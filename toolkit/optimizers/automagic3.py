@@ -1,3 +1,7 @@
+"""
+NOTE: This is experimental and under active development; expect breaking changes and bugs. Feedback welcome.
+"""
+import math
 from typing import List
 import torch
 
@@ -9,20 +13,41 @@ class Automagic3(torch.optim.Optimizer):
     A learning rate is kept per row of each parameter: one lr per output
     channel for >=2D weights (e.g. one lr per output neuron of a Linear layer)
     and one lr per element for 1D weights (biases, norms). Each step the lr is
-    nudged by how strongly the per-element update direction agrees with the
-    previous step. Agreement is the plain fraction of elements that kept their
-    sign (every element counts equally, regardless of update magnitude) and is
-    used as a proportional signal in [-1, 1] that scales a multiplicative
-    (geometric) bump ``lr *= exp(signal * lr_bump_rate)``, so each step is a fixed
-    fractional move that behaves uniformly across the whole [min_lr, max_lr]
-    range and a full up bump is exactly undone by a full down bump. The lr
-    drifts smoothly, self-stabilises near random agreement, and is clamped to
-    [min_lr, max_lr].
+    nudged by how consistent the per-element update direction has been.
 
-    The optimizer step is fused into the backward pass via
+    Agreement is window-consistency: over the last ``polarity_history_count``
+    update-sign snapshots plus the current sign, the per-element score is the
+    fraction sharing the dominant sign (``max(p, 1-p)``, in [0.5, 1]; direction-
+    agnostic, and the current step is just one vote so a single flip against a
+    long consistent history barely moves it). It is reduced to one value per row.
+    ``polarity_history_count`` is min 1 (default 2); a longer window makes the lr
+    react to a sustained trend rather than a single noisy step.
+
+    The agreement maps to a direction in [-1, 1] measured relative to the
+    window's noise floor ``b`` -- the consistency a pure-noise row shows purely
+    by chance, computed automatically from the window size (e.g. 0.75 for a
+    window of <=3 snapshots, ~0.69 for 4). Agreement == ``b`` -> 0 (lr steady),
+    1.0 -> +1 (lr up), below ``b`` -> down. There is no manual target: holding at
+    the noise floor is self-balancing per row -- the lr grows while a row is more
+    consistent than chance and settles at whatever lr makes its consistency meet
+    ``b``, so noisy and clean layers each find their own operating point without
+    tuning, and it neither collapses to min_lr nor runs to max_lr. Measuring
+    relative to ``b`` also makes the signal window-size independent. The direction
+    scales a multiplicative (geometric) bump ``lr *= exp(direction *
+    lr_bump_rate)`` -- a fixed fractional move, uniform across the whole range.
+    lr is clamped to [min_lr, max_lr].
+
+    With ``fused=True`` (default) the step is fused into the backward pass via
     ``register_post_accumulate_grad_hook``: each parameter is updated and its
     grad freed as soon as autograd finishes accumulating into it. ``.step()``
-    therefore does no real work and peak VRAM stays low.
+    therefore does no real work and peak VRAM stays low. Note this bypasses the
+    trainer's grad clipping / nan-skip (they run after backward) and is not
+    compatible with multi-backward gradient accumulation.
+
+    With ``fused=False`` it behaves like a traditional optimizer: grads
+    accumulate across backward passes and the update happens in ``.step()``.
+    Low-precision (bf16/fp16) grads are accumulated with stochastic rounding so
+    small per-micro-batch grads aren't lost; fp32 grads accumulate normally.
 
     Second-moment EMA state is stored in ``p.dtype`` (math runs in fp32 when
     the state is lower precision). Updates to low-precision (e.g. bf16/fp16)
@@ -40,10 +65,10 @@ class Automagic3(torch.optim.Optimizer):
     2. Proportional lr control (was a hard threshold flip). v2 bumped the lr up
        or down by a fixed amount depending on whether agreement crossed a
        threshold, which jitters when agreement hovers near the boundary. v3
-       scales the bump by how strongly the directions agree
-       (``2*agreement - 1`` in [-1, 1]). Plain English: the lr nudges gently
-       when the signal is weak and firmly when it is strong, and parks itself
-       instead of oscillating when gradients are basically noise.
+       scales the bump by how far consistency is from its hold point relative to
+       the noise floor (direction in [-1, 1]). Plain English: the lr nudges gently when the
+       signal is weak and firmly when it is strong, and parks itself instead of
+       oscillating when gradients are basically noise.
 
     3. Multiplicative (geometric) lr bump (was additive). v2 added/subtracted a
        fixed absolute amount, so the same bump was a huge relative jump near
@@ -81,10 +106,15 @@ class Automagic3(torch.optim.Optimizer):
         eps: float = 1e-30,
         clip_threshold: float = 1.0,
         weight_decay: float = 0.0,
+        polarity_history_count: int = 3,  # update-sign snapshots kept; current is compared vs all (min 1)
+        fused: bool = True,
     ):
         if lr > 1e-3:
             print(f"Warning! Start lr {lr} is very high; forcing to 1e-6.")
             lr = 1e-6
+        # Agreement compares the current update sign against the stored history,
+        # so at least one snapshot must be kept (1 = compare to previous only).
+        polarity_history_count = max(1, int(polarity_history_count))
         defaults = dict(
             lr=lr,
             min_lr=min_lr,
@@ -94,15 +124,32 @@ class Automagic3(torch.optim.Optimizer):
             eps=eps,
             clip_threshold=clip_threshold,
             weight_decay=weight_decay,
+            polarity_history_count=polarity_history_count,
+            # Noise floor of the consistency measure for this window (history+1),
+            # subtracted off so the lr signal is window-size independent.
+            agreement_floor=self._noise_floor(polarity_history_count + 1),
         )
         super().__init__(params, defaults)
 
+        self.fused = fused
         self._hook_handles = []
         for group in self.param_groups:
             for p in group["params"]:
-                if p.requires_grad:
+                if not p.requires_grad:
+                    continue
+                if self.fused:
+                    # Fused: update each param the moment its grad is ready.
                     handle = p.register_post_accumulate_grad_hook(
                         self._make_backward_hook(group)
+                    )
+                    self._hook_handles.append(handle)
+                elif p.dtype != torch.float32:
+                    # Non-fused: the actual update happens in .step(); here we
+                    # only stochastically accumulate low-precision grads across
+                    # micro-batches so repeated round-to-nearest doesn't drop
+                    # small grads (fp32 grads accumulate losslessly on their own).
+                    handle = p.register_post_accumulate_grad_hook(
+                        self._make_accum_hook()
                     )
                     self._hook_handles.append(handle)
 
@@ -114,6 +161,16 @@ class Automagic3(torch.optim.Optimizer):
     @staticmethod
     def _rms(t: torch.Tensor) -> torch.Tensor:
         return t.norm(2) / (t.numel() ** 0.5)
+
+    @staticmethod
+    def _noise_floor(window: int) -> float:
+        # Expected window-consistency max(p, 1-p) of a pure-noise element over a
+        # window of `window` independent fair coin flips. This is > 0.5 and grows
+        # with smaller windows (0.75 for window<=3, ~0.688 for 4, ...), so it must
+        # be subtracted off for the lr signal to behave the same at any window.
+        total = sum(math.comb(window, k) * max(k, window - k)
+                    for k in range(window + 1))
+        return total / (window * (2 ** window))
 
     @staticmethod
     def _approx_sq_grad(row: torch.Tensor, col: torch.Tensor) -> torch.Tensor:
@@ -151,6 +208,35 @@ class Automagic3(torch.optim.Optimizer):
         noise = torch.rand_like(v).sub_(0.5).mul_(ulp)
         return v.add_(noise).to(dtype)
 
+    @classmethod
+    def _stochastic_copy_(cls, dst: torch.Tensor, src_fp32: torch.Tensor) -> None:
+        # Stochastically round the fp32 ``src`` into the low-precision ``dst`` in
+        # place. Uses the fast mantissa-truncation path for bf16/fp16 and the
+        # generic method otherwise. ``src_fp32`` may be mutated (caller owns it).
+        if dst.dtype == torch.bfloat16:
+            dst.copy_(cls._sr_truncate(src_fp32, 16))
+        elif dst.dtype == torch.float16:
+            dst.copy_(cls._sr_truncate(src_fp32, 13))
+        else:
+            dst.copy_(cls._stochastic_round(src_fp32, dst.dtype))
+
+    def _make_accum_hook(self):
+        # Non-fused grad accumulation for low-precision params: accumulate the
+        # running sum in fp32 then stochastically round it back into the
+        # low-precision ``_accum_grad`` buffer, so small per-micro-batch grads
+        # are not lost to repeated round-to-nearest. .step() consumes the buffer.
+        def _hook(p: torch.Tensor):
+            if p.grad is None:
+                return
+            if hasattr(p, "_accum_grad"):
+                acc = p._accum_grad.to(torch.float32).add_(p.grad.to(torch.float32))
+                self._stochastic_copy_(p._accum_grad, acc)
+            else:
+                p._accum_grad = p.grad.clone()
+            p.grad = None
+
+        return _hook
+
     def _init_state(self, p: torch.Tensor, group: dict) -> None:
         state = self.state[p]
         state["step"] = 0
@@ -160,7 +246,9 @@ class Automagic3(torch.optim.Optimizer):
         state["lr"] = torch.full(
             lr_shape, float(group["lr"]), dtype=torch.float32, device=p.device
         )
-        state["last_polarity"] = torch.zeros(p.shape, dtype=torch.bool, device=p.device)
+        # Rolling history of the last polarity_history_count update-sign
+        # snapshots (bool); the current step is compared against all of them.
+        state["pol_hist"] = []
         if p.dim() >= 2:
             state["exp_avg_sq_row"] = torch.zeros(
                 p.shape[:-1], dtype=p.dtype, device=p.device
@@ -192,6 +280,17 @@ class Automagic3(torch.optim.Optimizer):
             raise RuntimeError("Automagic3 does not support sparse gradients.")
         if grad.dtype != torch.float32:
             grad = grad.to(torch.float32)
+
+        # This step is fused into backward, so the trainer's grad clipping and
+        # nan/inf-skip run too late to protect us -- the weights are already
+        # updated here. A single non-finite gradient would poison the
+        # second-moment EMA (NaN*beta2 + ... stays NaN forever) and corrupt the
+        # weights, which surfaces as the model "randomly" blowing up. Neutralise
+        # non-finite grads in place (we own this fp32 grad) so those elements
+        # contribute nothing this step instead of destroying state. Large but
+        # finite grads are left alone -- the second-moment normalisation already
+        # bounds their effect.
+        grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
 
         beta2 = group["beta2"]
         eps = group["eps"]
@@ -231,40 +330,67 @@ class Automagic3(torch.optim.Optimizer):
         # slow ramp wastes steps; for a soft start the user can set a low start
         # lr and let the lr bump up on its own.
         update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
+        # The RMS clip only bounds the aggregate, so a single outlier element can
+        # still survive at ~sqrt(numel)*clip_threshold and hit one weight hard,
+        # distorting the model. Cap each element to clip_threshold (a true
+        # max-norm trust region) so no single weight can take an outsized step.
+        update.clamp_(-group["clip_threshold"], group["clip_threshold"])
 
-        # Per-row sign agreement vs. the previous step: the plain fraction of
-        # elements that kept their sign, every element counting equally
-        # regardless of update magnitude. For >=2D params this is reduced to one
-        # value per output channel; for 1D it is per element. The result drives
-        # a proportional lr bump in [-1, 1]. The match is summed straight off the
-        # bool tensor (no full-size float cast) into the per-row reduction.
+        # Window-consistency agreement. We keep the last polarity_history_count
+        # update-sign snapshots; over the window of those plus the current sign,
+        # the per-element agreement is the fraction sharing the *dominant* sign,
+        # max(p, 1 - p) == 0.5 + |p - 0.5| where p is the fraction positive. This
+        # is direction-agnostic (a consistently-negative element scores as high
+        # as a consistently-positive one) and the current step is just one vote,
+        # so a single flip against a long consistent history barely moves it
+        # (e.g. 20-of-21 the same -> ~0.95). Values lie in [0.5, 1]: 0.5 is a
+        # 50/50 (chaotic) element, 1.0 is perfectly consistent. Reduced to one
+        # value per output channel for >=2D, per element for 1D.
         cur_polarity = update > 0
-        eqb = cur_polarity == state["last_polarity"]
-        state["last_polarity"] = cur_polarity
+        pol_hist = state["pol_hist"]
 
         lr_t = state["lr"]
         if p.dim() >= 2:
             dims = tuple(range(1, p.dim()))
-            agreement = eqb.sum(dim=dims, dtype=torch.float32).div_(
-                eqb.shape[1:].numel()
-            )
             lr_b = lr_t.view(lr_t.shape[0], *([1] * (p.dim() - 1)))
         else:
-            agreement = eqb.to(torch.float32)
+            dims = None
             lr_b = lr_t
 
-        if state["step"] > 0:
-            direction = agreement.mul_(2.0).sub_(1.0)
+        if pol_hist:
+            # per-element fraction positive over the window (current + history)
+            win = len(pol_hist) + 1
+            frac = cur_polarity.to(torch.float32)
+            for h in pol_hist:
+                frac.add_(h)
+            frac.div_(win)
+            # dominant-sign fraction in [0.5, 1], then reduce to per-row
+            consist = frac.sub_(0.5).abs_().add_(0.5)
+            agreement = consist.mean(dim=dims) if dims is not None else consist
+
+            # Map consistency to a direction in [-1, 1], measured relative to the
+            # window's noise floor b (the consistency a pure-noise row shows by
+            # chance, computed from the window size): agreement == b -> 0 (hold),
+            # 1.0 (perfect) -> +1 (lr up), below b -> down. There is no manual
+            # target -- holding at b is fully automatic and self-balancing per
+            # row: the lr grows while a row is more consistent than chance and
+            # settles at whatever lr makes its consistency meet b, so noisy and
+            # clean layers each find their own operating point. Measuring
+            # relative to b also makes the signal window-size independent.
+            b = group["agreement_floor"]
+            direction = agreement.sub_(b).div_(1.0 - b).clamp_(-1.0, 1.0)
             # Multiplicative (geometric) bump: lr *= exp(direction * lr_bump_rate).
-            # A full up step multiplies lr by exp(lr_bump_rate), a full down step by
-            # its reciprocal, so up and down are symmetric in log space (a full
-            # up bump is exactly undone by a full down bump). lr_bump_rate is thus a
-            # fractional rate (~lr_bump_rate per step for small values), giving a
-            # uniform relative move at every scale across [min_lr, max_lr]
-            # instead of a fixed absolute amount.
+            # lr_bump_rate is a fractional rate (~lr_bump_rate per step for small
+            # values), giving a uniform relative move at every scale across
+            # [min_lr, max_lr] instead of a fixed absolute amount.
             lr_t.mul_(torch.exp(direction.mul_(group["lr_bump_rate"]))).clamp_(
                 min=group["min_lr"], max=group["max_lr"]
             )
+
+        # Record this step's polarity and trim the window to the configured size.
+        pol_hist.append(cur_polarity)
+        if len(pol_hist) > group["polarity_history_count"]:
+            del pol_hist[0]
         state["step"] += 1
 
         wd = group["weight_decay"]
@@ -283,12 +409,7 @@ class Automagic3(torch.optim.Optimizer):
             if wd != 0.0:
                 update.add_(new_p_fp32, alpha=wd)
             new_p_fp32.addcmul_(update, lr_b, value=-1.0)
-            if p.dtype == torch.bfloat16:
-                p.copy_(self._sr_truncate(new_p_fp32, 16))
-            elif p.dtype == torch.float16:
-                p.copy_(self._sr_truncate(new_p_fp32, 13))
-            else:
-                p.copy_(self._stochastic_round(new_p_fp32, p.dtype))
+            self._stochastic_copy_(p, new_p_fp32)
 
         p.grad = None
 
@@ -300,6 +421,22 @@ class Automagic3(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        # Fused mode already updated every param in the backward hook; nothing
+        # left to do. Non-fused mode does the real work here.
+        if not self.fused:
+            for group in self.param_groups:
+                for p in group["params"]:
+                    if not p.requires_grad:
+                        continue
+                    # Low-precision grads were stochastically accumulated into
+                    # _accum_grad; hand it back as the grad to update from.
+                    accum = getattr(p, "_accum_grad", None)
+                    if accum is not None:
+                        p.grad = accum
+                        del p._accum_grad
+                    if p.grad is None:
+                        continue
+                    self._update_param(p, group)
         return loss
 
     def get_learning_rates(self) -> List[float]:
@@ -329,3 +466,7 @@ class Automagic3(torch.optim.Optimizer):
                 st = self.state.get(p)
                 if st is not None and isinstance(st.get("lr"), torch.Tensor):
                     st["lr"] = st["lr"].to(torch.float32)
+                # Polarity history is transient; rebuild it after load rather
+                # than trying to persist/cast a list of bool tensors.
+                if st is not None and "pol_hist" in st:
+                    st["pol_hist"] = []
