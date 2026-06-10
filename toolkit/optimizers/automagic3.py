@@ -1,7 +1,7 @@
 """
 NOTE: This is experimental and under active development; expect breaking changes and bugs. Feedback welcome.
 """
-import math
+
 from typing import List
 import torch
 
@@ -10,32 +10,39 @@ class Automagic3(torch.optim.Optimizer):
     """
     Automagic v3.
 
-    A learning rate is kept per row of each parameter: one lr per output
-    channel for >=2D weights (e.g. one lr per output neuron of a Linear layer)
-    and one lr per element for 1D weights (biases, norms). Each step the lr is
-    nudged by how consistent the per-element update direction has been.
+    A single learning rate is kept per parameter tensor (one lr per weight
+    matrix / layer). Each step the lr is nudged by whether the per-element update
+    direction *flipped* vs the previous step (RProp-style edge-of-stability
+    control), aggregated over the whole tensor.
 
-    Agreement is window-consistency: over the last ``polarity_history_count``
-    update-sign snapshots plus the current sign, the per-element score is the
-    fraction sharing the dominant sign (``max(p, 1-p)``, in [0.5, 1]; direction-
-    agnostic, and the current step is just one vote so a single flip against a
-    long consistent history barely moves it). It is reduced to one value per row.
-    ``polarity_history_count`` is min 1 (default 2); a longer window makes the lr
-    react to a sustained trend rather than a single noisy step.
+    A sign flip means the step jumped past the local minimum (overshoot) -- the
+    one event whose frequency genuinely rises with the lr, so it provides a true
+    restoring force. Each element votes: agree with last step -> +``lr_bump_rate``;
+    flip -> -``lr_bump_rate`` (symmetric). The votes are reduced to ONE value for
+    the whole tensor and EMA-smoothed over ~``lr_smoothing_steps`` steps, then
+    applied multiplicatively: ``lr *= exp(nudge)``. Reducing over the whole tensor
+    (rather than per row/channel) is deliberate: per-channel lrs let coupled
+    channels fight -- one drives its lr up while a neighbour drives its down to
+    compensate -- and split to opposite extremes, which visibly wrecks the model;
+    one lr per tensor makes opposing channels cancel into a single vote.
 
-    The agreement maps to a direction in [-1, 1] measured relative to the
-    window's noise floor ``b`` -- the consistency a pure-noise row shows purely
-    by chance, computed automatically from the window size (e.g. 0.75 for a
-    window of <=3 snapshots, ~0.69 for 4). Agreement == ``b`` -> 0 (lr steady),
-    1.0 -> +1 (lr up), below ``b`` -> down. There is no manual target: holding at
-    the noise floor is self-balancing per row -- the lr grows while a row is more
-    consistent than chance and settles at whatever lr makes its consistency meet
-    ``b``, so noisy and clean layers each find their own operating point without
-    tuning, and it neither collapses to min_lr nor runs to max_lr. Measuring
-    relative to ``b`` also makes the signal window-size independent. The direction
-    scales a multiplicative (geometric) bump ``lr *= exp(direction *
-    lr_bump_rate)`` -- a fixed fractional move, uniform across the whole range.
-    lr is clamped to [min_lr, max_lr].
+    The flip equilibrium is flip fraction == 0.5, the only rate that is both the
+    pure-noise point and the edge of stability: a tensor descending cleanly flips
+    less than half the time -> its lr grows; once it overshoots it flips more than
+    half -> its lr shrinks; pure noise flips ~half -> the lr holds. Symmetry is
+    load-bearing (any asymmetry drags a noise-dominated tensor to zero). Elements
+    with an exactly-zero update (dead/masked grads, low-precision underflow) carry
+    no direction and abstain from the vote.
+
+    On top of the per-tensor flip control, every tensor's lr is gently pulled
+    toward the GLOBAL average lr each step (``lr_pull``, geometric / log-space:
+    ``lr *= (avg_lr / lr) ** lr_pull``). This mean-reversion is the restoring
+    force that replaces hard min/max clamps: layers may settle at their own level,
+    but cannot drift apart to opposite extremes (one frozen near zero, one running
+    away) -- the failure mode that destroys full finetunes. The target is the
+    emergent average across layers, not a fixed number, so it stays fully
+    automatic; there are no min/max lr bounds. ``lr_bump_rate`` sets how fast the
+    lr moves, not where it lands.
 
     With ``fused=True`` (default) the step is fused into the backward pass via
     ``register_post_accumulate_grad_hook``: each parameter is updated and its
@@ -53,26 +60,73 @@ class Automagic3(torch.optim.Optimizer):
     the state is lower precision). Updates to low-precision (e.g. bf16/fp16)
     parameters are applied in fp32 and stochastically rounded on write-back.
 
+    Parameters
+    ----------
+    lr : float
+        Starting learning rate for every layer. The controller adapts away from
+        this, so it is a launch point, not a tuned target -- a low value just
+        lets the lr ramp up on its own (there is no warmup). Values above 1e-3
+        are rejected and forced back to 1e-6. There are no min/max lr clamps;
+        the mean-reversion pull keeps the spread bounded instead.
+    lr_bump_rate : float
+        Fractional, log-space size of each lr nudge (~10% at 0.1). Sets how fast
+        the lr moves, NOT where it settles (the flip dynamics fix that); a full
+        up-nudge and a full down-nudge cancel exactly.
+    lr_pull : float
+        Per-step strength of the mean-reversion pulling each layer's lr toward
+        the global average (log space; 0 disables). This is the restoring force
+        that replaces min/max clamps and stops layers drifting to opposite
+        extremes. Small (default 0.05) lets layers keep their own level while
+        bounding the spread; larger forces all layers toward a common lr.
+    beta2 : float
+        EMA decay for the second moment, as in Adam/Adafactor.
+    eps : float
+        Floor added to the second moment before the rsqrt, to avoid div-by-zero.
+    clip_threshold : float
+        Trust region on the update: its RMS is scaled to <= this, then every
+        element is clamped to +/- this, so no single weight takes an outsized
+        step.
+    weight_decay : float
+        Decoupled (AdamW-style) weight decay; 0 disables it.
+    lr_smoothing_steps : int
+        How many steps of the flip signal to EMA-average before nudging the lr
+        (>=1, default 3). Higher = smoother/slower lr, lower = twitchier/faster;
+        it does not change where the lr lands. Held as an EMA, so it costs O(1)
+        state per layer regardless of the value.
+    fused : bool
+        If True (default), each param is updated inside the backward pass the
+        moment its grad is ready -- low peak VRAM, but it bypasses the trainer's
+        grad clipping / nan-skip and cannot be combined with multi-backward
+        gradient accumulation. If False, a normal ``.step()``-time update, with
+        low-precision grads accumulated using stochastic rounding.
+
     Improvements over v2
     --------------------
-    1. Per-row learning rate (was a single scalar per parameter tensor).
-       v2 kept one lr for an entire weight matrix; v3 keeps one per output
-       channel (per element for 1D params). Plain English: different neurons in
-       the same layer can now learn at different speeds instead of being forced
-       to share one rate, so a layer where some rows have converged and others
-       have not is handled gracefully.
+    1. Per-layer lr with mean-reversion (v2 had one static lr per tensor and no
+       coupling between layers). v3 still keeps one lr per tensor, but it is
+       adaptive (driven by the flip controller) and every layer's lr is pulled
+       toward the global average (``lr_pull``). Plain English: each layer finds
+       its own learning rate automatically, but no layer can run away or freeze
+       relative to the others -- which is what used to split a full finetune into
+       over-cooked and dead layers and destroy it. (An earlier v3 used a separate
+       lr per output channel; coupled channels fought and split to opposite
+       extremes, so it was reduced back to one lr per tensor.)
 
-    2. Proportional lr control (was a hard threshold flip). v2 bumped the lr up
-       or down by a fixed amount depending on whether agreement crossed a
-       threshold, which jitters when agreement hovers near the boundary. v3
-       scales the bump by how far consistency is from its hold point relative to
-       the noise floor (direction in [-1, 1]). Plain English: the lr nudges gently when the
-       signal is weak and firmly when it is strong, and parks itself instead of
-       oscillating when gradients are basically noise.
+    2. Overshoot-based (RProp-style) lr control with a real equilibrium. v2
+       bumped the lr from raw direction agreement, which has no upper fixed point
+       -- a parameter that is simply still descending keeps agreeing at any lr,
+       so the lr ratchets up and eventually runs away on long runs. v3 drives the
+       lr from sign *flips* (overshoot) instead, nudging up on agree and down on
+       flip symmetrically; the equilibrium is a flip fraction of 0.5, which is
+       both the noise point and the edge of stability. Plain English: the lr
+       speeds up while a layer is making clean progress, backs off the moment it
+       starts overshooting, and simply holds when the gradient is pure noise --
+       so it neither climbs without bound on long runs nor collapses to nothing
+       on a fresh, noisy LoRA.
 
     3. Multiplicative (geometric) lr bump (was additive). v2 added/subtracted a
-       fixed absolute amount, so the same bump was a huge relative jump near
-       min_lr and a negligible one near max_lr. v3 multiplies by
+       fixed absolute amount, so the same bump was a huge relative jump when the
+       lr was tiny and a negligible one when it was large. v3 multiplies by
        ``exp(signal * lr_bump_rate)`` -- a fixed *percentage* step. Plain
        English: the lr moves at the same relative pace whether it is tiny or
        large, traverses its whole range in a predictable number of steps, and a
@@ -87,51 +141,52 @@ class Automagic3(torch.optim.Optimizer):
        weight updates, so it actually keeps learning instead of stalling.
 
     5. Faster hot path, identical math. eps is folded into the small reduced
-       row/col vectors instead of the full gradient-square tensor; the lr scale,
-       weight decay and parameter update are fused into one ``addcmul_``; and the
-       sign-agreement is summed straight off the bool mask with no full-size
-       float cast. Plain English: each step issues fewer GPU passes over the
-       weights, so it runs faster (notably in bf16/fp16) without changing the
-       result.
+       row/col vectors instead of the full gradient-square tensor; the lr scale
+       and parameter update are fused into one ``addcmul_``; and the per-element
+       agree/flip vote is a single int8 sign-product (``cur_sign * prev_sign``)
+       instead of several boolean masks plus float casts. Plain English: each
+       step issues fewer GPU passes over the weights, so it runs faster (notably
+       in bf16/fp16) without changing the result.
     """
 
     def __init__(
         self,
         params,
         lr: float = 1e-6,
-        min_lr: float = 1e-8,
-        max_lr: float = 1e-2,
         lr_bump_rate: float = 0.1,  # fractional/log step per bump (~10%); see step logic
+        lr_pull: float = 0.025,  # per-step pull of each layer's lr toward the global avg (log space)
         beta2: float = 0.999,
         eps: float = 1e-30,
         clip_threshold: float = 1.0,
         weight_decay: float = 0.0,
-        polarity_history_count: int = 3,  # update-sign snapshots kept; current is compared vs all (min 1)
+        lr_smoothing_steps: int = 3,  # lr-nudge EMA smoothing horizon, in steps (min 1)
         fused: bool = True,
     ):
         if lr > 1e-3:
             print(f"Warning! Start lr {lr} is very high; forcing to 1e-6.")
             lr = 1e-6
-        # Agreement compares the current update sign against the stored history,
-        # so at least one snapshot must be kept (1 = compare to previous only).
-        polarity_history_count = max(1, int(polarity_history_count))
+        # The lr nudge is EMA-smoothed over ~this many steps; at least 1.
+        lr_smoothing_steps = max(1, int(lr_smoothing_steps))
         defaults = dict(
             lr=lr,
-            min_lr=min_lr,
-            max_lr=max_lr,
             lr_bump_rate=lr_bump_rate,
+            lr_pull=max(0.0, float(lr_pull)),
             beta2=beta2,
             eps=eps,
             clip_threshold=clip_threshold,
             weight_decay=weight_decay,
-            polarity_history_count=polarity_history_count,
-            # Noise floor of the consistency measure for this window (history+1),
-            # subtracted off so the lr signal is window-size independent.
-            agreement_floor=self._noise_floor(polarity_history_count + 1),
+            lr_smoothing_steps=lr_smoothing_steps,
+            # EMA decay for the per-layer lr nudge, derived from the smoothing
+            # horizon (n steps -> beta = n/(n+1)).
+            dir_beta=lr_smoothing_steps / (lr_smoothing_steps + 1.0),
         )
         super().__init__(params, defaults)
 
         self.fused = fused
+        # Global geometric-mean lr across all layers; the mean-reversion pull
+        # targets this. Seeded at the start lr (all layers equal) and refreshed
+        # each .step() from the current per-layer lrs.
+        self._avg_lr = float(lr)
         self._hook_handles = []
         for group in self.param_groups:
             for p in group["params"]:
@@ -160,20 +215,17 @@ class Automagic3(torch.optim.Optimizer):
 
     @staticmethod
     def _rms(t: torch.Tensor) -> torch.Tensor:
+        # Root-mean-square of a tensor; used to size the trust-region clip.
         return t.norm(2) / (t.numel() ** 0.5)
 
     @staticmethod
-    def _noise_floor(window: int) -> float:
-        # Expected window-consistency max(p, 1-p) of a pure-noise element over a
-        # window of `window` independent fair coin flips. This is > 0.5 and grows
-        # with smaller windows (0.75 for window<=3, ~0.688 for 4, ...), so it must
-        # be subtracted off for the lr signal to behave the same at any window.
-        total = sum(math.comb(window, k) * max(k, window - k)
-                    for k in range(window + 1))
-        return total / (window * (2 ** window))
-
-    @staticmethod
     def _approx_sq_grad(row: torch.Tensor, col: torch.Tensor) -> torch.Tensor:
+        # Adafactor's factored second moment (inherited from v2). Rather than
+        # store a full RxC tensor of running grad^2, only its per-row and
+        # per-col means are kept; this rebuilds the rank-1 approximation of
+        # 1/sqrt(v) -- the per-element update scale -- as the outer product
+        # rsqrt(row / mean(row)) (x) rsqrt(col). That is the standard HF
+        # Adafactor reconstruction and is what keeps optimizer state small.
         r = (row / row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)
         c = col.unsqueeze(-2).rsqrt()
         return torch.mul(r, c)
@@ -240,15 +292,20 @@ class Automagic3(torch.optim.Optimizer):
     def _init_state(self, p: torch.Tensor, group: dict) -> None:
         state = self.state[p]
         state["step"] = 0
-        # Per-row lr: one entry per output channel for >=2D params, per element
-        # for 1D params, a scalar for 0D params.
-        lr_shape = (p.shape[0],) if p.dim() >= 2 else p.shape
-        state["lr"] = torch.full(
-            lr_shape, float(group["lr"]), dtype=torch.float32, device=p.device
+        # ONE lr per parameter tensor (scalar), not per row/channel. Per-channel
+        # lrs let coupled channels fight -- one drives up while another drives
+        # down to compensate -- so they split to the rails and wreck the model.
+        # A single lr per tensor averages the vote over all elements, so opposing
+        # channels cancel instead of diverging.
+        state["lr"] = torch.tensor(
+            float(group["lr"]), dtype=torch.float32, device=p.device
         )
-        # Rolling history of the last polarity_history_count update-sign
-        # snapshots (bool); the current step is compared against all of them.
-        state["pol_hist"] = []
+        # Previous update-sign snapshot (int8 {-1, 0, +1}, full param shape); the
+        # current sign is compared against it to detect per-element flips. Set on
+        # the first step.
+        state["prev_sign"] = None
+        # EMA of the (scalar) log lr-nudge, smoothing the flip signal over time.
+        state["dir_ema"] = torch.zeros((), dtype=torch.float32, device=p.device)
         if p.dim() >= 2:
             state["exp_avg_sq_row"] = torch.zeros(
                 p.shape[:-1], dtype=p.dtype, device=p.device
@@ -299,6 +356,13 @@ class Automagic3(torch.optim.Optimizer):
         # which saves a full-size kernel pass.
         sq = grad * grad
 
+        # Second moment: a beta2-EMA of grad^2, then update = grad / sqrt(v),
+        # exactly as Adam/Adafactor (this magnitude-normalises the step; only the
+        # *sign* of the result drives the lr controller further down). For >=2D
+        # params v is Adafactor-factored into row/col means (small state, see
+        # _approx_sq_grad); 1D params (biases, norms) keep the full per-element
+        # second moment. State lives in p.dtype; when that is low precision the
+        # math is done in an fp32 copy and written back.
         if p.dim() >= 2:
             row_state = state["exp_avg_sq_row"]
             col_state = state["exp_avg_sq_col"]
@@ -336,71 +400,70 @@ class Automagic3(torch.optim.Optimizer):
         # max-norm trust region) so no single weight can take an outsized step.
         update.clamp_(-group["clip_threshold"], group["clip_threshold"])
 
-        # Window-consistency agreement. We keep the last polarity_history_count
-        # update-sign snapshots; over the window of those plus the current sign,
-        # the per-element agreement is the fraction sharing the *dominant* sign,
-        # max(p, 1 - p) == 0.5 + |p - 0.5| where p is the fraction positive. This
-        # is direction-agnostic (a consistently-negative element scores as high
-        # as a consistently-positive one) and the current step is just one vote,
-        # so a single flip against a long consistent history barely moves it
-        # (e.g. 20-of-21 the same -> ~0.95). Values lie in [0.5, 1]: 0.5 is a
-        # 50/50 (chaotic) element, 1.0 is perfectly consistent. Reduced to one
-        # value per output channel for >=2D, per element for 1D.
-        cur_polarity = update > 0
-        pol_hist = state["pol_hist"]
+        # RProp-style edge-of-stability lr control. The signal is whether each
+        # element's update direction *flipped* vs the previous step, not how
+        # steady it has been: a flip means we stepped past the local minimum
+        # (overshoot), the one event whose frequency actually rises with the lr,
+        # so it gives a true restoring force. Steadiness does not -- a parameter
+        # descending monotonically agrees with itself at any non-overshooting lr,
+        # which is why a consistency-vs-noise-floor signal has no upper
+        # equilibrium and runs away on long tunes.
+        # Trinary sign {-1, 0, +1}: zero updates (dead/masked grads, flat
+        # activation regions, low-precision underflow) are kept distinct from
+        # negatives rather than bucketed with them by a bare ``> 0``.
+        cur_sign = update.sign().to(torch.int8)
+        prev_sign = state["prev_sign"]
+        lr_t = state["lr"]  # scalar (one lr for the whole tensor)
 
-        lr_t = state["lr"]
-        if p.dim() >= 2:
-            dims = tuple(range(1, p.dim()))
-            lr_b = lr_t.view(lr_t.shape[0], *([1] * (p.dim() - 1)))
-        else:
-            dims = None
-            lr_b = lr_t
+        if prev_sign is not None:
+            # Per-element vote via the sign product. With signs in {-1, 0, +1},
+            # cur_sign * prev_sign is +1 when the direction held (agree), -1 when
+            # it flipped (overshoot), and 0 whenever either step's update was zero
+            # -- so a zero update automatically ABSTAINS (contributes nothing and
+            # isn't counted), no separate masking needed.
+            #
+            # Reduced over the WHOLE tensor (not per row) this is
+            # bump*(1 - 2*flip_fraction): the lr grows while the layer mostly
+            # holds its direction, shrinks once it mostly flips, and holds at the
+            # flip_fraction == 0.5 point. Aggregating over all elements means
+            # channels pushing opposite ways cancel into one vote instead of
+            # splitting to opposite lr extremes.
+            bump = group["lr_bump_rate"]
+            prod = cur_sign * prev_sign  # int8 {-1, 0, +1} per element
+            # Reduce directly on the int8 product (sum -> int64, no full-size
+            # float cast; count_nonzero -> valid votes) -- two reductions instead
+            # of casting the whole tensor to float twice.
+            num = prod.sum()
+            den = prod.count_nonzero().clamp_(min=1)
+            log_dir = num.float().div_(den.float()).mul_(bump)
+            # EMA-smooth the nudge so a single noisy step doesn't swing the lr,
+            # then apply it multiplicatively (a fixed fractional move).
+            ema = state["dir_ema"]
+            beta = group["dir_beta"]
+            ema.mul_(beta).add_(log_dir, alpha=1.0 - beta)
+            lr_t.mul_(torch.exp(ema))
+            # Mean-reversion: pull this layer's lr toward the global average lr
+            # (geometric, in log space) -- lr *= (avg/lr)**lr_pull. This is the
+            # restoring force that replaces the hard min/max rails: layers can
+            # still settle at their own level, but can't drift apart to opposite
+            # extremes (one frozen, one runaway) and wreck the model. The pull is
+            # toward an emergent average, not a fixed target, so it stays
+            # automatic. self._avg_lr is refreshed once per .step().
+            pull = group["lr_pull"]
+            if pull > 0.0 and self._avg_lr > 0.0:
+                lr_t.mul_(lr_t.reciprocal().mul_(self._avg_lr).pow_(pull))
 
-        if pol_hist:
-            # per-element fraction positive over the window (current + history)
-            win = len(pol_hist) + 1
-            frac = cur_polarity.to(torch.float32)
-            for h in pol_hist:
-                frac.add_(h)
-            frac.div_(win)
-            # dominant-sign fraction in [0.5, 1], then reduce to per-row
-            consist = frac.sub_(0.5).abs_().add_(0.5)
-            agreement = consist.mean(dim=dims) if dims is not None else consist
-
-            # Map consistency to a direction in [-1, 1], measured relative to the
-            # window's noise floor b (the consistency a pure-noise row shows by
-            # chance, computed from the window size): agreement == b -> 0 (hold),
-            # 1.0 (perfect) -> +1 (lr up), below b -> down. There is no manual
-            # target -- holding at b is fully automatic and self-balancing per
-            # row: the lr grows while a row is more consistent than chance and
-            # settles at whatever lr makes its consistency meet b, so noisy and
-            # clean layers each find their own operating point. Measuring
-            # relative to b also makes the signal window-size independent.
-            b = group["agreement_floor"]
-            direction = agreement.sub_(b).div_(1.0 - b).clamp_(-1.0, 1.0)
-            # Multiplicative (geometric) bump: lr *= exp(direction * lr_bump_rate).
-            # lr_bump_rate is a fractional rate (~lr_bump_rate per step for small
-            # values), giving a uniform relative move at every scale across
-            # [min_lr, max_lr] instead of a fixed absolute amount.
-            lr_t.mul_(torch.exp(direction.mul_(group["lr_bump_rate"]))).clamp_(
-                min=group["min_lr"], max=group["max_lr"]
-            )
-
-        # Record this step's polarity and trim the window to the configured size.
-        pol_hist.append(cur_polarity)
-        if len(pol_hist) > group["polarity_history_count"]:
-            del pol_hist[0]
+        state["prev_sign"] = cur_sign
         state["step"] += 1
 
         wd = group["weight_decay"]
 
         if p.dtype == torch.float32:
             # Decoupled weight decay folded in (update += wd*p), then a single
-            # fused p -= lr_b * update.
+            # fused p -= lr * update (lr is a scalar, broadcasts).
             if wd != 0.0:
                 update.add_(p, alpha=wd)
-            p.addcmul_(update, lr_b, value=-1.0)
+            p.addcmul_(update, lr_t, value=-1.0)
         else:
             # Low precision: apply the update in fp32 then stochastically round
             # back, so tiny updates aren't lost to round-to-nearest. Single
@@ -408,7 +471,7 @@ class Automagic3(torch.optim.Optimizer):
             new_p_fp32 = p.to(torch.float32)
             if wd != 0.0:
                 update.add_(new_p_fp32, alpha=wd)
-            new_p_fp32.addcmul_(update, lr_b, value=-1.0)
+            new_p_fp32.addcmul_(update, lr_t, value=-1.0)
             self._stochastic_copy_(p, new_p_fp32)
 
         p.grad = None
@@ -437,17 +500,39 @@ class Automagic3(torch.optim.Optimizer):
                     if p.grad is None:
                         continue
                     self._update_param(p, group)
+        self._refresh_avg_lr()
         return loss
 
+    def _all_lrs(self) -> list:
+        # The per-layer lr scalars (0-d tensors), gathered without any device
+        # sync. Callers stack these and reduce in one op so there is a single
+        # GPU->CPU sync instead of one per layer.
+        return [
+            st["lr"]
+            for group in self.param_groups
+            for p in group["params"]
+            if (st := self.state.get(p)) is not None and "lr" in st
+        ]
+
+    def _refresh_avg_lr(self) -> None:
+        # Global geometric-mean lr across all layers, the mean-reversion target.
+        # Geometric (mean of log) because the lr is controlled/pulled in log
+        # space. One stacked reduction + one sync, refreshed once per step.
+        lrs = self._all_lrs()
+        if lrs:
+            self._avg_lr = float(torch.stack(lrs).log_().mean().exp_())
+
     def get_learning_rates(self) -> List[float]:
+        # Reporting helper: one representative lr per param group -- the mean of
+        # the per-layer (per-tensor) lrs. Stacked reduction -> one sync per group.
         out = []
         for group in self.param_groups:
             lrs = [
-                float(self.state[p]["lr"].mean())
+                self.state[p]["lr"]
                 for p in group["params"]
                 if p in self.state and "lr" in self.state[p]
             ]
-            out.append(sum(lrs) / len(lrs) if lrs else float(group["lr"]))
+            out.append(float(torch.stack(lrs).mean()) if lrs else float(group["lr"]))
         return out
 
     def get_avg_learning_rate(self) -> float:
@@ -466,7 +551,11 @@ class Automagic3(torch.optim.Optimizer):
                 st = self.state.get(p)
                 if st is not None and isinstance(st.get("lr"), torch.Tensor):
                     st["lr"] = st["lr"].to(torch.float32)
-                # Polarity history is transient; rebuild it after load rather
-                # than trying to persist/cast a list of bool tensors.
-                if st is not None and "pol_hist" in st:
-                    st["pol_hist"] = []
+                # prev_sign / dir_ema are transient; rebuild them after load
+                # rather than persisting a sign tensor and an fp32 EMA.
+                if st is not None and "prev_sign" in st:
+                    st["prev_sign"] = None
+                if st is not None and isinstance(st.get("dir_ema"), torch.Tensor):
+                    st["dir_ema"] = torch.zeros_like(st["dir_ema"], dtype=torch.float32)
+        # Rebuild the global average lr from the restored per-layer lrs.
+        self._refresh_avg_lr()
