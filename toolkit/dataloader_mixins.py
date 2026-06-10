@@ -205,6 +205,53 @@ class BucketsMixin:
         for key, bucket in self.buckets.items():
             random.shuffle(bucket.file_list_idx)
 
+    def roll_random_crop(self: 'AiToolkitDataset', file_item: 'FileItemDTO'):
+        """(Re)roll the random crop window for a single file item.
+
+        With dataset_config.random_crop_percent > 0, the pre-crop scale is
+        inflated by a random zoom so the bucket-sized crop window covers a
+        random (1 - percent)..100% of the image, then the window is placed at
+        a random position. With percent == 0 this preserves legacy behavior:
+        random position within whatever slack bucket-fitting left over.
+        """
+        pct = getattr(self.dataset_config, 'random_crop_percent', 0.0) or 0.0
+        base_w = getattr(file_item, 'base_scale_to_width', None)
+        base_h = getattr(file_item, 'base_scale_to_height', None)
+        if base_w is None or base_h is None:
+            base_w = file_item.scale_to_width
+            base_h = file_item.scale_to_height
+            file_item.base_scale_to_width = base_w
+            file_item.base_scale_to_height = base_h
+        if pct > 0:
+            zoom = 1.0 / (1.0 - random.uniform(0.0, pct))
+            file_item.scale_to_width = int(math.ceil(base_w * zoom))
+            file_item.scale_to_height = int(math.ceil(base_h * zoom))
+        else:
+            file_item.scale_to_width = base_w
+            file_item.scale_to_height = base_h
+        max_x = file_item.scale_to_width - file_item.crop_width
+        max_y = file_item.scale_to_height - file_item.crop_height
+        file_item.crop_x = random.randint(0, max_x) if max_x > 0 else 0
+        file_item.crop_y = random.randint(0, max_y) if max_y > 0 else 0
+
+    def reroll_random_crops(self: 'AiToolkitDataset'):
+        """Re-roll every file item's random crop. Called once per epoch from
+        setup_epoch so each epoch trains on a different crop of each image."""
+        if getattr(self, 'is_audio_model', False):
+            return
+        if not self.dataset_config.buckets or not self.dataset_config.random_crop:
+            return
+        if getattr(self, 'is_caching_latents', False):
+            # latents were encoded from the epoch-0 crop; re-rolling would
+            # change nothing (or mismatch). leave crops frozen.
+            return
+        for file_item in self.file_list:
+            if getattr(file_item, 'crop_width', None) is None:
+                continue
+            if getattr(file_item, 'scale_to_width', None) is None:
+                continue
+            self.roll_random_crop(file_item)
+
     def setup_buckets(self: 'AiToolkitDataset', quiet=False):
         if not hasattr(self, 'file_list'):
             raise Exception(f'file_list not found on class instance {self.__class__.__name__}')
@@ -212,8 +259,8 @@ class BucketsMixin:
             raise Exception(f'dataset_config not found on class instance {self.__class__.__name__}')
 
         if self.epoch_num > 0:
-            # no need to rebuild buckets for now
-            # todo handle random cropping for buckets
+            # bucket assignments don't change between epochs. random crops are
+            # re-rolled separately via reroll_random_crops() from setup_epoch().
             return
         self.buckets = {}  # clear it
 
@@ -243,7 +290,11 @@ class BucketsMixin:
                 file_item.scale_to_height = math.ceil(height * scale_factor)
                 file_item.crop_width = resolution
                 file_item.crop_height = resolution
-                if width > height:
+                file_item.base_scale_to_width = file_item.scale_to_width
+                file_item.base_scale_to_height = file_item.scale_to_height
+                if self.dataset_config.random_crop:
+                    self.roll_random_crop(file_item)
+                elif width > height:
                     file_item.crop_x = int(file_item.scale_to_width / 2 - resolution / 2)
                     file_item.crop_y = 0
                 else:
@@ -273,12 +324,12 @@ class BucketsMixin:
                 new_width = bucket_resolution["width"]
                 new_height = bucket_resolution["height"]
 
+                # remember pre-jitter scale so crops can be re-rolled each epoch
+                file_item.base_scale_to_width = file_item.scale_to_width
+                file_item.base_scale_to_height = file_item.scale_to_height
+
                 if self.dataset_config.random_crop:
-                    # random crop
-                    crop_x = random.randint(0, file_item.scale_to_width - new_width)
-                    crop_y = random.randint(0, file_item.scale_to_height - new_height)
-                    file_item.crop_x = crop_x
-                    file_item.crop_y = crop_y
+                    self.roll_random_crop(file_item)
                 else:
                     # do central crop
                     file_item.crop_x = int((file_item.scale_to_width - new_width) / 2)
@@ -827,6 +878,7 @@ class ImageProcessingDTOMixin:
                 Image.BICUBIC)
             min_img_size = min(img.size)
             if self.dataset_config.random_crop:
+                _rc_pct = getattr(self.dataset_config, 'random_crop_percent', 0.0) or 0.0
                 if self.dataset_config.random_scale and min_img_size > self.dataset_config.resolution:
                     if min_img_size < self.dataset_config.resolution:
                         print_acc(
@@ -837,6 +889,15 @@ class ImageProcessingDTOMixin:
                     scaler = scale_size / min_img_size
                     scale_width = int((img.width + 5) * scaler)
                     scale_height = int((img.height + 5) * scaler)
+                    img = img.resize((scale_width, scale_height), Image.BICUBIC)
+                elif _rc_pct > 0:
+                    # scale so the resolution-sized crop covers a random
+                    # (1 - pct)..1.0 fraction of the short side
+                    target_min = int(math.ceil(self.dataset_config.resolution / (1.0 - random.uniform(0.0, _rc_pct))))
+                    target_min = max(target_min, self.dataset_config.resolution)
+                    scaler = target_min / min_img_size
+                    scale_width = max(self.dataset_config.resolution, int(math.ceil(img.width * scaler)))
+                    scale_height = max(self.dataset_config.resolution, int(math.ceil(img.height * scaler)))
                     img = img.resize((scale_width, scale_height), Image.BICUBIC)
                 img = transforms.RandomCrop(self.dataset_config.resolution)(img)
             else:

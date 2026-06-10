@@ -897,6 +897,18 @@ class DatasetConfig:
             self.caption_ext = '.' + self.caption_ext
         self.random_scale: bool = kwargs.get('random_scale', False)
         self.random_crop: bool = kwargs.get('random_crop', False)
+        # Randomly crop away up to this much of each image, re-rolled every epoch.
+        # Accepts 0-100 (percent) or 0.0-1.0 (fraction). e.g. 20 means each epoch,
+        # each image is seen through a window covering a random 80-100% of it,
+        # placed at a random position, before bucket scaling/cropping.
+        _rcp = kwargs.get('random_crop_percent', 0.0) or 0.0
+        _rcp = float(_rcp)
+        if _rcp > 1.0:
+            _rcp = _rcp / 100.0
+        self.random_crop_percent: float = max(0.0, min(_rcp, 0.9))
+        if self.random_crop_percent > 0:
+            # percent cropping implies random_crop
+            self.random_crop = True
         self.resolution: int = kwargs.get('resolution', 512)
         self.scale: float = kwargs.get('scale', 1.0)
         self.buckets: bool = kwargs.get('buckets', True)
@@ -967,6 +979,12 @@ class DatasetConfig:
 
         if (len(self.augments) > 0 or has_augmentations) and (self.cache_latents or self.cache_latents_to_disk):
             print(f"WARNING: Augments are not supported with caching latents. Setting cache_latents to False")
+            self.cache_latents = False
+            self.cache_latents_to_disk = False
+
+        if self.random_crop_percent > 0 and (self.cache_latents or self.cache_latents_to_disk):
+            print(f"WARNING: random_crop_percent re-rolls crops every epoch, which is not supported "
+                  f"with caching latents. Setting cache_latents to False")
             self.cache_latents = False
             self.cache_latents_to_disk = False
 

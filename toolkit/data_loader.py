@@ -604,6 +604,10 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             if self.is_generating_controls:
                 # always do this last
                 self.setup_controls()
+        else:
+            # re-roll random crops so each epoch sees a different crop of each image
+            if self.dataset_config.buckets and self.dataset_config.random_crop:
+                self.reroll_random_crops()
         self.epoch_num += 1
 
     def __len__(self):
