@@ -1,0 +1,118 @@
+---
+# Ideogram 4 LoRA with GUIDANCE-AWARE LOSS on a single 24 GB GPU.
+#
+# Ideogram 4 samples with CFG between TWO networks: the conditional
+# transformer and a separate "unconditional" transformer
+# (v = u + g * (c - u), g = 7 for most of the official schedule). A LoRA
+# trained on the conditional branch alone is amplified by g at inference
+# ("fried" outputs); applying the same LoRA to the unconditional model
+# instead cancels the differential and mutes the style.
+#
+# guidance_aware_training sidesteps this: each step runs the frozen
+# unconditional model forward (no grad), forms u + g * (c_lora - u), and
+# regresses THAT against the flow target. Use the finished LoRA the simple
+# way at inference:
+#   - apply it to the CONDITIONAL model only
+#   - leave the unconditional model untouched
+#   - sample at the guidance scale you trained with (default 7)
+#
+# VRAM: the unconditional model is quantized like the main one and fully
+# layer-offloaded by default (forward-only, so streaming it from CPU costs
+# speed, not correctness). Expect steps ~1.5-2x slower than plain training.
+# See extensions_built_in/diffusion_models/ideogram4/GUIDANCE_AWARE.md
+job: extension
+config:
+  name: "ideogram4_lora_guidance_aware_v1"
+  process:
+    - type: 'sd_trainer'
+      training_folder: "output"
+      device: cuda:0
+#      trigger_word: "p3r5on"
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+      save:
+        dtype: float16
+        save_every: 250
+        max_step_saves_to_keep: 4
+        push_to_hub: false
+      datasets:
+        - folder_path: "/path/to/images/folder"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          shuffle_tokens: false
+          cache_latents_to_disk: true
+          resolution: [ 1024 ]
+      train:
+        batch_size: 1
+        steps: 2000
+        gradient_accumulation_steps: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw8bit"
+        # guidance_grad_rescale (below) keeps gradient magnitudes comparable
+        # to ordinary training, so normal Ideogram 4 LoRA learning rates apply.
+        lr: 1e-4
+        ema_config:
+          use_ema: true
+          ema_decay: 0.99
+        dtype: bf16
+      model:
+        # HF repo id or a local download of it. The unconditional weights come
+        # from the same path (subfolder unconditional_transformer/) unless
+        # overridden in model_kwargs below.
+        name_or_path: "ideogram-ai/ideogram-4-fp8"
+        arch: "ideogram4"
+        quantize: true
+        quantize_te: true
+        # stage weight dequantization through CPU at load time (the
+        # unconditional model always does this regardless of the flag)
+        low_vram: true
+        layer_offloading: true
+        # fraction of the MAIN transformer's linears kept on CPU.
+        # Raise it if you OOM, lower it for speed.
+        layer_offloading_transformer_percent: 0.5
+        layer_offloading_text_encoder_percent: 1.0
+        model_kwargs:
+          # ----- guidance-aware training -----
+          guidance_aware_training: true
+          # number, or [low, high] sampled uniformly per training example.
+          # 7.0 matches the bulk of the official sampler schedule; use
+          # [3.0, 7.0] to also cover the low-guidance "polish" tail.
+          train_guidance_scale: 7.0
+          # divide gradients by g (forward value unchanged) so the usual LR
+          # recipes carry over. Leave on unless you know why you want it off.
+          guidance_grad_rescale: true
+          # apply the guided loss on this fraction of steps (1.0 = always).
+          # Lowering it trades fidelity to the inference operator for speed.
+          guidance_aware_probability: 1.0
+          # the negative model is forward-only: keep all of it on CPU and
+          # stream it. Set 0.0 to keep it resident if you have the VRAM.
+          unconditional_layer_offload_percent: 1.0
+          # where the negative model lives (defaults shown):
+#          unconditional_path: null            # defaults to model.name_or_path
+#          unconditional_subfolder: "unconditional_transformer"
+          # previews use the real dual-model asymmetric CFG when the
+          # unconditional model is loaded.
+          sample_with_unconditional: true
+      sample:
+        sampler: "flowmatch"
+        sample_every: 250
+        width: 1024
+        height: 1024
+        prompts:
+          - "a ginger cat wearing a tiny wizard hat reading a spellbook"
+          - "a man holding a sign that says, 'this is a sign'"
+        # ignored while sampling with the unconditional model (the real
+        # negative branch takes no text at all)
+        neg: ""
+        seed: 42
+        walk_seed: true
+        # match train_guidance_scale: this is the g the LoRA is calibrated for
+        guidance_scale: 7
+        sample_steps: 20
+meta:
+  name: "[name]"
