@@ -1,4 +1,5 @@
 import os
+import random
 from typing import List, Optional
 
 import torch
@@ -29,6 +30,7 @@ from .src.latent_norm import get_latent_norm
 from .src.pipeline import (
     Ideogram4Pipeline,
     get_qwen3_vl_features,
+    guidance_aware_prediction,
     pad_text_features,
     patchify_latents,
     predict_velocity,
@@ -188,6 +190,55 @@ class Ideogram4Model(BaseModel):
         self._latent_shift = None
         self._latent_scale = None
 
+        # ------------------------------------------------------------------
+        # Guidance-aware training (dual-model asymmetric CFG).
+        #
+        # Ideogram 4 ships a second, separately refined "unconditional"
+        # transformer and samples with v = u + g * (c - u) between the two
+        # networks (g = 7 for most of the official schedule). A LoRA trained on
+        # the conditional branch alone therefore has its residual amplified by
+        # g at inference. With guidance_aware_training the trainer regresses
+        # the full guided combination (unconditional model frozen / no-grad)
+        # against the flow target, so the finished LoRA is applied to the
+        # conditional model ONLY, at the guidance scale it was trained for.
+        # See src/pipeline.py and GUIDANCE_AWARE.md. All knobs live in
+        # model_kwargs to keep shared config classes untouched.
+        # ------------------------------------------------------------------
+        mk = self.model_config.model_kwargs
+        self.guidance_aware_training = bool(mk.get("guidance_aware_training", False))
+        # The negative model can also be loaded without guided training, e.g.
+        # purely so previews match the real dual-model inference operator.
+        self.load_unconditional_model = bool(
+            mk.get("load_unconditional_model", self.guidance_aware_training)
+        )
+        train_g = mk.get("train_guidance_scale", 7.0)
+        if isinstance(train_g, (list, tuple)):
+            if len(train_g) != 2:
+                raise ValueError(
+                    "model_kwargs.train_guidance_scale must be a number or a "
+                    "[low, high] pair for per-sample uniform sampling"
+                )
+            train_g = [float(train_g[0]), float(train_g[1])]
+        else:
+            train_g = float(train_g)
+        self.train_guidance_scale = train_g
+        self.guidance_grad_rescale = bool(mk.get("guidance_grad_rescale", True))
+        self.guidance_aware_probability = float(
+            mk.get("guidance_aware_probability", 1.0)
+        )
+        self.unconditional_path = mk.get("unconditional_path", None)
+        self.unconditional_subfolder = mk.get(
+            "unconditional_subfolder", "unconditional_transformer"
+        )
+        self.unconditional_layer_offload_percent = mk.get(
+            "unconditional_layer_offload_percent", None
+        )
+        self.sample_with_unconditional = bool(
+            mk.get("sample_with_unconditional", True)
+        )
+        self.unconditional_transformer = None
+        self._unconditional_moved_to_device = False
+
     @property
     def text_embedding_space_version(self):
         # we changed the embeddings. invalidate cache.
@@ -222,23 +273,32 @@ class Ideogram4Model(BaseModel):
         text_encoder.requires_grad_(False)
         return tokenizer, text_encoder
 
-    def _load_transformer(self, base: str):
+    def _load_transformer(
+        self,
+        base: str,
+        subfolder: str = "transformer",
+        label: str = "transformer",
+        low_vram: Optional[bool] = None,
+    ):
         dtype = self.torch_dtype
-        self.print_and_status_update("Loading transformer")
+        self.print_and_status_update(f"Loading {label}")
+
+        if low_vram is None:
+            low_vram = self.model_config.low_vram
 
         transformer_config = Ideogram4Config()
         with torch.device("meta"):
             transformer = Ideogram4Transformer2DModel(transformer_config)
 
-        self.print_and_status_update("  - fetching transformer weights")
+        self.print_and_status_update(f"  - fetching {label} weights")
         state_dict = _load_component_state_dict(
-            base, "transformer", "diffusion_pytorch_model"
+            base, subfolder, "diffusion_pytorch_model"
         )
-        self.print_and_status_update("  - dequantizing transformer weights")
+        self.print_and_status_update(f"  - dequantizing {label} weights")
         state_dict = _dequantize_fp8_state_dict(
-            state_dict, dtype, self.device_torch, self.model_config.low_vram
+            state_dict, dtype, self.device_torch, low_vram
         )
-        self.print_and_status_update("  - loading transformer state dict")
+        self.print_and_status_update(f"  - loading {label} state dict")
         transformer.load_state_dict(state_dict, assign=True)
         del state_dict
         flush()
@@ -298,6 +358,10 @@ class Ideogram4Model(BaseModel):
             # quantize_model leaves the model on CPU; make sure it lands on device.
             transformer.to(self.device_torch)
         flush()
+
+        if self.load_unconditional_model:
+            self._load_unconditional_transformer()
+            flush()
 
         tokenizer, text_encoder = self._load_text_encoder(base)
         if self.model_config.quantize_te:
@@ -373,6 +437,122 @@ class Ideogram4Model(BaseModel):
         return img
 
     # ------------------------------------------------------------------
+    # Guidance-aware training (dual-model asymmetric CFG)
+    # ------------------------------------------------------------------
+    def _load_unconditional_transformer(self):
+        """Load Ideogram 4's separate unconditional (negative-branch) model.
+
+        Frozen, eval-only, never trained and never saved — the LoRA network is
+        attached to ``self.model`` (via ``get_model_to_train``) so this second
+        instance is untouched by it. It is quantized with the same settings as
+        the main transformer, then layer-offloaded (default: fully) so it
+        streams from CPU during its forward pass. Since the pass is
+        forward-only / no-grad, aggressive offloading costs speed, not
+        correctness, which is what keeps the 24 GB budget intact.
+        """
+        base = self.unconditional_path or self.model_config.name_or_path
+        # Force CPU staging for the dequant: by this point the main transformer
+        # already occupies the GPU, and a second 18.6 GB bf16 staging pass on
+        # device would OOM a 24 GB card. Each tensor is still dequantized on
+        # GPU, just parked on CPU afterwards.
+        uncond = self._load_transformer(
+            base,
+            subfolder=self.unconditional_subfolder,
+            label="unconditional transformer",
+            low_vram=True,
+        )
+        uncond.requires_grad_(False)
+        uncond.eval()
+
+        if self.model_config.quantize:
+            self.print_and_status_update("Quantizing unconditional transformer")
+            # quantize_model() has an accuracy-recovery-adapter branch that
+            # attaches an ARA network to the module it quantizes and stores it
+            # on the base model. The ARA belongs to the *trained* (conditional)
+            # transformer only, so suppress it while quantizing the frozen
+            # negative model.
+            ara = self.model_config.accuracy_recovery_adapter
+            self.model_config.accuracy_recovery_adapter = None
+            try:
+                quantize_model(self, uncond)
+            finally:
+                self.model_config.accuracy_recovery_adapter = ara
+            flush()
+        else:
+            print_acc(
+                "  - WARNING: unconditional transformer is not quantized "
+                "(~18.6 GB of bf16 weights to stream). Set model.quantize: true "
+                "for the 24 GB recipe."
+            )
+
+        offload_percent = self.unconditional_layer_offload_percent
+        if offload_percent is None:
+            offload_percent = 1.0
+        offload_percent = float(offload_percent)
+
+        if offload_percent > 0:
+            self.print_and_status_update(
+                "Layer-offloading unconditional transformer "
+                f"({offload_percent:.0%} of linear layers on CPU)"
+            )
+            MemoryManager.attach(
+                uncond,
+                self.device_torch,
+                offload_percent=offload_percent,
+                ignore_modules=[
+                    uncond.rotary_emb.inv_freq,
+                    uncond.input_proj,
+                    uncond.llm_cond_proj,
+                ],
+            )
+        elif self.model_config.low_vram:
+            self.print_and_status_update("Moving unconditional transformer to CPU")
+            uncond.to("cpu")
+        else:
+            uncond.to(self.device_torch)
+
+        self.unconditional_transformer = uncond
+        self._unconditional_moved_to_device = False
+
+        if self.guidance_aware_training:
+            tg = self.train_guidance_scale
+            tg_str = (
+                f"uniform[{tg[0]}, {tg[1]}]" if isinstance(tg, list) else f"{tg}"
+            )
+            print_acc(
+                f"Guidance-aware training enabled: g={tg_str}, "
+                f"grad_rescale={self.guidance_grad_rescale}, "
+                f"p={self.guidance_aware_probability}"
+            )
+
+    def _ensure_unconditional_on_device(self):
+        uncond = self.unconditional_transformer
+        if uncond is None:
+            return
+        if hasattr(uncond, "_memory_manager"):
+            # MemoryManager streams the managed linears on demand; its
+            # overridden .to() moves only the unmanaged modules (norms,
+            # embeddings, ignored projections), which is exactly what the
+            # forward pass needs resident. Doing this once is enough.
+            if not self._unconditional_moved_to_device:
+                uncond.to(self.device_torch)
+                self._unconditional_moved_to_device = True
+        elif uncond.device != self.device_torch:
+            uncond.to(self.device_torch)
+
+    def _sample_train_guidance_scale(self, batch_size: int) -> torch.Tensor:
+        """Per-sample guidance for the guided training objective, shape (B,)."""
+        tg = self.train_guidance_scale
+        if isinstance(tg, list):
+            low, high = tg
+            return torch.empty(
+                batch_size, device=self.device_torch, dtype=torch.float32
+            ).uniform_(low, high)
+        return torch.full(
+            (batch_size,), float(tg), device=self.device_torch, dtype=torch.float32
+        )
+
+    # ------------------------------------------------------------------
     # Training hooks
     # ------------------------------------------------------------------
     def get_noise_prediction(
@@ -396,14 +576,44 @@ class Ideogram4Model(BaseModel):
             text_embeddings.text_embeds, self.device_torch, self.torch_dtype
         )
 
-        pred = predict_velocity(
+        latents = latent_model_input.to(self.device_torch)
+
+        use_guided = (
+            self.guidance_aware_training
+            and self.unconditional_transformer is not None
+        )
+        if use_guided and self.guidance_aware_probability < 1.0:
+            use_guided = random.random() < self.guidance_aware_probability
+
+        guidance = None
+        if use_guided:
+            guidance = self._sample_train_guidance_scale(latents.shape[0])
+            if torch.all(guidance == 1.0):
+                # g = 1 is exactly the conditional prediction; skip the
+                # unconditional forward pass entirely.
+                use_guided = False
+
+        if not use_guided:
+            return predict_velocity(
+                self.transformer, latents, t01, llm_features, text_mask
+            )
+
+        self._ensure_unconditional_on_device()
+        # Guided velocity u + g * (c - u): gradients flow through the
+        # conditional branch only; the unconditional pass runs under no_grad.
+        # This is applied to every prediction made through this hook
+        # (including prior / preservation predictions) so all comparisons stay
+        # in the same operator space as inference.
+        return guidance_aware_prediction(
             self.transformer,
-            latent_model_input.to(self.device_torch),
+            self.unconditional_transformer,
+            latents,
             t01,
             llm_features,
             text_mask,
+            guidance,
+            grad_rescale=self.guidance_grad_rescale,
         )
-        return pred
 
     def get_prompt_embeds(self, prompt) -> AdvancedPromptEmbeds:
         if isinstance(prompt, str):

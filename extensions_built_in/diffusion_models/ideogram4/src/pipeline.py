@@ -249,6 +249,111 @@ def predict_velocity(
 
 
 # ---------------------------------------------------------------------------
+# Asymmetric unconditional pass + guidance-aware prediction.
+#
+# Ideogram 4 ships a *separate* unconditional transformer (same architecture,
+# different weights) and samples with classic CFG between the two networks:
+#
+#     v = v_uncond + g * (v_cond - v_uncond)
+#
+# The reference pipeline's negative branch is "asymmetric": it drops the text
+# tokens entirely (the sequence is image tokens only) and feeds zeroed llm
+# features. The helpers below reproduce that exact branch and expose the guided
+# combination as a differentiable training operator: gradients flow through the
+# conditional prediction only, the unconditional pass is always no-grad.
+#
+# Why train against the guided combination? A LoRA trained on the conditional
+# branch alone gets its residual amplified by ``g`` at inference (g=7 for most
+# of the official schedule), which fries outputs unless the LoRA is also
+# applied to the unconditional model — which in turn cancels the differential
+# and mutes the LoRA. Regressing ``v_uncond + g * (v_cond_lora - v_uncond)``
+# against the flow target instead bakes the inference-time operator into
+# training, so the resulting LoRA is meant to be applied to the conditional
+# model only, at the guidance scale it was trained for.
+# ---------------------------------------------------------------------------
+
+
+def predict_velocity_unconditional(
+    transformer: Ideogram4Transformer2DModel,
+    latents: torch.Tensor,  # (B, 128, gh, gw)
+    t: torch.Tensor,  # (B,) toolkit flow time in [0, 1] (1 = pure noise)
+) -> torch.Tensor:
+    """Run the asymmetric unconditional branch: image tokens only, zeroed text.
+
+    Mirrors the reference pipeline's negative pass, which slices the text region
+    off entirely (no padding tokens) and passes zeroed llm features over the
+    image positions. Reuses :func:`predict_velocity` with a zero-length text
+    segment, which produces exactly that packing: an image-only sequence, all
+    ``OUTPUT_IMAGE_INDICATOR`` tokens, a single shared segment, and image-only
+    MRoPE positions.
+    """
+    batch_size = latents.shape[0]
+    llm_dim = transformer.config.llm_features_dim
+    empty_features = torch.zeros(
+        batch_size, 0, llm_dim, device=latents.device, dtype=latents.dtype
+    )
+    empty_mask = torch.zeros(batch_size, 0, dtype=torch.long, device=latents.device)
+    return predict_velocity(transformer, latents, t, empty_features, empty_mask)
+
+
+def combine_guided_velocity(
+    v_cond: torch.Tensor,
+    v_uncond: torch.Tensor,
+    guidance: "torch.Tensor | float",
+    grad_rescale: bool = True,
+) -> torch.Tensor:
+    """``v = v_uncond + g * (v_cond - v_uncond)`` with optional gradient rescale.
+
+    ``guidance`` may be a python float or a per-sample tensor of shape ``(B,)``.
+    The combination is computed in float32 and cast back to ``v_cond.dtype``.
+    ``v_uncond`` is always detached; gradients flow through ``v_cond`` only.
+
+    With ``grad_rescale=True`` (default) the *forward value is unchanged* but
+    the gradient w.r.t. ``v_cond`` is divided by ``g``. Without it, the loss
+    gradient picks up an extra factor of ``g`` (d v/d v_cond = g), which acts
+    like multiplying the learning rate by the guidance scale. Rescaling keeps
+    effective step sizes comparable to ordinary (non-guided) training so
+    existing LR recipes carry over.
+    """
+    if torch.is_tensor(guidance):
+        g = guidance.to(device=v_cond.device, dtype=torch.float32)
+    else:
+        g = torch.tensor(float(guidance), device=v_cond.device, dtype=torch.float32)
+    if g.dim() == 0:
+        g = g.view(1)
+    while g.dim() < v_cond.dim():
+        g = g.unsqueeze(-1)
+
+    v_uncond_f = v_uncond.detach().to(torch.float32)
+    v = g * v_cond.to(torch.float32) + (1.0 - g) * v_uncond_f
+
+    if grad_rescale:
+        v_over_g = v / g
+        v = v_over_g + (v - v_over_g).detach()
+
+    return v.to(v_cond.dtype)
+
+
+def guidance_aware_prediction(
+    cond_transformer: Ideogram4Transformer2DModel,
+    uncond_transformer: Ideogram4Transformer2DModel,
+    latents: torch.Tensor,  # (B, 128, gh, gw)
+    t: torch.Tensor,  # (B,) toolkit flow time in [0, 1]
+    llm_features: torch.Tensor,  # (B, Lt, llm_dim)
+    text_mask: torch.Tensor,  # (B, Lt)
+    guidance: "torch.Tensor | float",
+    grad_rescale: bool = True,
+) -> torch.Tensor:
+    """Differentiable guided velocity: cond pass with grad, uncond pass without."""
+    v_cond = predict_velocity(cond_transformer, latents, t, llm_features, text_mask)
+    with torch.no_grad():
+        v_uncond = predict_velocity_unconditional(
+            uncond_transformer, latents.detach(), t
+        )
+    return combine_guided_velocity(v_cond, v_uncond, guidance, grad_rescale=grad_rescale)
+
+
+# ---------------------------------------------------------------------------
 # Minimal sampling pipeline (for training previews).
 # ---------------------------------------------------------------------------
 
@@ -297,7 +402,20 @@ class Ideogram4Pipeline:
         gw = width // (ae_scale * patch)
         latent_channels = transformer.config.in_channels
 
-        do_cfg = unconditional_embeds is not None and guidance_scale != 1.0
+        # When the separate unconditional transformer is loaded
+        # (guidance_aware_training / load_unconditional_model), previews use
+        # the *real* inference operator: the asymmetric image-only negative
+        # branch on the dedicated unconditional model, exactly like the
+        # reference pipeline and the dual-model ComfyUI workflow. Otherwise
+        # fall back to classic CFG on the conditional model with the (usually
+        # empty) negative prompt.
+        uncond_transformer = getattr(model, "unconditional_transformer", None)
+        use_uncond_model = uncond_transformer is not None and getattr(
+            model, "sample_with_unconditional", True
+        )
+        do_cfg = guidance_scale != 1.0 and (
+            use_uncond_model or unconditional_embeds is not None
+        )
 
         if latents is None:
             shape = (1, latent_channels, gh, gw)
@@ -310,10 +428,14 @@ class Ideogram4Pipeline:
         cond_feats, cond_mask = pad_text_features(
             conditional_embeds.text_embeds, device, dtype
         )
-        if do_cfg:
+        if do_cfg and not use_uncond_model:
             uncond_feats, uncond_mask = pad_text_features(
                 unconditional_embeds.text_embeds, device, dtype
             )
+        if do_cfg and use_uncond_model:
+            ensure_fn = getattr(model, "_ensure_unconditional_on_device", None)
+            if ensure_fn is not None:
+                ensure_fn()
 
         for t in timesteps:
             t01 = (t / 1000.0).to(device).expand(latents.shape[0])
@@ -321,9 +443,14 @@ class Ideogram4Pipeline:
                 transformer, latents.to(dtype), t01, cond_feats, cond_mask
             )
             if do_cfg:
-                v_uncond = predict_velocity(
-                    transformer, latents.to(dtype), t01, uncond_feats, uncond_mask
-                )
+                if use_uncond_model:
+                    v_uncond = predict_velocity_unconditional(
+                        uncond_transformer, latents.to(dtype), t01
+                    )
+                else:
+                    v_uncond = predict_velocity(
+                        transformer, latents.to(dtype), t01, uncond_feats, uncond_mask
+                    )
                 v = v_uncond + guidance_scale * (v_cond - v_uncond)
             else:
                 v = v_cond
