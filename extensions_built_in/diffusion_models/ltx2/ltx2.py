@@ -1022,7 +1022,7 @@ class LTX2Model(BaseModel):
             audio_num_frames=audio_num_frames,
             video_coords=video_coords,
             audio_coords=audio_coords,
-            isolate_modalities=False,
+            isolate_modalities=getattr(batch.dataset_config, "isolate_modalities", False),
             spatio_temporal_guidance_blocks=None,
             perturbation_mask=None,
             use_cross_timestep=use_cross_timestep,
