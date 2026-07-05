@@ -103,6 +103,15 @@ def get_optimizer(
     elif lower_type == 'automagic3':
         from toolkit.optimizers.automagic3 import Automagic3
         optimizer = Automagic3(params, lr=float(learning_rate), **optimizer_params)
+    elif lower_type in {"simplifiedademamixexm", "simplified_ademamix_exm", "ademamixexm"}:
+        from toolkit.optimizers.simplified_ademamix import SimplifiedAdEMAMixExM
+
+        print("Using SimplifiedAdEMAMixExM optimizer")
+        optimizer = SimplifiedAdEMAMixExM(
+            params,
+            lr=float(learning_rate),
+            **optimizer_params,
+        )
     else:
         raise ValueError(f'Unknown optimizer type {optimizer_type}')
     return optimizer
