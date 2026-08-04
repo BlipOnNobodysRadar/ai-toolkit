@@ -1,4 +1,4 @@
-# Triggered after enabling this workflow on the default branch.
+# Triggered after enabling the resolver on the default branch.
 name: Resolve upstream sync
 
 on:
