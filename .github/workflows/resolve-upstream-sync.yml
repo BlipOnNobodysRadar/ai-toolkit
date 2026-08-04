@@ -1,12 +1,10 @@
+# Triggered after enabling this workflow on the default branch.
 name: Resolve upstream sync
 
 on:
   push:
     branches:
       - automation/resolve-upstream-sync
-  pull_request:
-    branches:
-      - main
 
 permissions:
   contents: write
@@ -41,7 +39,6 @@ jobs:
 
           if [[ $merge_status -ne 0 ]]; then
             echo "Resolving expected conflicts with upstream as the base."
-
             git checkout --ours -- ui/package.json
             git checkout --ours -- extensions_built_in/diffusion_models/ltx2/ltx2.py
             git checkout --ours -- toolkit/config_modules.py
