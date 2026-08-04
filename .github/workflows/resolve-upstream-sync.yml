@@ -1,0 +1,123 @@
+name: Resolve upstream sync
+
+on:
+  push:
+    branches:
+      - automation/resolve-upstream-sync
+
+permissions:
+  contents: write
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream and preserve custom features
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/ostris/ai-toolkit.git || true
+          git fetch upstream main
+          git fetch origin blip/ltx23-image-noaudio-optimizer sync/upstream-2026-08-03
+
+          git checkout -B sync/upstream-2026-08-03 upstream/main
+
+          set +e
+          git merge --no-commit --no-ff origin/blip/ltx23-image-noaudio-optimizer
+          merge_status=$?
+          set -e
+
+          if [[ $merge_status -ne 0 ]]; then
+            echo "Resolving expected conflicts with upstream as the base."
+
+            git checkout --ours -- ui/package.json
+            git checkout --ours -- extensions_built_in/diffusion_models/ltx2/ltx2.py
+            git checkout --ours -- toolkit/config_modules.py
+            git checkout --ours -- toolkit/optimizer.py
+          fi
+
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text()
+              if new in text:
+                  return
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f"Expected exactly one insertion point in {path}, found {count}")
+              p.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              "extensions_built_in/diffusion_models/ltx2/ltx2.py",
+              "            isolate_modalities=False,\n",
+              "            isolate_modalities=getattr(batch.dataset_config, \"isolate_modalities\", False),\n",
+          )
+
+          replace_once(
+              "toolkit/config_modules.py",
+              "        self.audio_normalize: bool = kwargs.get('audio_normalize', False) # normalize audio volume levels when loading\n",
+              "        self.audio_normalize: bool = kwargs.get('audio_normalize', False) # normalize audio volume levels when loading\n"
+              "        self.isolate_modalities: bool = kwargs.get('isolate_modalities', False)\n",
+          )
+
+          optimizer_block = '''    elif lower_type in {"simplifiedademamixexm", "simplified_ademamix_exm", "ademamixexm"}:
+              from toolkit.optimizers.simplified_ademamix import SimplifiedAdEMAMixExM
+
+              print("Using SimplifiedAdEMAMixExM optimizer")
+              optimizer = SimplifiedAdEMAMixExM(
+                  params,
+                  lr=float(learning_rate),
+                  **optimizer_params,
+              )
+'''
+          optimizer_path = Path("toolkit/optimizer.py")
+          optimizer_text = optimizer_path.read_text()
+          if "SimplifiedAdEMAMixExM" not in optimizer_text:
+              needle = '''    elif lower_type == 'automagicexperiment':
+'''
+              if optimizer_text.count(needle) != 1:
+                  raise RuntimeError("Could not locate optimizer insertion point")
+              optimizer_text = optimizer_text.replace(needle, optimizer_block + needle, 1)
+              optimizer_path.write_text(optimizer_text)
+          PY
+
+          git add ui/package.json \
+            extensions_built_in/diffusion_models/ltx2/ltx2.py \
+            toolkit/config_modules.py \
+            toolkit/optimizer.py \
+            toolkit/optimizers/simplified_ademamix.py \
+            toolkit/optimizers/utils.py
+
+          unresolved="$(git diff --name-only --diff-filter=U)"
+          if [[ -n "$unresolved" ]]; then
+            echo "Unresolved conflicts remain:"
+            echo "$unresolved"
+            exit 1
+          fi
+
+          grep -Fq 'isolate_modalities=getattr(batch.dataset_config, "isolate_modalities", False)' extensions_built_in/diffusion_models/ltx2/ltx2.py
+          grep -Fq "self.isolate_modalities: bool = kwargs.get('isolate_modalities', False)" toolkit/config_modules.py
+          grep -Fq 'SimplifiedAdEMAMixExM' toolkit/optimizer.py
+          test -s toolkit/optimizers/simplified_ademamix.py
+          test -s toolkit/optimizers/utils.py
+
+          python -m py_compile \
+            extensions_built_in/diffusion_models/ltx2/ltx2.py \
+            toolkit/config_modules.py \
+            toolkit/optimizer.py \
+            toolkit/optimizers/simplified_ademamix.py \
+            toolkit/optimizers/utils.py
+
+          git commit -m "Sync upstream while preserving custom training features"
+          git push --force-with-lease origin sync/upstream-2026-08-03
