@@ -1,7 +1,32 @@
 """Lazy compatibility hooks for fork-specific AI Toolkit features."""
 
 import builtins
+import os
 import sys
+
+
+def _patch_huggingface_downloader():
+    """Route Hugging Face byte transfers through aria2 unless explicitly disabled."""
+    if os.environ.get("AITK_HF_DOWNLOADER", "aria2").strip().lower() != "aria2":
+        return False
+
+    # huggingface_hub reads this during import. Force the regular HTTP path so
+    # our aria2 transfer hook cannot be bypassed by hf-xet.
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
+
+    try:
+        from toolkit.aria2_hf_download import patch_huggingface_downloads
+
+        return patch_huggingface_downloads()
+    except ModuleNotFoundError as exc:
+        # During initial dependency installation huggingface_hub may not exist
+        # yet. The next normal ai-toolkit process will patch it at startup.
+        if exc.name == "huggingface_hub":
+            return False
+        raise
+
+
+_patch_huggingface_downloader()
 
 
 def _patch_dataset_config():
