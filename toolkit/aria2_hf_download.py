@@ -139,6 +139,10 @@ def aria2_http_get(
     del tqdm_class, _nb_retries, kwargs  # aria2 handles retries/progress itself.
 
     if expected_size is not None and resume_size == expected_size:
+        target_name = getattr(temp_file, "name", None)
+        if isinstance(target_name, (str, bytes, os.PathLike)):
+            control_path = Path(os.fsdecode(os.fspath(target_name)) + ".aria2")
+            control_path.unlink(missing_ok=True)
         return
 
     target_name = getattr(temp_file, "name", None)
@@ -163,10 +167,15 @@ def aria2_http_get(
     # Hugging Face normally opens this path in append mode and derives
     # resume_size from it. Keep the path and partial bytes intact on resume.
     temp_file.flush()
+    control_path = Path(str(target) + ".aria2")
     if resume_size <= 0:
         temp_file.seek(0)
         temp_file.truncate(0)
         temp_file.flush()
+        # A force-download can remove Hugging Face's .incomplete file without
+        # knowing about aria2's sidecar. Never let stale piece metadata apply
+        # to a fresh zero-byte download.
+        control_path.unlink(missing_ok=True)
         resume_size = 0
 
     connections = _env_int("AITK_ARIA2_CONNECTIONS", 16, 1, 16)
@@ -187,8 +196,9 @@ def aria2_http_get(
         binary,
         "--continue=true",
         "--auto-file-renaming=false",
-        "--allow-overwrite=true",
         "--file-allocation=none",
+        "--always-resume=true",
+        "--auto-save-interval=5",
         f"--max-connection-per-server={connections}",
         f"--split={connections}",
         "--min-split-size=1M",
