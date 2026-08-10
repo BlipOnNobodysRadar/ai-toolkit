@@ -321,6 +321,8 @@ class CaptionProcessingDTOMixin:
             self.raw_caption_short: str = None
             self.caption: str = None
             self.caption_short: str = None
+            # caption with the trigger word replaced by the diff output preservation class
+            self.caption_dop: str = None
 
             dataset_config: DatasetConfig = kwargs.get('dataset_config', None)
             self.extra_values: List[float] = dataset_config.extra_values
@@ -367,6 +369,14 @@ class CaptionProcessingDTOMixin:
         self.caption = self.get_caption()
         if self.raw_caption_short is not None:
             self.caption_short = self.get_caption(short_caption=True)
+        if self.dataset_config.diff_output_preservation:
+            # replace this dataset's trigger word with the preservation class.
+            # do it on the final caption so token order matches the normal caption
+            self.caption_dop = self.caption
+            if self.trigger_word is not None:
+                self.caption_dop = self.caption.replace(
+                    self.trigger_word, self.dataset_config.diff_output_preservation_class
+                )
 
     def get_caption(
             self: 'FileItemDTO',
@@ -470,6 +480,33 @@ class AudioProcessingDTOMixin:
         
 
 class ImageProcessingDTOMixin:
+    def get_auto_frame_count(self: 'FileItemDTO', total_frames: int, video_fps: float) -> int:
+        # frame count this video will train at with auto_frame_count. Also called at
+        # FileItemDTO init so bucket keys carry the real frame count, so it must give
+        # the same answer at bucketing time and at load time.
+        # allow for any length video here but make sure it is temporally compressable.
+        vid_length_seconds = total_frames / video_fps
+
+        desired_num_frames = int(vid_length_seconds * self.dataset_config.fps)
+
+        if getattr(self, 'frame_count_snapper', None) is not None:
+            # model-specific valid-frame-count grid (e.g. minimax_h3's 17n+5)
+            desired_num_frames = self.frame_count_snapper(desired_num_frames)
+        else:
+            # make sure it is divisible by temporal_compression
+            if self.dataset_config.trim_auto_frame_count_tail:
+                # snap to the largest valid count that fits inside the video (after the
+                # key frame +1 below) so trim mode never overshoots the source, which
+                # would freeze the last frame and pad the audio tail with silence
+                desired_num_frames = max(0, desired_num_frames - 1) // self.temporal_compression * self.temporal_compression
+            else:
+                desired_num_frames = desired_num_frames // self.temporal_compression * self.temporal_compression
+
+            # TODO, all models currently add a key frame, but future models may not, update here if this changes.
+            desired_num_frames += 1  # add one for the key frame that is always added
+
+        return desired_num_frames
+
     def load_and_process_video(
         self: 'FileItemDTO',
         transform: Union[None, transforms.Compose],
@@ -511,26 +548,18 @@ class ImageProcessingDTOMixin:
             frames_to_extract = []
             
             if self.dataset_config.auto_frame_count:
-                # allow for any length video here but make sure it is temporally compressable.
-                vid_length_seconds = total_frames / video_fps
+                self.num_frames = self.get_auto_frame_count(total_frames, video_fps)
 
-                desired_num_frames = int(vid_length_seconds * self.dataset_config.fps)
 
-                if getattr(self, 'frame_count_snapper', None) is not None:
-                    # model-specific valid-frame-count grid (e.g. minimax_h3's 17n+5)
-                    desired_num_frames = self.frame_count_snapper(desired_num_frames)
-                else:
-                    # make sure it is divisible by temporal_compression
-                    desired_num_frames = desired_num_frames // self.temporal_compression * self.temporal_compression
-
-                    # TODO, all models currently add a key frame, but future models may not, update here if this changes.
-                    desired_num_frames += 1  # add one for the key frame that is always added
-
-                self.num_frames = desired_num_frames
-                
-            
             # Always stretch/shrink to the requested number of frames if needed
-            if self.dataset_config.shrink_video_to_frames or total_frames < self.num_frames:
+            if self.dataset_config.auto_frame_count and self.dataset_config.trim_auto_frame_count_tail:
+                # preserve real time: pull frames at the dataset fps from the start of the
+                # video and trim the tail that didn't fit the snapped frame count, instead of
+                # shrinking the whole video to fit (which speeds up motion / chipmunks audio).
+                # Critical for audio models (e.g. minimax_h3) where audio must stay in sync.
+                fps_ratio = video_fps / self.dataset_config.fps if video_fps and video_fps > 0 else 1.0
+                frames_to_extract = [min(round(i * fps_ratio), max_frame_index) for i in range(self.num_frames)]
+            elif self.dataset_config.shrink_video_to_frames or total_frames < self.num_frames:
                 # Distribute frames evenly across the entire video
                 interval = max_frame_index / (self.num_frames - 1) if self.num_frames > 1 else 0
                 frames_to_extract = [min(int(round(i * interval)), max_frame_index) for i in range(self.num_frames)]
@@ -733,10 +762,20 @@ class ImageProcessingDTOMixin:
                             gain = target_peak / (peak + eps)
                             waveform = waveform * gain
 
+                        trim_tail_audio = (
+                            self.dataset_config.auto_frame_count
+                            and self.dataset_config.trim_auto_frame_count_tail
+                        )
+
                         # Slice to the selected clip region (when we have a meaningful time range)
                         if source_duration > 0.0:
                             start_sample = int(round(clip_start_time * sample_rate))
-                            end_sample = int(round(clip_end_time * sample_rate))
+                            if trim_tail_audio and target_duration > 0.0:
+                                # time must stay 1:1 with the video — cut exactly the
+                                # training duration so no stretch is needed below
+                                end_sample = start_sample + round(target_duration * sample_rate)
+                            else:
+                                end_sample = round(clip_end_time * sample_rate)
                             start_sample = max(0, min(start_sample, waveform.shape[-1]))
                             end_sample = max(0, min(end_sample, waveform.shape[-1]))
                             if end_sample > start_sample:
@@ -749,10 +788,19 @@ class ImageProcessingDTOMixin:
                             waveform = None
 
                     if waveform is not None and waveform.numel() > 0:
-                        target_samples = int(round(target_duration * sample_rate))
+                        target_samples = round(target_duration * sample_rate)
                         if target_samples > 0 and waveform.shape[-1] != target_samples:
                             # Time-stretch/shrink to match the video clip duration implied by dataset FPS.
-                            if self.dataset_config.audio_preserve_pitch:
+                            if trim_tail_audio:
+                                # never stretch/contract in trim mode. The waveform can only be
+                                # short here (audio/video ended a hair before the target) —
+                                # pad the tail with silence, or cut any rounding overshoot
+                                pad = target_samples - waveform.shape[-1]
+                                if pad > 0:
+                                    waveform = F.pad(waveform, (0, pad))
+                                else:
+                                    waveform = waveform[..., :target_samples]
+                            elif self.dataset_config.audio_preserve_pitch:
                                 waveform = time_stretch_preserve_pitch(waveform, sample_rate, target_samples)  # waveform is [C, L]
                             else:
                                 # Use linear interpolation over the time axis.
@@ -1732,6 +1780,10 @@ class LatentCachingFileItemDTOMixin:
         if self.is_video and self.dataset_config.auto_frame_count:
             # don't store num frames here as it is calculated dynamically
             item["auto_frame_count"] = True
+            if self.dataset_config.trim_auto_frame_count_tail:
+                # changes frame selection; only added when on so caches made before
+                # this option existed stay valid when it is off
+                item["trim_auto_frame_count_tail"] = True
             is_video = True
         elif self.is_video and self.dataset_config.num_frames > 1:
             item["num_frames"] = self.dataset_config.num_frames
@@ -2035,17 +2087,20 @@ class TextEmbeddingFileItemDTOMixin:
             super().__init__(*args, **kwargs)
         self.prompt_embeds: Union[PromptEmbeds, None] = None
         self._text_embedding_path: Union[str, None] = None
+        # diff output preservation embeds (caption with trigger word replaced by class)
+        self.dop_prompt_embeds: Union[PromptEmbeds, None] = None
+        self._dop_text_embedding_path: Union[str, None] = None
         self.is_text_embedding_cached = False
         self.text_embedding_load_device = 'cpu'
         self.text_embedding_version = 1
 
-    def get_text_embedding_info_dict(self: 'FileItemDTO'):
+    def get_text_embedding_info_dict(self: 'FileItemDTO', caption_override=None):
         # make sure the caption is loaded here
         # TODO: we need a way to cache all the other features like trigger words, DOP, etc. For now, we need to throw an error if not compatible.
         if self.caption is None:
             self.load_caption()
         item = OrderedDict([
-            ("caption", self.caption),
+            ("caption", self.caption if caption_override is None else caption_override),
             ("text_embedding_space_version", self.text_embedding_space_version),
             ("text_embedding_version", self.text_embedding_version),
         ])
@@ -2061,27 +2116,47 @@ class TextEmbeddingFileItemDTOMixin:
             item["first_frame_in_te"] = True
         return item
 
+    def _build_text_embedding_path(self: 'FileItemDTO', caption_override=None):
+        # we store text embeddings in a folder in same path as image called _text_embedding_cache
+        img_dir = os.path.dirname(self.path)
+        te_dir = os.path.join(img_dir, '_t_e_cache')
+        hash_dict = self.get_text_embedding_info_dict(caption_override=caption_override)
+        filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
+        # get base64 hash of md5 checksum of hash_dict
+        hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
+        hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
+        hash_str = hash_str.replace('=', '')
+        return os.path.join(te_dir, f'{filename_no_ext}_{hash_str}.safetensors')
+
     def get_text_embedding_path(self: 'FileItemDTO', recalculate=False):
         if self._text_embedding_path is not None and not recalculate:
             return self._text_embedding_path
         else:
-            # we store text embeddings in a folder in same path as image called _text_embedding_cache
-            img_dir = os.path.dirname(self.path)
-            te_dir = os.path.join(img_dir, '_t_e_cache')
-            hash_dict = self.get_text_embedding_info_dict()
-            filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
-            # get base64 hash of md5 checksum of hash_dict
-            hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
-            hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
-            hash_str = hash_str.replace('=', '')
-            self._text_embedding_path = os.path.join(te_dir, f'{filename_no_ext}_{hash_str}.safetensors')
+            self._text_embedding_path = self._build_text_embedding_path()
 
         return self._text_embedding_path
+
+    def get_dop_text_embedding_path(self: 'FileItemDTO', recalculate=False):
+        if self._dop_text_embedding_path is not None and not recalculate:
+            return self._dop_text_embedding_path
+        else:
+            # make sure the caption is loaded so caption_dop is built
+            if self.caption is None:
+                self.load_caption()
+            # if the trigger word is not in the caption, this hashes to the same
+            # path as the normal embedding and the cache file is shared
+            self._dop_text_embedding_path = self._build_text_embedding_path(
+                caption_override=self.caption_dop
+            )
+
+        return self._dop_text_embedding_path
 
     def cleanup_text_embedding(self):
         if self.prompt_embeds is not None:
             # we are caching on disk, don't save in memory
             self.prompt_embeds = None
+        if self.dop_prompt_embeds is not None:
+            self.dop_prompt_embeds = None
 
     def load_prompt_embedding(self, device=None):
         if not self.is_text_embedding_cached:
@@ -2089,6 +2164,13 @@ class TextEmbeddingFileItemDTOMixin:
         if self.prompt_embeds is None:
             # load it from disk
             self.prompt_embeds = PromptEmbeds.load(self.get_text_embedding_path())
+        if self.dataset_config.diff_output_preservation and self.dop_prompt_embeds is None:
+            dop_path = self.get_dop_text_embedding_path()
+            if dop_path == self.get_text_embedding_path():
+                # no trigger word in caption, same embedding
+                self.dop_prompt_embeds = self.prompt_embeds
+            else:
+                self.dop_prompt_embeds = PromptEmbeds.load(dop_path)
 
 class TextEmbeddingCachingMixin:
     def __init__(self: 'AiToolkitDataset', **kwargs):
@@ -2110,13 +2192,21 @@ class TextEmbeddingCachingMixin:
                 file_item.latent_load_device = self.sd.device
 
                 text_embedding_path = file_item.get_text_embedding_path(recalculate=True)
+                # (path, caption) pairs to encode for this item
+                encode_targets = [(text_embedding_path, file_item.caption)]
+                if self.dataset_config.diff_output_preservation:
+                    dop_path = file_item.get_dop_text_embedding_path(recalculate=True)
+                    if dop_path != text_embedding_path:
+                        # trigger word was in the caption, cache the DOP version too
+                        encode_targets.append((dop_path, file_item.caption_dop))
                 # only process if not saved to disk
-                if not os.path.exists(text_embedding_path):
+                encode_targets = [t for t in encode_targets if not os.path.exists(t[0])]
+                if len(encode_targets) > 0:
                     # load if not loaded
                     if not did_move:
                         self.sd.set_device_state_preset('cache_text_encoder')
                         did_move = True
-                        
+
                     if file_item.encode_control_in_text_embeddings and file_item.control_path is not None:
                         ctrl_img_list = []
                         control_path_list = file_item.control_path
@@ -2143,7 +2233,10 @@ class TextEmbeddingCachingMixin:
                             ctrl_img = ctrl_img_list[0]
                         else:
                             ctrl_img = ctrl_img_list
-                        prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption, control_images=ctrl_img)
+                        for path, caption in encode_targets:
+                            prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption, control_images=ctrl_img)
+                            prompt_embeds.save(path)
+                            del prompt_embeds
                     elif (
                         getattr(self.sd, 'encode_first_frame_in_text_embeddings', False)
                         and self.dataset_config.do_i2v
@@ -2163,13 +2256,16 @@ class TextEmbeddingCachingMixin:
                         )
                         if self.sd.has_multiple_control_images:
                             ctrl_img = [ctrl_img]
-                        prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption, control_images=ctrl_img)
+                        for path, caption in encode_targets:
+                            prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption, control_images=ctrl_img)
+                            prompt_embeds.save(path)
+                            del prompt_embeds
                         file_item.tensor = None
                     else:
-                        prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption)
-                    # save it
-                    prompt_embeds.save(text_embedding_path)
-                    del prompt_embeds
+                        for path, caption in encode_targets:
+                            prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption)
+                            prompt_embeds.save(path)
+                            del prompt_embeds
                 file_item.is_text_embedding_cached = True
                 i += 1
             # restore device state
