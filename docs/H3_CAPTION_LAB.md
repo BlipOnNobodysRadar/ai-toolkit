@@ -1,6 +1,6 @@
 # MiniMax-H3 Caption Lab (experimental)
 
-This is a first-pass attempt to turn MiniMax-H3 back around on unlabeled video. It is intentionally a lab tool rather than a production captioner.
+This is an experimental attempt to turn MiniMax-H3 back around on unlabeled video. It is a lab tool, not a production captioner.
 
 The pipeline is:
 
@@ -8,27 +8,28 @@ The pipeline is:
 2. Qwen3-VL is unloaded from the GPU.
 3. MiniMax-H3 encodes the real clip to its own video/audio latent spaces.
 4. For each caption, H3 receives the same noisy version of the real clip at several flow timesteps.
-5. The caption is ranked by how much it improves H3's flow-prediction error relative to a blank-caption baseline.
+5. Captions are ranked by how much they improve H3's flow-prediction error relative to a blank-caption baseline.
 
-That last step is the interesting part: H3 itself decides which text better explains the clip in the representation used for H3 training. The score is still experimental; it is not a calibrated likelihood and should be validated against human preference before trusting it at scale.
+The interesting part is step 5: H3 itself provides the ranking signal in the representation used for H3 training. The score is not a calibrated likelihood and still needs broad human validation.
 
-## Why it should fit a 24 GB card
+## Current field-test status
 
-The proposer and scorer are never resident together. The default proposer is a pre-quantized 4-bit Qwen3-VL-32B model. H3 uses the same fully-offloaded path as low-VRAM training, and H3 scoring defaults to a 256-pixel longest edge. The H3 video/audio VAEs are moved back to CPU after latent extraction, and the DiT is parked on CPU whenever the H3 Qwen conditioner is needed.
+The first real 4090 test succeeded end-to-end in separate stages:
 
-A 4090 is therefore a plausible target, but the 32B proposer is the tightest stage. If it OOMs on a particular clip, reduce `--qwen-video-tokens`, reduce `--qwen-fps`, or temporarily use an 8B Qwen3-VL proposer. H3 scoring is independent of which model proposed the captions.
+- the official `Qwen/Qwen3-VL-8B-Instruct`, dynamically quantized to NF4, generated dense captions for a 14-second clip;
+- H3 loaded with full text-encoder/transformer offload and scored the clip at a 256-pixel longest edge;
+- at timestep 500, two plausible captions both ranked above an intentionally unrelated rainy-night sports-car caption;
+- the more complete of the two plausible captions ranked first.
 
-## Requirements
+That is an encouraging sanity check, not proof that the score is reliable enough for automatic labeling.
 
-Use the normal ai-toolkit environment. For the current PyTorch 2.13 builds, TorchCodec 0.13 is required for the optional audio decode path; this branch updates the stale 0.9.1 pin.
+The original default `unsloth/Qwen3-VL-32B-Instruct-bnb-4bit` checkpoint loaded on the same machine but failed during vision inference in BitsAndBytes with an uninitialized FP4 quantization state. The proven-good default is therefore now the official 8B model. `--qwen-model` remains available for experiments with other proposers.
 
-The default Qwen proposer is:
+## 24 GB design
 
-```text
-unsloth/Qwen3-VL-32B-Instruct-bnb-4bit
-```
+The proposer and H3 scorer are never resident together. Qwen is unloaded before H3 loads. H3 uses the same fully-offloaded low-VRAM path as training, H3 scoring defaults to a 256-pixel longest edge, the VAEs are returned to CPU after latent extraction, and the DiT is parked on CPU while H3's 32B Qwen conditioner produces text embeddings.
 
-It is a separate download from H3's truncated/quantized Qwen conditioner.
+Use the normal ai-toolkit environment. TorchCodec 0.13 is required for the optional audio path with the current PyTorch build.
 
 ## Full caption + rank
 
@@ -40,16 +41,42 @@ venv/bin/python tools/h3_caption_lab.py caption /path/to/clip.mp4 \
   --write-sidecar
 ```
 
-This writes:
+The script adds the repository root to `sys.path` itself, so `PYTHONPATH=.` is no longer required.
 
-- `clip.mp4.h3caption.json` — all candidates, per-pass losses, and ranking.
-- `clip.txt` — the winning caption, only when `--write-sidecar` is given.
+Default result names are command-specific:
 
-Existing `.txt` captions are never overwritten unless `--overwrite` is also supplied.
+- `generate` -> `clip.mp4.qwen.json`
+- `score` -> `clip.mp4.h3score.json`
+- `caption` -> `clip.mp4.h3caption.json`
+- `--write-sidecar` -> `clip.txt`
+
+Existing result JSON and sidecars are not overwritten unless `--overwrite` is explicitly supplied. `--output` can always be used to choose a different result path.
+
+## Generate candidates without H3
+
+```bash
+venv/bin/python tools/h3_caption_lab.py generate /path/to/clip.mp4 \
+  --candidates 4 \
+  --qwen-video-tokens 1536
+```
+
+The default proposer is now:
+
+```text
+Qwen/Qwen3-VL-8B-Instruct
+```
+
+For a smaller first test:
+
+```bash
+venv/bin/python tools/h3_caption_lab.py generate /path/to/clip.mp4 \
+  --candidates 2 \
+  --qwen-video-tokens 1024
+```
 
 ## Feed it the official H3 prompt manual
 
-The built-in proposer instruction covers the important semantic categories but is not intended to replace MiniMax's prompt guide. If you have the official base prompt guide locally:
+The built-in proposer instruction covers temporal order, subjects, environment, camera behavior, composition, lighting, and visible text, but it is not intended to replace MiniMax's prompt guide.
 
 ```bash
 venv/bin/python tools/h3_caption_lab.py caption /path/to/clip.mp4 \
@@ -57,18 +84,9 @@ venv/bin/python tools/h3_caption_lab.py caption /path/to/clip.mp4 \
   --guide /path/to/VIDEO_PROMPT_WRITING_GUIDE_base_en.md
 ```
 
-The guide is injected into the Qwen system instruction (capped at 40k characters).
+The guide is injected into the Qwen system instruction and capped at 40k characters.
 
-## Generate candidates without H3
-
-Useful to inspect Qwen before spending time on H3 scoring:
-
-```bash
-venv/bin/python tools/h3_caption_lab.py generate /path/to/clip.mp4 \
-  --candidates 4
-```
-
-## Score captions you already wrote
+## Score supplied captions
 
 ```bash
 venv/bin/python tools/h3_caption_lab.py score /path/to/clip.mp4 \
@@ -77,28 +95,71 @@ venv/bin/python tools/h3_caption_lab.py score /path/to/clip.mp4 \
   --candidate "second caption"
 ```
 
-Or put captions in a text file separated by blank lines:
+A JSON produced by `generate`, or a text file with captions separated by blank lines, can be supplied directly:
 
 ```bash
 venv/bin/python tools/h3_caption_lab.py score /path/to/clip.mp4 \
   --models-path /path/to/ComfyUI/models \
-  --candidate-file candidates.txt
+  --candidate-file /path/to/clip.mp4.qwen.json
 ```
 
-## 4090 knobs
+## Contrast / corruption sanity test
 
-The conservative defaults are:
+Before trusting the scorer on a dataset, compare a correct caption against deliberately controlled errors. Useful negatives include:
+
+- the same scene with temporal order swapped;
+- correct subjects but wrong camera behavior;
+- correct action but wrong lighting/weather;
+- correct scene but wrong clothing/colors;
+- a deliberately vague caption;
+- a completely unrelated caption.
+
+For a stronger test than a single pass, average several noise seeds at all three default timesteps:
+
+```bash
+venv/bin/python tools/h3_caption_lab.py score /path/to/clip.mp4 \
+  --models-path /path/to/ComfyUI/models \
+  --candidate-file /path/to/contrast_candidates.txt \
+  --timesteps 250 500 750 \
+  --score-repeats 3 \
+  --no-audio-score
+```
+
+`--score-repeats N` repeats every timestep with independent matched noise while keeping exactly the same noise for all candidate captions in each pass.
+
+## Reproducibility
+
+H3's video VAE samples from a posterior during normal `encode_images`. Earlier prototype runs therefore used different clean latent samples even when the diffusion-noise seed was unchanged, which made repeated scores drift noticeably.
+
+The lab now seeds the VAE posterior immediately before latent extraction. The default is:
 
 ```text
-Qwen video sampling: 2 fps
-Qwen visual budget:   1536 tokens
-H3 scoring edge:      256 px
-H3 flow timesteps:    250, 500, 750
-H3 offload:           100% text encoder + transformer
-candidate count:      4
+--latent-seed 1701
 ```
 
-For a faster proof-of-concept:
+Diffusion noise remains controlled independently by:
+
+```text
+--score-seed 1776
+```
+
+The result JSON records the latent seed, score seed, timesteps, repeat count, scoring resolution, and audio settings. Exact bitwise equality is not promised across different CUDA/library builds, but repeated runs in the same environment should now be comparing the same latent sample and matched noise.
+
+## 4090 defaults
+
+```text
+Qwen proposer:         Qwen/Qwen3-VL-8B-Instruct, dynamic NF4
+Qwen video sampling:   2 fps
+Qwen visual budget:    1536 tokens
+H3 scoring edge:       256 px
+H3 flow timesteps:     250, 500, 750
+H3 score repeats:      1
+H3 latent seed:        1701
+H3 offload:            100% text encoder + transformer
+candidate count:       4
+```
+
+For a fast proof of concept:
 
 ```bash
 venv/bin/python tools/h3_caption_lab.py caption /path/to/clip.mp4 \
@@ -109,7 +170,7 @@ venv/bin/python tools/h3_caption_lab.py caption /path/to/clip.mp4 \
   --no-audio-score
 ```
 
-For more discriminating H3 ranking, add timesteps and/or use a larger `--score-max-edge`. That increases runtime and peak memory.
+For more discriminating ranking, increase `--score-repeats`, include more timesteps, and/or increase `--score-max-edge`. All increase runtime; larger scoring resolution can also increase peak VRAM.
 
 ## What the H3 score means
 
@@ -119,34 +180,34 @@ For clean clip latent `x0`, sampled noise `n`, and flow noise level `sigma`, the
 x_sigma = (1 - sigma) * x0 + sigma * n
 ```
 
-H3 predicts ai-toolkit's `noise - clean` velocity target. The tool measures MSE against the known target using identical noise for every caption. It repeats this at several timesteps.
+H3 predicts ai-toolkit's `noise - clean` velocity target. The tool measures MSE against the known target while using identical noise for every caption in a matched pass.
 
-The reported `relative_gain` is the matched relative improvement over an empty caption:
+The reported video relative gain is:
 
 ```text
 (blank_loss - caption_loss) / blank_loss
 ```
 
-Video and audio improvements are normalized independently before being combined, so their raw MSE scales do not have to match. `--audio-weight` controls the audio contribution.
+When audio scoring is enabled, video and audio improvements are normalized independently before being combined. `--audio-weight` controls the audio contribution.
 
-The ranking therefore asks a narrower question than normal caption quality:
+The ranking therefore asks:
 
 > Which candidate makes this specific H3 checkpoint better explain this specific observed clip?
 
-That is exactly why it is potentially useful for H3 training captions, but it remains an empirical hypothesis until tested.
+That is potentially useful for H3 training captions, but it is not equivalent to recovering the original unknown prompt or evaluating general prose quality.
 
 ## Important limitations
 
-- Qwen3-VL sees video, not soundtrack audio. The candidate generator is therefore instructed not to invent audio. H3 can still use the real soundtrack in the ranking signal. A later stage should add transcription and non-speech audio analysis.
-- H3's score can prefer wording quirks or overly specific captions. Human evaluation is needed before bulk auto-labeling.
-- The default scoring path uses the H3 training assistant LoRA, matching the normal H3 training configuration. Use `--no-assistant-lora` to score the naked base checkpoint instead.
-- The first version resizes the clip for scoring while preserving aspect ratio. It does not reproduce every ai-toolkit dataset bucketing/cropping choice.
-- No claim is made that this recovers the original unknown prompt that produced a clip. It ranks captions by conditional flow prediction error.
+- Qwen3-VL sees video, not soundtrack audio, so the proposer is instructed not to invent audio. H3 can still use the real soundtrack in the scoring signal. A later proposer path should add transcription and non-speech audio analysis.
+- The scorer may prefer H3-specific wording quirks or excessive specificity. Human evaluation is required before bulk auto-labeling.
+- The default scoring path uses the H3 training assistant LoRA. Use `--no-assistant-lora` to score the naked base checkpoint.
+- The scorer resizes while preserving aspect ratio; it does not reproduce every ai-toolkit dataset bucketing/cropping choice.
+- A single easy negative is not enough validation. The next useful experiment is a controlled corruption suite across many clips.
 
-## Next experiments if this signal works
+## Next experiments
 
-1. Compare H3 ranking against human ranking on 20-50 clips with deliberately good/bad/camera-wrong/temporally-wrong captions.
-2. Add iterative refinement: let Qwen see the current winner and produce targeted variants, then re-rank.
-3. Add Whisper transcription plus an audio-event model.
-4. Probe whether MiniMax's first 50 Qwen3-VL layers differ materially from stock Qwen3-VL-32B. If they do, experiment with restoring layers 50-63 + norm + LM head and using the H3-adapted lower stack as the caption proposer itself.
-5. If the scorer is useful, train a small inverse adapter from H3 video/audio features into a language decoder using synthetic `(H3 prompt, H3 generation)` pairs.
+1. Test controlled caption corruptions (temporal order, camera, lighting, attributes, vagueness, unrelated content) across 20-50 clips and multiple noise seeds.
+2. Add iterative refinement: Qwen proposes variants of the current winner and H3 re-ranks them.
+3. Add speech transcription and non-speech audio-event analysis; a Qwen3-Omni/other audio-capable proposer is a possible route.
+4. Probe whether MiniMax's first 50 Qwen3-VL layers differ materially from stock Qwen3-VL-32B. If they do, experiment with restoring layers 50-63 + final norm + LM head and using the H3-adapted lower stack itself as an inverse captioner.
+5. If the score continues to correlate with human preference, train a small inverse adapter from H3 video/audio features into a language decoder using synthetic `(H3 prompt, H3 generation)` pairs.
