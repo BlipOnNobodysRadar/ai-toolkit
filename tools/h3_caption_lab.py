@@ -21,15 +21,27 @@ import json
 import math
 import os
 import random
-from dataclasses import dataclass, asdict
+import sys
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Optional
+
+# Running `python tools/h3_caption_lab.py` normally puts tools/ rather than the
+# repository root on sys.path. Add the root so ai-toolkit internals import
+# without requiring callers to remember PYTHONPATH=.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import torch
 import torch.nn.functional as F
 
 
-DEFAULT_QWEN_MODEL = "unsloth/Qwen3-VL-32B-Instruct-bnb-4bit"
+# The original 32B pre-quantized BnB proposer currently fails in its vision
+# stack under the pinned Transformers/BitsAndBytes environment. The official
+# 8B checkpoint, quantized to NF4 at load time below, is the proven-good 24 GB
+# default. --qwen-model can still override it.
+DEFAULT_QWEN_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
 DEFAULT_ASSISTANT_LORA = (
     "ostris/minimax_h3_training_adapter/"
     "minimax_h3_training_adapter_alpha.safetensors"
@@ -121,6 +133,14 @@ def _cleanup_cuda() -> None:
             pass
 
 
+def _seed_everything(seed: int) -> None:
+    """Seed Python and Torch immediately before a stochastic operation."""
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def _read_optional_guide(path: Optional[str]) -> str:
     if not path:
         return ""
@@ -190,14 +210,11 @@ def generate_candidates(
     model.eval()
 
     candidates: list[Candidate] = []
-    video_uri = video_path.resolve().as_uri()
+    video_local_path = str(video_path.resolve())
 
     for i in range(count):
         this_seed = seed + i
-        torch.manual_seed(this_seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(this_seed)
-        random.seed(this_seed)
+        _seed_everything(this_seed)
 
         messages = [
             {
@@ -207,7 +224,7 @@ def generate_candidates(
             {
                 "role": "user",
                 "content": [
-                    {"type": "video", "video": video_uri},
+                    {"type": "video", "path": video_local_path},
                     {
                         "type": "text",
                         "text": (
@@ -225,7 +242,7 @@ def generate_candidates(
             add_generation_prompt=True,
             return_dict=True,
             return_tensors="pt",
-            fps=fps,
+            processor_kwargs={"videos_kwargs": {"fps": fps}},
         )
         input_device = next(model.parameters()).device
         inputs = inputs.to(input_device)
@@ -365,8 +382,8 @@ def _align_video_for_h3(video: torch.Tensor) -> torch.Tensor:
 
 
 def _make_noise(shape, seed: int, device: torch.device) -> torch.Tensor:
-    g = torch.Generator(device="cpu").manual_seed(seed)
-    return torch.randn(shape, generator=g, dtype=torch.float32).to(device)
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    return torch.randn(shape, generator=generator, dtype=torch.float32).to(device)
 
 
 def _embed_caption(h3, text: str):
@@ -472,6 +489,10 @@ def score_candidates(video_path: Path, candidates: list[Candidate], args) -> lis
     num_frames = int(video.shape[0])
 
     print(f"[H3 caption lab] Encoding {num_frames} frames at {video.shape[-1]}x{video.shape[-2]}")
+    # H3's video VAE samples from a posterior. Seed immediately before encode
+    # so repeated score runs use the same clean latent rather than comparing
+    # different posterior samples.
+    _seed_everything(args.latent_seed)
     with torch.inference_mode():
         latents = h3.encode_images([video]).detach()
 
@@ -482,6 +503,7 @@ def score_candidates(video_path: Path, candidates: list[Candidate], args) -> lis
             max_seconds=min(args.max_seconds, num_frames / 24.0),
         )
         if audio_data is not None:
+            _seed_everything(args.latent_seed ^ 0x31A9B7)
             with torch.inference_mode():
                 audio_latents = h3.encode_audio([audio_data]).detach()
             del audio_data
@@ -493,8 +515,16 @@ def score_candidates(video_path: Path, candidates: list[Candidate], args) -> lis
     del video
     _cleanup_cuda()
 
-    pass_grid = [(int(t), int(args.score_seed + i)) for i, t in enumerate(args.timesteps)]
+    pass_grid = []
+    for repeat in range(args.score_repeats):
+        repeat_seed = int(args.score_seed + repeat * 10007)
+        for offset, timestep in enumerate(args.timesteps):
+            pass_grid.append((int(timestep), repeat_seed + offset))
 
+    print(
+        f"[H3 caption lab] Scoring {len(pass_grid)} matched pass(es): "
+        f"{len(args.timesteps)} timestep(s) x {args.score_repeats} noise seed repeat(s)"
+    )
     print("[H3 caption lab] Scoring blank-caption baseline")
     blank_embeds = _embed_caption(h3, "")
     blank_passes = [
@@ -547,7 +577,13 @@ def _load_candidate_file(path: str) -> list[Candidate]:
             if isinstance(item, str):
                 out.append(Candidate(item, source=str(p)))
             elif isinstance(item, dict) and item.get("text"):
-                out.append(Candidate(str(item["text"]), source=str(p)))
+                out.append(
+                    Candidate(
+                        text=str(item["text"]),
+                        source=str(item.get("source") or p),
+                        seed=item.get("seed"),
+                    )
+                )
         return out
 
     text = p.read_text(encoding="utf-8")
@@ -555,21 +591,48 @@ def _load_candidate_file(path: str) -> list[Candidate]:
     return [Candidate(c, source=str(p)) for c in chunks]
 
 
+def _default_output_path(video_path: Path, command: str) -> Path:
+    suffix = {
+        "generate": ".qwen.json",
+        "score": ".h3score.json",
+        "caption": ".h3caption.json",
+    }[command]
+    return video_path.with_suffix(video_path.suffix + suffix)
+
+
 def _write_results(video_path: Path, candidates: list[Candidate], scores: list[CaptionScore], args):
     result_path = (
         Path(args.output).expanduser().resolve()
         if args.output
-        else video_path.with_suffix(video_path.suffix + ".h3caption.json")
+        else _default_output_path(video_path, args.command)
     )
+    if result_path.exists() and not args.overwrite:
+        raise FileExistsError(
+            f"Refusing to overwrite existing results {result_path}; "
+            "pass --overwrite or choose --output."
+        )
+
     payload = {
         "video": str(video_path),
         "experimental": True,
+        "command": args.command,
         "qwen_model": getattr(args, "qwen_model", None),
         "h3_model": getattr(args, "h3_model", None),
+        "settings": {
+            "score_max_edge": getattr(args, "score_max_edge", None),
+            "max_seconds": getattr(args, "max_seconds", None),
+            "timesteps": getattr(args, "timesteps", None),
+            "score_seed": getattr(args, "score_seed", None),
+            "score_repeats": getattr(args, "score_repeats", None),
+            "latent_seed": getattr(args, "latent_seed", None),
+            "audio_weight": getattr(args, "audio_weight", None),
+            "audio_enabled": not getattr(args, "no_audio_score", True),
+        },
         "candidates": [asdict(c) for c in candidates],
         "scores": [asdict(s) for s in scores],
         "best_caption": scores[0].text if scores else (candidates[0].text if candidates else None),
     }
+    result_path.parent.mkdir(parents=True, exist_ok=True)
     result_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"[H3 caption lab] Wrote {result_path}")
 
@@ -601,6 +664,18 @@ def _add_common_score_args(p):
     p.add_argument("--max-seconds", type=float, default=15.0)
     p.add_argument("--timesteps", type=int, nargs="+", default=[250, 500, 750])
     p.add_argument("--score-seed", type=int, default=1776)
+    p.add_argument(
+        "--score-repeats",
+        type=int,
+        default=1,
+        help="Repeat each timestep with independent matched noise seeds and average the gains.",
+    )
+    p.add_argument(
+        "--latent-seed",
+        type=int,
+        default=1701,
+        help="Seed the H3 VAE posterior sample so repeated score runs use the same clean latent.",
+    )
     p.add_argument("--no-audio-score", action="store_true")
     p.add_argument(
         "--audio-weight",
@@ -613,7 +688,11 @@ def _add_common_score_args(p):
 def _add_output_args(p):
     p.add_argument("--output")
     p.add_argument("--write-sidecar", action="store_true")
-    p.add_argument("--overwrite", action="store_true")
+    p.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow replacing an existing result JSON and/or training sidecar.",
+    )
 
 
 def build_parser():
@@ -663,6 +742,8 @@ def main() -> int:
     video_path = Path(args.video).expanduser().resolve()
     if not video_path.is_file():
         raise FileNotFoundError(video_path)
+    if getattr(args, "score_repeats", 1) < 1:
+        raise ValueError("--score-repeats must be >= 1")
 
     candidates: list[Candidate] = []
     if args.command in ("caption", "generate"):
