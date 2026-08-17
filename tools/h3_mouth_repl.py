@@ -9,7 +9,9 @@ Commands:
   /show            print the active video
   /text PROMPT     ask a text-only question
   /ask PROMPT      ask about the active video
-  /h3              produce an H3-oriented generation prompt for the active video
+  /h3              alias for /h3base
+  /h3base          rewrite active video using MiniMax's official base prompt guide
+  /h3ref           rewrite active video using MiniMax's official full-reference guide
   /tokens N        set max_new_tokens for subsequent generations
   /help            show commands
   /quit            exit
@@ -22,7 +24,15 @@ from __future__ import annotations
 
 import argparse
 import shlex
+import sys
+from functools import lru_cache
 from pathlib import Path
+
+# Running `python tools/h3_mouth_repl.py` puts tools/ rather than the repository
+# root on sys.path. Bootstrap the root before importing the sibling tool module.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from tools.h3_mouth_probe import (
     DEFAULT_H3_MODEL,
@@ -40,11 +50,41 @@ from tools.h3_mouth_probe import (
 )
 
 
-H3_PROMPT_REQUEST = """Write a MiniMax H3 generation prompt that would reproduce this exact clip as closely as possible.
+GUIDE_REPO = "MiniMaxAI/MiniMax-H3"
+BASE_GUIDE_PATH = "docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md"
+REF_GUIDE_PATH = "docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md"
 
-Use natural-language production directions rather than commentary about the source video. Preserve the chronological sequence of shots and actions. Include concrete subject appearance, environment, lighting, framing, shot scale, camera angle, camera movement, subject movement, transitions, visible readable text, and continuity details when they matter. Distinguish camera motion from subject motion. Do not invent anything that is not visibly supported. Do not invent dialogue, music, ambience, or sound effects because this vision-only graft cannot hear the soundtrack.
 
-Return only the generation prompt, with enough temporal structure to recreate the clip."""
+@lru_cache(maxsize=2)
+def _official_guide(kind: str) -> str:
+    """Load MiniMax's official guide lazily and cache it for this REPL session."""
+    from huggingface_hub import hf_hub_download
+
+    filename = BASE_GUIDE_PATH if kind == "base" else REF_GUIDE_PATH
+    path = hf_hub_download(repo_id=GUIDE_REPO, filename=filename)
+    return Path(path).read_text(encoding="utf-8")
+
+
+def _h3_prompt_request(kind: str) -> str:
+    guide = _official_guide(kind)
+    if kind == "base":
+        task_note = """
+The supplied asset is the target video itself. Rewrite what is OBSERVED into the T2VA-style three-core-field format from the guide. Do not add an image-alignment instruction. Preserve real shot boundaries and use the guide's shot/cut/camera terminology. The model receiving this request can see the video but cannot hear its soundtrack. Therefore do NOT fabricate dialogue, singing, ambience, sound effects, or music. Where the required audio fields cannot be determined from vision, write exactly `AUDIO_UNAVAILABLE_FROM_VISUAL_MODEL` rather than `N/A` (the guide reserves N/A for known absence/silence). This is an intermediate visual-only rewrite that will later be completed from an audio-capable model.
+"""
+    else:
+        task_note = """
+The supplied asset is the target/reference video being analyzed. Follow the full-reference guide's six-section organization exactly where applicable. Do not invent reference assets that were not supplied. The model receiving this request can see the video but cannot hear its soundtrack. Therefore do NOT fabricate dialogue, singing, ambience, sound effects, or music; mark audio-only facts as `AUDIO_UNAVAILABLE_FROM_VISUAL_MODEL`. This is an intermediate visual-only rewrite that will later be completed from an audio-capable model.
+"""
+
+    return f"""You are producing a MiniMax H3 prompt rewrite for this exact observed video.
+
+Follow the OFFICIAL MiniMax H3 guide below, including its field names, ordering, shot notation, cut-time format, speaker/dialogue conventions when actually observable, camera-motion terminology, and reference-label rules. Preserve chronological order and concrete visual detail. Output only the final rewrite, not commentary about the guide.
+{task_note}
+
+--- OFFICIAL MINIMAX H3 GUIDE START ---
+{guide}
+--- OFFICIAL MINIMAX H3 GUIDE END ---
+"""
 
 
 def build_hybrid(models_path: str, stock_model: str, h3_model: str):
@@ -81,10 +121,16 @@ Commands:
   /show            show active video
   /text PROMPT     text-only generation
   /ask PROMPT      ask about active video
-  /h3              write an H3-oriented generation prompt for active video
+  /h3              alias for /h3base
+  /h3base          official H3 T2VA/base-format visual rewrite
+  /h3ref           official H3 full-reference-format visual rewrite
   /tokens N        change max_new_tokens
   /help            show this help
   /quit            exit
+
+The /h3* commands use MiniMaxAI/MiniMax-H3's official prompt-writing guides.
+Because this Qwen3-VL graft cannot hear audio, audio-only fields are explicitly
+marked AUDIO_UNAVAILABLE_FROM_VISUAL_MODEL rather than hallucinated.
 
 Plain text behaves like /ask when a video is active, otherwise /text.
 """.strip()
@@ -161,9 +207,14 @@ def main() -> int:
 
         mode = None
         prompt = None
-        if raw == "/h3":
+        if raw in ("/h3", "/h3base"):
             mode = "video"
-            prompt = H3_PROMPT_REQUEST
+            print("[H3 mouth REPL] Loading/caching official base prompt guide...")
+            prompt = _h3_prompt_request("base")
+        elif raw == "/h3ref":
+            mode = "video"
+            print("[H3 mouth REPL] Loading/caching official full-reference prompt guide...")
+            prompt = _h3_prompt_request("ref")
         elif raw.startswith("/ask "):
             mode = "video"
             prompt = raw.split(None, 1)[1]
