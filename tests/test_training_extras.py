@@ -316,3 +316,19 @@ def test_transformer_alpha_export_and_resume(tmp_path):
     path=str(tmp_path/'alpha.safetensors');n.save_weights(path,dtype=torch.float32)
     n2=network();n2.apply_to(None,None,False,True);n2.load_weights(path)
     assert all(torch.equal(v,n2.state_dict()[k]) for k,v in raw.items())
+
+
+def test_locon_optimizer_routes_lora_plus(monkeypatch):
+    from toolkit.lycoris_special import LycorisSpecialNetwork
+    from toolkit.config_modules import NetworkConfig
+    class Toy(torch.nn.Module):
+        def __init__(self):
+            super().__init__();self.proj=torch.nn.Linear(4,4,bias=False)
+    monkeypatch.setattr(LycorisSpecialNetwork,'UNET_TARGET_REPLACE_MODULE',['Toy'])
+    toy=Toy();n=LycorisSpecialNetwork(None,toy,lora_dim=2,alpha=1,train_text_encoder=False,
+        network_config=NetworkConfig(type='locon',lora_plus_ratio=4))
+    n.apply_to(None,toy,False,True)
+    groups=n.prepare_optimizer_params(.02,.01)
+    assert {g['lr'] for g in groups}=={.01,.04}
+    up_ids={id(p) for k,p in n.named_parameters() if 'lora_up.' in k}
+    assert up_ids and all(g['lr']==.04 for g in groups for p in g['params'] if id(p) in up_ids)

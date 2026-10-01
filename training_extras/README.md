@@ -1,8 +1,7 @@
 # training_extras — opt-in package user guide
 
 `training_extras` is an **opt-in** package for our existing AI Toolkit fork, ported from
-`67372a/LoRA_Easy_Training_Scripts`. It is not enabled by default; existing recipes, presets
-and checkpoints keep working untouched unless you explicitly turn an extras section on.
+`67372a/LoRA_Easy_Training_Scripts`. It is not enabled by default; extras stay disabled until you explicitly turn them on. This update also fixes native Krea2 loading, cached H3 audio copying, and gradient accumulation.
 
 ## 1. Installation addon dependency
 
@@ -233,4 +232,6 @@ Current Toolkit adapter implementation is used; the screenshot's experimental Ly
 
 ## Provenance and acceptance
 
-Pinned commits, transformations, and vendor hashes are in `source-manifest.json`; optimizer constructor signatures and update coverage are in `optimizer-catalog.json`. See `C:/Users/someb/AI/training-extras/ACCEPTANCE.md` for fresh runtime evidence and usage accounting. Presets are hypotheses, not quality recommendations. Nothing in the comparison directories automatically starts a long training grid.
+Pinned commits, transformations, and vendor hashes are in `source-manifest.json`; optimizer constructor signatures and update coverage are in `optimizer-catalog.json`. See `C:/Users/someb/AI/training-extras/acceptance.json` for fresh runtime evidence and usage accounting. Presets are hypotheses, not quality recommendations. Nothing in the comparison directories automatically starts a long training grid.
+
+Toolkit `steps` counts training-loop iterations under its existing semantics: with `gradient_accumulation_steps: 2`, two loop iterations produce one optimizer update. MiniCPM `--steps` counts optimizer updates. Keep accumulation fixed within each comparison and record both counts. Checkpointing midway through an accumulation group does not serialize unfinished gradients; resume from an optimizer boundary for continuation experiments.
