@@ -221,6 +221,9 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
             self.model_config.name_or_path,
             self.model_config.model_kwargs.get("checkpoint_filename", None),
         )
+        for prefix in ("model.diffusion_model.", "diffusion_model."):
+            if any(k.startswith(prefix) for k in state_dict):
+                state_dict = {k.removeprefix(prefix): v for k, v in state_dict.items()}
         self.print_and_status_update("  - loading transformer state dict")
         transformer = SingleStreamDiT.load_from_state_dict(
             state_dict, dtype, config=config
@@ -241,7 +244,8 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
             te_path, max_length=self.max_text_length, token=HF_TOKEN
         )
         text_encoder = Qwen3VLTextEncoder.load_model(
-            te_path, dtype=dtype, subfolder="", token=HF_TOKEN
+            self.model_config.model_kwargs.get("text_encoder_weight_path", te_path),
+            dtype=dtype, config_path=te_path, subfolder="", token=HF_TOKEN
         )
         vl_processor = None
         if self.is_edit:
@@ -263,7 +267,8 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
         vae_path = self.model_config.model_kwargs.get("vae_path", QWEN_IMAGE_VAE_PATH)
         self.print_and_status_update(f"Loading Qwen-Image VAE from {vae_path}")
         vae = QwenImageVAE.load_model(
-            vae_path, dtype=self.vae_torch_dtype, token=HF_TOKEN
+            vae_path, dtype=self.vae_torch_dtype, token=HF_TOKEN,
+            config_path=self.model_config.model_kwargs.get("vae_config_path", QWEN_IMAGE_VAE_PATH),
         )
         vae.eval()
         vae.requires_grad_(False)

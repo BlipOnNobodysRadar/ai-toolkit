@@ -714,6 +714,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc(e)
                 print_acc("Could not save optimizer")
 
+        if getattr(self, 'training_extras', None) is not None:
+            self.training_extras.checkpoint(os.path.join(self.save_root, 'training_extras.pt'))
         self.clean_up_saves()
         self.post_save_hook(file_path)
 
@@ -1569,6 +1571,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # must be called while the vae and text encoder are still loaded, they may be
         # dumped later to save memory
         val_config = self.train_config.validation_config
+        if val_config is not None and val_config.datasets:
+            from training_extras.toolkit_validation import setup
+            setup(self)
+            return
         if val_config is None:
             return
         if not self.accelerator.is_main_process:
@@ -1657,6 +1663,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
     def validate(self):
         val_config = self.train_config.validation_config
+        if val_config is not None and self._validation_cache is not None and 'native_batches' in self._validation_cache:
+            from training_extras.toolkit_validation import validate
+            validate(self)
+            return
         if val_config is None or self._validation_cache is None:
             return
         if not self.accelerator.is_main_process:
@@ -2156,6 +2166,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         
         # esure params require grad
         self.ensure_params_requires_grad(force=True)
+
         optimizer = get_optimizer(self.params, optimizer_type, learning_rate=self.train_config.lr,
                                   optimizer_params=self.train_config.optimizer_params)
         self.optimizer = optimizer
@@ -2517,6 +2528,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.ensure_params_requires_grad(force=True)
 
 
+        if self._validation_cache is not None and 'native_batches' in self._validation_cache:
+            from training_extras.toolkit_validation import validate
+            validate(self, phase='initial')
+
         ###################################################################
         # TRAIN LOOP
         ###################################################################
@@ -2630,6 +2645,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.num_consecutive_oom > 3:
                     raise RuntimeError("OOM during training step 3 times in a row, aborting training")
                 optimizer.zero_grad(set_to_none=True)
+                if getattr(self, 'training_extras', None) is not None:
+                    self.training_extras.edm.zero_grad()
                 flush()
                 torch.cuda.ipc_collect()
                 # skip this step and keep going
@@ -2649,7 +2666,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.timer.stop('train_loop')
 
             # run validation before any possible sampling/logging for this step
-            if not did_oom and self.train_config.validation_config is not None:
+            if not did_oom and self.train_config.validation_config is not None and not self.is_grad_accumulation_step:
                 val_config = self.train_config.validation_config
                 is_validate_step = (
                     self.step_num == self.start_step
@@ -2810,6 +2827,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.progress_bar.close()
         if self.train_config.free_u:
             self.sd.pipeline.disable_freeu()
+        if self._validation_cache is not None and 'native_batches' in self._validation_cache:
+            from training_extras.toolkit_validation import validate
+            validate(self, phase='final')
         if self.accelerator.is_main_process:
             self.save()
         if not self.train_config.disable_sampling:

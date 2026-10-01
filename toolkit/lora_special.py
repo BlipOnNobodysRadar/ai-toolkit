@@ -425,7 +425,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             if self.network_type.lower() != "lokr" or not self.use_old_lokr_format:
                 self.peft_format = True
 
-        if self.peft_format:
+        if self.peft_format and not getattr(self.network_config, 'respect_alpha', False):
             # no alpha for peft
             self.alpha = self.lora_dim
             alpha = self.alpha
@@ -508,7 +508,8 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                         #   normal lora for it
                         all_layers = self.network_config is not None and getattr(self.network_config, 'all_layers', False)
                         is_leaf_with_weight = (
-                            len(list(child_module.children())) == 0
+                            (all_layers or len(self.full_if_contains) > 0)
+                            and len(list(child_module.children())) == 0
                             and isinstance(getattr(child_module, 'weight', None), torch.nn.Parameter)
                         )
                         matches_full_if_contains = len(self.full_if_contains) > 0 and (
@@ -762,6 +763,11 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
     def prepare_optimizer_params(self, text_encoder_lr, unet_lr, default_lr):
         # call Lora prepare_optimizer_params
         all_params = super().prepare_optimizer_params(text_encoder_lr, unet_lr, default_lr)
+        cfg = self.network_config
+        if cfg is not None and (cfg.lora_plus_ratio != 1 or cfg.lora_plus_text_encoder_ratio != 1):
+            from training_extras.optim import lora_plus_groups
+            all_params = lora_plus_groups(all_params, self, default_lr, cfg.lora_plus_ratio,
+                                         cfg.lora_plus_text_encoder_ratio)
 
         if self.full_train_in_out:
             base_model = self.base_model_ref() if self.base_model_ref is not None else None

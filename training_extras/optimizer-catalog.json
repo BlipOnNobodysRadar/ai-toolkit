@@ -1,0 +1,1141 @@
+[
+  {
+    "name": "ABMOG",
+    "kind": "optimizer",
+    "class": "abmog.ABMOG",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.0001, betas: float = (0.95, 0.99), weight_decay: float = 0.0, weight_decay_rate: float = 0.995, spectral_adaptive: bool = True, spectral_clip_compile: bool = True, spectral_clip_dtype=None, adaptive: bool = True, adaptive_min: float = -1.0, adaptive_max: float = 1.0, input_norm: bool = True, lowpass_grad: float = 0.0, bcos: bool = True, cautious_min: float = 0.0, sgd_nesterov: bool = True, abm_order: int = 4, abm_k: int = 5, abm_cpu_storage: bool = True, stochastic_fp: bool = True, sync_chunk_size: int = 128, state_storage_dtype: str | torch.dtype = torch.bfloat16, state_storage_device: str | torch.device = 'cpu')",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "AdaBelief",
+    "kind": "optimizer",
+    "class": "adabelief.AdaBelief",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.001, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.999), weight_decay: float = 0.0, weight_decouple: bool = True, fixed_decay: bool = False, rectify: bool = False, n_sma_threshold: int = 5, degenerated_to_sgd: bool = True, ams_bound: bool = False, r: float = 0.95, adanorm: bool = False, adam_debias: bool = False, eps: float = 1e-16, cautious: bool = False, torch_compile: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "AdaGC",
+    "kind": "optimizer",
+    "class": "adagc.AdaGC",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr=0.001, betas=(0.9, 0.999), eps=1e-08, weight_decay=0.01, amsgrad=False, Tstart=100, Aabs=1.0, Arel=1.05, beta_ema=0.98, eps_ema=1e-06, stochastic_rounding=False, compile_step=False)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "Adai",
+    "kind": "optimizer",
+    "class": "adai.Adai",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.001, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.1, 0.99), weight_decay: float = 0.0, weight_decouple: bool = False, fixed_decay: bool = False, stable_weight_decay: bool = False, dampening: float = 1.0, use_gc: bool = False, eps: float = 0.001, torch_compile: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "AdamW8bitAO",
+    "kind": "optimizer",
+    "class": "adam.AdamW8bitAO",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr=0.001, betas=(0.9, 0.999), eps=1e-08, weight_decay=0.01, amsgrad=False, *, block_size=256, bf16_stochastic_round=False) -> None",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "AdamW4bitAO",
+    "kind": "optimizer",
+    "class": "adam.AdamW4bitAO",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr=0.001, betas=(0.9, 0.999), eps=1e-08, weight_decay=0.01, amsgrad=False, *, block_size=128, bf16_stochastic_round=False) -> None",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "AdamWfp8AO",
+    "kind": "optimizer",
+    "class": "adam.AdamWfp8AO",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr=0.001, betas=(0.9, 0.999), eps=1e-08, weight_decay=0.01, amsgrad=False, *, block_size=256, bf16_stochastic_round=False) -> None",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "AdamW8bitKahan",
+    "kind": "optimizer",
+    "class": "adam.AdamW8bitKahan",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, *args, stabilize=True, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "AdamMini",
+    "kind": "optimizer",
+    "class": "adammini.AdamMini",
+    "status": "imported",
+    "required_args": [
+      "model"
+    ],
+    "signature": "(self, model: torch.nn.modules.module.Module, lr: float = 1.0, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.999), weight_decay: float = 0.1, model_sharding: bool = False, num_embeds: int = 2048, num_heads: int = 32, num_query_groups: Optional[int] = None, eps: float = 1e-08, torch_compile: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified only; constructor requires explicit arguments and may need host-specific wrapping."
+  },
+  {
+    "name": "AdamWScheduleFreePlus",
+    "kind": "optimizer",
+    "class": "adamw_schedulefree_plus.AdamWScheduleFreePlus",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: collections.abc.Iterable[torch.Tensor] | collections.abc.Iterable[dict[str, typing.Any]] | collections.abc.Iterable[tuple[str, torch.Tensor]], lr: Union[float, torch.Tensor] = 1.0, betas: Tuple[float, float] = (0.9, 0.95), sf_beta1: float = 0.9, eps: float = 1e-08, weight_decay: float = 0, weight_decay_at_y: bool = False, r: float = 1.0, weight_lr_power: float = 2.0, polyak_beta: float = 0.9, polyak_f_ema: float = 0.95, max_polyak_lr: float = 10.0, c_warmup: int = 0, warmup_steps: int = 0, sf_beta1_anneal_steps: int = 0, sf_beta1_max: float = 0.965, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "Adan",
+    "kind": "optimizer",
+    "class": "adan.Adan",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.001, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.98, 0.92, 0.99), weight_decay: float = 0.0, weight_decouple: bool = False, max_grad_norm: float = 0.0, use_gc: bool = False, r: float = 0.95, adanorm: bool = False, eps: float = 1e-08, cautious: bool = False, update_strategy: Literal['unmodified', 'cautious', 'grams', 'both'] = 'unmodified', **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "AdEMAMix",
+    "kind": "optimizer",
+    "class": "ademamix.AdEMAMix",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.001, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.999, 0.9999), weight_decay: float = 0.0, weight_decouple: bool = False, fixed_decay: bool = False, clip: float = 0.0, alpha: float = 5.0, t_alpha_beta3: Optional[float] = None, eps: float = 1e-08, centralization: float = 0.0, cautious: bool = False, update_strategy: Literal['unmodified', 'cautious', 'grams', 'both'] = 'unmodified', adopt: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "SimplifiedAdEMAMix",
+    "kind": "optimizer",
+    "class": "ademamix.SimplifiedAdEMAMix",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float | torch.Tensor = 0.0001, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.99, 0.95), weight_decay: float = 0.0, weight_decouple: bool = True, fixed_decay: bool = False, alpha: float = 1.0, beta1_warmup: Optional[int] = None, min_beta1: float = 0.9, eps: float = 1e-08, eps2: float = 0.01, eps_floor: Optional[float] = None, use_orthograd: bool = False, adaptive_clip: Optional[float] = None, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', update_strategy: Literal['unmodified', 'cautious', 'grams', 'both'] = 'unmodified', bias_correction1: bool = False, bias_correction2: bool = True, use_stable_spam_clipping: bool = False, use_adopt: bool = False, torch_compile: bool = False, cautious_weight_decay: bool = False, compile_step: bool = False, foreach: bool = False, kahan_sum: bool = False, sync_chunk_size: int = 256, state_storage_dtype: str | torch.dtype = torch.bfloat16, state_storage_device: str | torch.device = 'cpu', **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "SimplifiedAdEMAMixExM",
+    "kind": "optimizer",
+    "class": "ademamix.SimplifiedAdEMAMixExM",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float | torch.Tensor = 0.0002, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.95, 0.997), min_beta1: float = 0.95, beta1_warmup: Optional[int] = None, weight_decay: float = 0.0, weight_decouple: bool = True, alpha: float = 1.0, eps: float = 1e-08, eps_floor: Optional[float] = 1e-12, use_orthograd: bool = True, update_strategy: Literal['unmodified', 'cautious', 'grams', 'both'] = 'unmodified', update_strategy_scale: float = 1.0, use_stable_spam_clipping: bool = True, use_compass: bool = False, use_adabelief: bool = True, use_newton_schulz: bool = True, amsgrad_min_decay_rate: float = 0.98, amsgrad_max_decay_rate: float = 0.98, torch_compile: bool = True, sync_chunk_size: int = 256, state_storage_dtype: str | torch.dtype = torch.bfloat16, state_storage_device: str | torch.device = 'cpu', **kwargs)",
+    "tested_update": true,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "ADOPT",
+    "kind": "optimizer",
+    "class": "adopt.ADOPT",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.001, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.9999), weight_decay: float = 0.0, weight_decouple: bool = False, fixed_decay: bool = False, eps: float = 1e-06, clip: float = 0.25, cautious: bool = False, update_strategy: Literal['unmodified', 'cautious', 'grams', 'both'] = 'unmodified', **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "ADOPTMARS",
+    "kind": "optimizer",
+    "class": "adopt.ADOPTMARS",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0025, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.9999), weight_decay: float = 0.0, weight_decouple: bool = False, stable_weight_decay: bool = False, eps: float = 1e-06, eps2: float = 0.01, eps_floor: Optional[float] = None, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', gamma: float = 0.025, cautious: bool = True, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "FADOPTMARS",
+    "kind": "optimizer",
+    "class": "adopt.FADOPTMARS",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0025, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.9999), weight_decay: float = 0.0, weight_decouple: bool = False, stable_weight_decay: bool = False, eps: float = 1e-06, eps2: float = 0.01, eps_floor: Optional[float] = None, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', fisher_clip: float = 1.0, gamma: float = 0.025, cautious: bool = True, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "AINOOpt",
+    "kind": "optimizer",
+    "class": "ainoopt.AINOOpt",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.0001, betas: Tuple[float, float, float] = (0.95, 0.95, 0.999), weight_decay: float = 0.0, cautious_update: bool = True, cautious_wd: bool = True, stochastic_fp: bool = True, compile_step: bool = False, foreach: bool = False, sinkhorn_steps: int = 5, ortho_dtype: torch.dtype = torch.bfloat16, eps: float = 1e-16, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "Alice",
+    "kind": "optimizer",
+    "class": "alice.Alice",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.01, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.9, 0.999), alpha: float = 0.25, alpha_c: float = 0.2, update_interval: int = 10, rank: int = 32, gamma: float = 1.01, leading_basis: int = 10, weight_decay: float = 0.0, weight_decouple: bool = True, eps: float = 1e-08, adam_lr: float = 0.0005, adam_betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.999), adam_weight_decay: float = 0.0, torch_compile: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "AMUSE",
+    "kind": "optimizer",
+    "class": "amuse.AMUSE",
+    "status": "imported",
+    "required_args": [
+      "param_groups"
+    ],
+    "signature": "(self, param_groups, *, lr: float = None, weight_decay: float = 0.0, heuristic_muon: bool = True, beta1: float = 0.9, weight_lr_power: float = 2.0, warmup_steps: int = 0, rho: float = 1.0, r: float = 0.0, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified only; constructor requires explicit arguments and may need host-specific wrapping."
+  },
+  {
+    "name": "BCOS",
+    "kind": "optimizer",
+    "class": "bcos.BCOS",
+    "status": "imported",
+    "required_args": [
+      "lr"
+    ],
+    "signature": "(self, params, lr, beta=0.9, beta2=None, eps=1e-06, weight_decay=0.1, mode='c', decouple_wd=True, simple_cond=False, sync_chunk_size: int = 128, state_storage_dtype: str | torch.dtype = torch.bfloat16, state_storage_device: str | torch.device = 'cpu', **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified only; constructor requires explicit arguments and may need host-specific wrapping."
+  },
+  {
+    "name": "BilatMuon",
+    "kind": "optimizer",
+    "class": "bilatmuon.BilatMuon",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.01, mode: str = 'full', betas: Tuple[float, float] = (0.9, 0.99), weight_decay: float = 0.0, rank: Optional[int] = None, factorization: str = 'als', rsvd_oversample: int = 8, rsvd_power: int = 1, split: Tuple[float, float] = (0.5, 0.5), ns_substeps: int = 2, rescale_ortho: bool = True, cautious_update: bool = True, cautious_wd: bool = True, stochastic_bf16: bool = True, quantize_grad: bool = False, precondition: str = 'rms', sinkhorn_iters: int = 3, als_eps: float = 1e-06, eps: float = 1e-08, ortho_dtype: torch.dtype = torch.bfloat16, compile_step: bool = True, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "BilatMuonNS",
+    "kind": "optimizer",
+    "class": "bilatmuonns.BilatMuonNS",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.01, betas: Tuple[float, float] = (0.99, 0.99), weight_decay: float = 0.0, rank: Optional[int] = 64, oversample: int = 8, power: int = 1, ns_substeps: int = 4, rescale_ortho: bool = True, cautious_update: bool = True, cautious_wd: bool = True, stochastic_bf16: bool = True, quantize_grad: bool = False, precondition: str = 'rms', sinkhorn_iters: int = 3, eps: float = 1e-08, ortho_dtype: torch.dtype = torch.bfloat16, compile_step: bool = True, compile_mode: str = 'default', fullgraph: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "CAME",
+    "kind": "optimizer",
+    "class": "came.CAME",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 5e-05, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.999, 0.9999), weight_decay: float = 0.0, weight_decouple: bool = True, fixed_decay: bool = False, clip_threshold: float = 1.0, ams_bound: bool = False, eps1: float = 1e-30, eps2: float = 1e-16, cautious: bool = False, update_strategy: Literal['unmodified', 'cautious', 'grams', 'both'] = 'unmodified', sync_chunk_size: int = 256, state_storage_dtype: str | torch.dtype = torch.bfloat16, state_storage_device: str | torch.device = 'cpu', cautious_weight_decay: bool = False, compile_step: bool = False, foreach: bool = False, non_factored_confidence: bool = False, kahan_sum: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "CASCADE",
+    "kind": "optimizer",
+    "class": "cascade.CASCADE",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Iterable[torch.Tensor], lr: float = 0.001, betas: Tuple[float, float] = (0.95, 0.95), eps: float = 1e-08, weight_decay: float = 0.0, cautious: bool = True, muon: bool = True, stochastic_fp: bool = True, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "MomentusCaution",
+    "kind": "optimizer",
+    "class": "clybius_experiments.MomentusCaution",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.0001, beta: float = 0.9, momentum_beta: float = 0.0, weight_decay: float = 0.0, gamma_ratio: float = 0.5, adaptive_clip: float = 0.0, cautious: bool = True, nesterov: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "REMASTER",
+    "kind": "optimizer",
+    "class": "clybius_experiments.REMASTER",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.0001, betas: tuple = (0.95, 0.9999), weight_decay: float = 0.0, weight_decay_rate: float = 0.998, amp: float = 5.0, reset_interval: int = 0, reset_increment: int = 0, orthograd: bool = True, cautious_min: float = 1.0, stochastic_fp: bool = True, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "Compass",
+    "kind": "optimizer",
+    "class": "compass.Compass",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.00014, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.975, 0.999), weight_decay: float = 0.001, weight_decouple: bool = True, stable_weight_decay: bool = False, lr_decouple: bool = False, max_lr: float = 0.0, fixed_decay: bool = False, clip: float = 0.01, amp_fac: float = 2.0, eps: float = 1e-08, centralization: float = 0.0, adaptive_clipping: bool = False, adaptive_clip_eps: float = 0.001, adam_debias: bool = False, rectify_variance: bool = False, n_sma_threshold: int = 5, degenerated_to_sgd: bool = False, cautious: bool = False, update_strategy: Literal['unmodified', 'cautious', 'grams', 'both'] = 'unmodified', use_orthograd: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "CompassPlus",
+    "kind": "optimizer",
+    "class": "compass.CompassPlus",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.00014, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.975, 0.999), weight_decay: float = 0.0005, weight_decouple: bool = True, lr_decouple: bool = False, max_lr: float = 0.0, stable_decay: bool = False, fixed_decay: bool = False, clip: float = 0.01, clip_eps: float = 0.001, amp_fac: float = 2.0, centralize_gradients: int = 0, normalize_gradients: int = 0, norm_loss_factor: float = 0, norm_loss_eps: float = 1e-08, use_softplus: bool = False, beta_softplus: float = 50.0, threshold_softplus: float = 0.0, use_lookahead: bool = False, lookahead_merge_time: int = 5, lookahead_blending_alpha: float = 0.5, adam_debias: bool = False, use_pnm: bool = False, pnm_beta: float = 0.1, amsgrad: bool = False, use_slow_ema: bool = False, slow_ema_beta: float = 0.9998, slow_ema_alpha: float = 3.0, slow_ema_t_alpha_beta: Optional[float] = None, diff_amp: float = 0.0, diff_amp_beta: float = 0.999, eps: float = 1e-08, eps2: float = 0.01, eps_floor: float = 1e-16, update_clipping: bool = False, rectify_variance: bool = False, n_sma_threshold: int = 5, degenerated_to_sgd: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "Compass8BitBNB",
+    "kind": "optimizer",
+    "class": "compass.Compass8BitBNB",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr=0.0001, betas=(0.975, 0.999), weight_decay=0.001, weight_decouple=True, fixed_decay=False, clip=0.0, amp_fac=2, eps=1e-08, centralization=0.0, quantization_group_size=64)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "CompassADOPT",
+    "kind": "optimizer",
+    "class": "compass.CompassADOPT",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0001, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.95, 0.9999), amp_fac: float = 2.0, weight_decay: float = 0.0, weight_decouple: bool = True, stable_weight_decay: bool = False, eps: float = 1e-06, eps2: float = 0.01, eps_floor: Optional[float] = None, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', cautious: bool = False, factor_second_moment: bool = False, debias_beta1: bool = True, debias_beta2: bool = True, compass_second_moment_smoothing: bool = True, use_orthograd: bool = False, update_strategy: Literal['unmodified', 'cautious', 'grams', 'both'] = 'unmodified', use_stable_spam_clipping: bool = False, ssc_t_max: Optional[int] = None, torch_compile: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "CompassADOPTMARS",
+    "kind": "optimizer",
+    "class": "compass.CompassADOPTMARS",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0001, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.95, 0.9999), amp_fac: float = 2.0, weight_decay: float = 0.0, weight_decouple: bool = True, stable_weight_decay: bool = False, eps: float = 1e-06, eps2: float = 0.01, eps_floor: Optional[float] = None, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', cautious: bool = True, factor_second_moment: bool = False, gamma: float = 0.025, debias_beta1: bool = True, debias_beta2: bool = True, compass_second_moment_smoothing: bool = True, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "_CompassBase",
+    "kind": "optimizer",
+    "class": "compass._CompassBase",
+    "status": "imported",
+    "required_args": [
+      "lr",
+      "betas",
+      "eps",
+      "eps2",
+      "eps_floor",
+      "weight_decay",
+      "weight_decouple",
+      "stable_weight_decay",
+      "amp_fac",
+      "cautious",
+      "adaptive_clip",
+      "adaptive_clip_eps",
+      "adaptive_clip_type",
+      "debias_beta1",
+      "debias_beta2",
+      "adopt",
+      "mars_gamma",
+      "compass_second_moment_smoothing",
+      "update_strategy",
+      "stable_update",
+      "stable_update_clip_threshold",
+      "use_orthograd",
+      "use_spam_clipping",
+      "spam_clipping_type",
+      "spam_clipping_threshold",
+      "spam_clipping_start_step",
+      "spam_clipping_eps",
+      "use_spam_momentum_reset",
+      "spam_momentum_reset_warmup_steps",
+      "spam_momentum_reset_interval_steps",
+      "use_focus",
+      "focus_gamma",
+      "focus_beta",
+      "debug",
+      "use_exadam",
+      "block_size",
+      "min_quant_size",
+      "state_precision",
+      "torch_compile"
+    ],
+    "signature": "(self, params, lr, betas, eps, eps2, eps_floor, weight_decay, weight_decouple, stable_weight_decay, amp_fac, cautious, adaptive_clip, adaptive_clip_eps, adaptive_clip_type, debias_beta1, debias_beta2, adopt, mars_gamma, compass_second_moment_smoothing, update_strategy, stable_update, stable_update_clip_threshold, use_orthograd, use_spam_clipping, spam_clipping_type, spam_clipping_threshold, spam_clipping_start_step, spam_clipping_eps, use_spam_momentum_reset, spam_momentum_reset_warmup_steps, spam_momentum_reset_interval_steps, use_focus, focus_gamma, focus_beta, debug, use_exadam, *, block_size, min_quant_size, state_precision, torch_compile) -> None",
+    "tested_update": false,
+    "host_notes": "Import verified only; constructor requires explicit arguments and may need host-specific wrapping."
+  },
+  {
+    "name": "CompassAO",
+    "kind": "optimizer",
+    "class": "compass.CompassAO",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr=0.0001, betas=(0.95, 0.999), eps: float = 1e-08, eps2: float = 0.01, eps_floor: Optional[float] = None, weight_decay: float = 0.0, weight_decouple: bool = True, stable_weight_decay: bool = False, amp_fac: float = 2.0, cautious: bool = False, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', debias_beta1: bool = True, debias_beta2: bool = True, adopt: bool = False, mars_gamma: float = 0.0, compass_second_moment_smoothing: bool = True, update_strategy: Literal['unmodified', 'cautious', 'grams', 'both'] = 'unmodified', stable_update: bool = False, stable_update_clip_threshold: float = 1.0, use_orthograd: bool = False, use_spam_clipping: bool = False, spam_clipping_threshold: float = 500.0, spam_clipping_start_step: int = 20, spam_clipping_type: Literal['unit', 'layer', 'element'] = 'element', spam_clipping_eps: Optional[float] = None, use_spam_momentum_reset: bool = False, spam_momentum_reset_warmup_steps: int = 20, spam_momentum_reset_interval_steps: int = 41, use_focus: bool = False, focus_gamma: float = 0.1, focus_beta: float = 0.9, debug: bool = False, use_exadam: bool = False, *, block_size: Optional[int] = None, min_quant_size: int = 4096, state_precision: Literal['parameter', 'q4bit', 'q8bit', 'qfp8'] = 'parameter', torch_compile: bool = True, **kwargs) -> None",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "CosineAnnealingWarmRestarts",
+    "kind": "scheduler",
+    "class": "CosineAnnealingWarmRestarts.CosineAnnealingWarmRestarts",
+    "status": "imported",
+    "required_args": [
+      "gamma"
+    ],
+    "signature": "(self, optimizer: torch.optim.optimizer.Optimizer, gamma: float, cycle_multiplier: float = 1, first_cycle_max_steps: int = 1, min_lr: float = 1e-06, warmup_steps: int = 0, last_epoch: int = -1) -> None",
+    "tested_update": false,
+    "host_notes": "Import verified only; constructor requires explicit arguments and may need host-specific wrapping."
+  },
+  {
+    "name": "CStableAdamW",
+    "kind": "optimizer",
+    "class": "cstableadamw.CStableAdamW",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.001, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.999), kahan_sum: bool = True, weight_decay: float = 0.01, weight_decouple: bool = True, eps: float = 1e-08, use_rms: bool = False, use_atan2: bool = False, atan2_a: float = 1.27, atan2_b: float = 1.0, cautious_factor: float = 1.0, use_adopt: bool = False, use_stable_spam_clipping: bool = False, ssc_scale: float = 1.0, ssc_gamma1: float = 0.85, ssc_gamma2: float = 0.99999, ssc_gamma3: float = 0.999, ssc_eps_floor: float = 1e-16, torch_compile: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "Dehaze",
+    "kind": "optimizer",
+    "class": "dehaze.Dehaze",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.0001, betas: tuple = (0.95, 0.9, 0.9999999), weight_decay: float = 0.0, weight_decay_rate: float = 0.995, stage1_atan2: bool = True, stage2_atan2: bool = True, adaptive_muon: bool = False, stochastic_fp: bool = True, torch_compile: bool = True, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "FARMSCrop",
+    "kind": "optimizer",
+    "class": "farmscrop.FARMSCrop",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr=0.0001, betas=(0.999, 0.9999), eps=1e-08, eps2=0.01, eps_floor=1e-16, weight_decay=1e-06, centralization=1.0, diff_mult=1.0, momentum_beta=0.9999, momentum_amp=5.0, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "FARMSCropV2",
+    "kind": "optimizer",
+    "class": "farmscrop.FARMSCropV2",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0001, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.999, 0.9999), eps: float = 1e-06, eps2: float = 0.01, eps_floor: float = None, weight_decay: float = 0.0, centralization: float = 0.0, diff_mult: float = 1.0, momentum_beta: float = 0.9999, momentum_lambda: float = 0.25, clip: float = 1.0, cautious: bool = False, cautious_grad: Literal['grad', 'approx_grad_natgrad_nat'] = 'grad', **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "FCompass",
+    "kind": "optimizer",
+    "class": "fcompass.FCompass",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr=7e-05, betas=(0.98, 0.999), amp_fac=2, eps=1e-08, eps2=0.01, eps_floor=1e-16, weight_decay=0.001, clip=1.0, centralization=1.0, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "FCompassADOPT",
+    "kind": "optimizer",
+    "class": "fcompass.FCompassADOPT",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0001, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.97, 0.9999), amp_fac: float = 2.0, weight_decay: float = 0.0, weight_decouple: bool = False, stable_weight_decay: bool = False, eps: float = 1e-06, eps2: float = 0.01, eps_floor: Optional[float] = None, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', fisher_clip: float = 1.0, cautious: bool = True, debias_beta1: bool = False, debias_beta2: bool = True, compass_second_moment_smoothing: bool = True, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "FCompassADOPTMARS",
+    "kind": "optimizer",
+    "class": "fcompass.FCompassADOPTMARS",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0001, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.97, 0.9999), amp_fac: float = 2.0, weight_decay: float = 0.0, weight_decouple: bool = False, stable_weight_decay: bool = False, eps: float = 1e-06, eps2: float = 0.01, eps_floor: Optional[float] = None, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', fisher_clip: float = 1.0, gamma: float = 0.025, cautious: bool = True, debias_beta1: bool = False, debias_beta2: bool = True, compass_second_moment_smoothing: bool = True, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "FCompassPlus",
+    "kind": "optimizer",
+    "class": "fcompass.FCompassPlus",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0001, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.97, 0.999), amp_fac: float = 2.0, centralize_gradients: int = 1, normalize_gradients: int = 0, eps: float = 1e-08, eps2: float = 0.01, eps_floor: float = 1e-16, weight_decay: float = 0.001, clip: float = 0.01, use_lookahead: bool = False, lookahead_merge_time: int = 5, lookahead_blending_alpha: float = 0.5, norm_loss_factor: float = 0.0005, norm_loss_eps: float = 1e-08, use_softplus: bool = True, beta_softplus: float = 50.0, threshold_softplus: float = 0.0, amsgrad: bool = True, diff_amp: float = 0.0, diff_amp_beta: float = 0.999, use_pnm: bool = False, pnm_beta: float = 0.1, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "FFTDescent",
+    "kind": "optimizer",
+    "class": "fftdescent.FFTDescent",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.0001, beta: float = 0.95, weight_decay: float = 0.0, weight_decay_rate: float = 0.995, spectral_clip: bool = True, spectral_clip_compile: bool = True, spectral_clip_dtype=None, spectral_min: float = -1.0, spectral_max: float = 1.0, spectral_adaptive: bool = False, lowpass_grad: float = 1.0, sign_momentum: float = 0.9, stochastic_fp: bool = True, compile_step: bool = False, foreach: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "Fira",
+    "kind": "optimizer",
+    "class": "fira.Fira",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.001, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.999), weight_decay: float = 0.0, eps: float = 1e-06, torch_compile: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "FishMonger",
+    "kind": "optimizer",
+    "class": "fishmonger.FishMonger",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr=0.001, betas=(0.9, 0.99, 0.999), eps=1e-08, eps2=0.01, eps_floor=1e-16, weight_decay=0.0, clip=1.0, centralization=1.0, diff_amp=1.0, diff_amp_beta=0.999, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "FishMonger8BitBNB",
+    "kind": "optimizer",
+    "class": "fishmonger.FishMonger8BitBNB",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr=0.001, betas=(0.9, 0.99, 0.999), eps=1e-08, weight_decay=0.0, clip=1.0, centralization=1.0, diff_amp=1.0, diff_amp_beta=0.999, quantization_group_size=64)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "FMARSCrop",
+    "kind": "optimizer",
+    "class": "fmarscrop.FMARSCrop",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0005, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.999, 0.9999), eps: float = 1e-06, eps2: float = 0.01, eps_floor: float = None, weight_decay: float = 0.0, weight_decouple: bool = False, centralization: float = 0.0, moment_centralization: float = 0.0, diff_mult: float = 1.0, momentum_lambda: float = 0.1, momentum_beta: float = 0.99, clip: float = 1.0, cautious: bool = True, gamma: float = 0.0005, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'global', stable_weight_decay: bool = False, debias_beta2: bool = True, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "FMARSCropV2ExMachina",
+    "kind": "optimizer",
+    "class": "fmarscrop.FMARSCropV2ExMachina",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0005, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.99, 0.9999, 0.999), eps: float = 1e-06, eps2: float = 0.01, eps_floor: float = None, weight_decay: float = 0.0, weight_decouple: bool = False, centralization: float = 0.0, moment_centralization: float = 0.0, diff_mult: float = 1.0, momentum_lambda: float = 0.1, clip: float = 1.0, cautious: bool = False, gamma: float = 0.005, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'global', stable_weight_decay: bool = False, debias_beta1: bool = False, debias_beta2: bool = True, debias_beta3: bool = False, update_strategy: Literal['unmodified', 'cautious', 'grams', 'both'] = 'cautious', **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "FMARSCropV2",
+    "kind": "optimizer",
+    "class": "fmarscrop.FMARSCropV2",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.0001, betas=(0.999, 0.9999), eps: float = 1e-06, eps2: float = 0.01, eps_floor: float = None, weight_decay: float = 0.01, centralization: float = 0.0, moment_centralization: float = 0.0, diff_mult: float = 0.0, momentum_beta: float = 0.99, momentum_lambda: float = 0.1, gamma: float = 0.001, clip: float = 1.0, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, cautious: bool = True, debias_beta2: bool = True)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "FMARSCropV3",
+    "kind": "optimizer",
+    "class": "fmarscrop.FMARSCropV3",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.0001, betas=(0.99, 0.95), eps: float = 1e-06, eps2: float = 0.01, eps_floor: float = None, weight_decay: float = 0.01, centralization: float = 0.0, moment_centralization: float = 0.0, diff_mult: float = 0.0, momentum_lambda: float = 2.0, gamma: float = 0.05, clip_lambda: float = 1.0, adaptive_clip: float = 0.0, adaptive_clip_eps: float = 0.001, adaptive_clip_norm_type: bool = 1, cautious: bool = True)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "FMARSCropV3ExMachina",
+    "kind": "optimizer",
+    "class": "fmarscrop.FMARSCropV3ExMachina",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0005, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.99, 0.95), eps: float = 1e-06, eps2: float = 0.01, eps_floor: float = None, weight_decay: float = 0.0, weight_decouple: bool = False, centralization: float = 0.0, moment_centralization: float = 0.0, diff_mult: float = 1.0, momentum_lambda: float = 2.0, clip: float = 1.0, cautious: bool = False, gamma: float = 0.005, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'global', stable_weight_decay: bool = False, debias_beta1: bool = False, debias_beta2: bool = False, update_strategy: Literal['unmodified', 'cautious', 'grams', 'both'] = 'cautious', stable_update: bool = False, atan2_denom: bool = False, use_orthograd: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "GaLore",
+    "kind": "optimizer",
+    "class": "galore.GaLore",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.001, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.999), weight_decay: float = 0.0, eps: float = 1e-06, torch_compile: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "Glyph",
+    "kind": "optimizer",
+    "class": "glyph.Glyph",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.0001, betas: tuple = (0.95, 0.999999), weight_decay: float = 0.0, weight_decay_rate: float = 0.998, amp: float = 1.0, orthograd: bool = False, adaptive_ema: bool = True, atan2: bool = True, cautious_min: float = 1.0, stochastic_fp: bool = True)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "GOODDOG",
+    "kind": "optimizer",
+    "class": "gooddog.GOODDOG",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.0001, betas: tuple = (0.9, 0.96, 0.9999999), weight_decay: float = 0.0, weight_decay_rate: float = 0.995, stage1_atan2: bool = True, stage2_atan2: bool = True, invariant: bool = False, adaptive_muon: bool = True, orthograd: bool = False, stochastic_fp: bool = True, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "GrokFastAdamW",
+    "kind": "optimizer",
+    "class": "grokfast.GrokFastAdamW",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0001, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.99), grokfast: bool = True, grokfast_alpha: float = 0.98, grokfast_lamb: float = 2.0, grokfast_after_step: int = 0, weight_decay: float = 0.0, weight_decouple: bool = True, fixed_decay: bool = False, normalize_lr: bool = True, eps: float = 1e-08, torch_compile: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "Lamb",
+    "kind": "optimizer",
+    "class": "lamb.Lamb",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.001, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.999), weight_decay: float = 0.0, weight_decouple: bool = True, fixed_decay: bool = False, rectify: bool = False, degenerated_to_sgd: bool = False, n_sma_threshold: int = 5, grad_averaging: bool = True, max_grad_norm: float = 1.0, adam: bool = False, pre_norm: bool = False, r: float = 0.95, adanorm: bool = False, adam_debias: bool = False, eps: float = 1e-06, torch_compile: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "LaProp",
+    "kind": "optimizer",
+    "class": "laprop.LaProp",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0004, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.999), centered: bool = False, steps_before_using_centered: int = 10, weight_decay: float = 0.0, weight_decouple: bool = True, fixed_decay: bool = False, ams_bound: bool = False, cautious: bool = False, eps: float = 1e-15, torch_compile: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "LoFac",
+    "kind": "optimizer",
+    "class": "lofac.LoFac",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.01, polybeta: float = 0.99999, rank: int = 8, factorization: str = 'lokr', lokr_dims: Optional[Tuple[int, int]] = None, weight_decay: float = 0.0, orthogonalize: bool = True, rescale_ortho: bool = True, rms_normalize: bool = False, rms_clip: bool = False, cautious_update: bool = True, cautious_wd: bool = True, stochastic_fp: bool = True, compile_step: bool = False, ortho_dtype: torch.dtype = torch.bfloat16, eps: float = 1e-08)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "LPFAdamW",
+    "kind": "optimizer",
+    "class": "lpfadamw.LPFAdamW",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr=0.001, betas=(0.9, 0.9, 0.999), amp_fac=2, eps=1e-08, weight_decay=0, centralization=0, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "MODA",
+    "kind": "optimizer",
+    "class": "moda.MODA",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr=0.001, dual_momentum1=0, dual_momentum2=0, primal_momentum1=None, norm: str = 'Spectral', norm_kwargs: dict = None, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "Mythical",
+    "kind": "optimizer",
+    "class": "mythical.Mythical",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.0001, betas: tuple = (0.95, 0.999999), weight_decay: float = 0.0, weight_decay_rate: float = 0.998, amp: float = 1.0, orthograd: bool = False, adaptive_ema: bool = False, atan2: bool = False, warmup: bool = False, cautious_min: float = 1.0, stochastic_fp: bool = True, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "NorMuonScheduleFree",
+    "kind": "optimizer",
+    "class": "nor_muon_schedulefree.NorMuonScheduleFree",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: collections.abc.Iterable[torch.Tensor] | collections.abc.Iterable[dict[str, typing.Any]] | collections.abc.Iterable[tuple[str, torch.Tensor]], lr: Union[float, torch.Tensor] = 0.0001, betas: Tuple[float, float] = (0.9, 0.95), momentum: float = 0.8, eps: float = 1e-08, weight_decay: float = 0.05, warmup_steps: int = 0, eta_scale: float = 0.2, ns_steps: int = 5, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "OAGOpt",
+    "kind": "optimizer",
+    "class": "oagopt.OAGOpt",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.0001, betas: float = (0.95, 0.99, 0.999), weight_decay: float = 0.0, weight_decay_rate: float = 0.995, spectral_adaptive: bool = True, spectral_clip_compile: bool = True, spectral_clip_dtype=None, adaptive: bool = True, adaptive_min: float = -1.0, adaptive_max: float = 1.0, input_norm: bool = True, lowpass_grad: float = 0.0, sim_match: bool = False, cautious_min: float = 0.0, sgd_nesterov: bool = True, stochastic_fp: bool = True, sync_chunk_size: int = 128, state_storage_dtype: str | torch.dtype = torch.bfloat16, state_storage_device: str | torch.device = 'cpu', **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "OCGOpt",
+    "kind": "optimizer",
+    "class": "ocgopt.OCGOpt",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.0001, betas: float = (0.95, 0.9999999, 0.9999999), weight_decay: float = 0.0, weight_decay_rate: float = 0.995, centralization: float = 1.0, spectral_adaptive: bool = True, spectral_clip_compile: bool = True, spectral_clip_dtype=None, adaptive: bool = True, adaptive_min: float = -1.0, adaptive_max: float = 1.0, input_norm: bool = False, lowpass_grad: float = 0.0, sim_match: bool = False, cautious_min: float = 0.0, cautious_weight_decay: bool = False, stochastic_fp: bool = True, kahan_summation: bool = False, foreach: bool = False, sync_chunk_size: int = 256, state_storage_dtype: str | torch.dtype = torch.bfloat16, state_storage_device: str | torch.device = 'cpu', compile_step: bool = False, num_ns_steps: int = 7, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "OCGOptV2",
+    "kind": "optimizer",
+    "class": "ocgoptv2.OCGOptV2",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.0001, betas: float = (0.95, 0.9975, 0.9999), weight_decay: float = 0.0, weight_decay_rate: float = 0.995, cautious_weight_decay: bool = False, centralization: float = 1.0, spectral_adaptive: bool = True, spectral_clip_compile: bool = True, spectral_clip_dtype=None, adaptive: bool = False, adaptive_min: float = -1.0, adaptive_max: float = 1.0, input_norm: bool = False, aol: bool = False, lowpass_grad: float = 0.0, stochastic_fp: bool = True, compile_step: bool = False, foreach: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "ProjectiveAdam",
+    "kind": "optimizer",
+    "class": "projective_adam.ProjectiveAdam",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Iterable[torch.Tensor], lr: float = 0.001, betas: Tuple[float, float] = (0.95, 0.999), eps: float = 1e-16, weight_decay: float = 0.0, projection: Literal['stereographic', 'gnomonic', 'hyperbolic'] = 'gnomonic', input_norm: bool = True, normuon: bool = True, use_compile: bool = True, ortho_dtype: Optional[str] = None, stochastic_fp: bool = True, sync_chunk_size: int = 128, state_storage_dtype: str | torch.dtype = torch.bfloat16, state_storage_device: str | torch.device = 'cpu', **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "RACS",
+    "kind": "optimizer",
+    "class": "racs.RACS",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.01, beta: float = 0.9, alpha: float = 0.02, gamma: float = 1.01, weight_decay: float = 0.0, weight_decouple: bool = True, eps: float = 1e-08, adam_lr: float = 0.0005, adam_betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.999), adam_weight_decay: float = 0.0, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "RAdamScheduleFree",
+    "kind": "optimizer",
+    "class": "radam_schedulefree.RAdamScheduleFree",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: collections.abc.Iterable[torch.Tensor] | collections.abc.Iterable[dict[str, typing.Any]] | collections.abc.Iterable[tuple[str, torch.Tensor]], lr: Union[float, torch.Tensor] = 0.0025, betas: Tuple[float, float] = (0.9, 0.999), eps: float = 1e-08, weight_decay: float = 0, r: float = 0.0, weight_lr_power: float = 2.0, foreach: Optional[bool] = False, silent_sgd_phase: bool = True, sync_chunk_size: int = 128, state_storage_dtype: Union[str, torch.dtype] = torch.bfloat16, state_storage_device: Union[str, torch.device] = 'cpu')",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "Ranger21",
+    "kind": "optimizer",
+    "class": "ranger21.Ranger21",
+    "status": "imported",
+    "required_args": [
+      "num_iterations"
+    ],
+    "signature": "(self, params: Dict[str, Any], num_iterations: int, lr: float = 0.001, beta0: float = 0.9, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.999), use_softplus: bool = True, beta_softplus: float = 50.0, disable_lr_scheduler: bool = False, num_warm_up_iterations: Optional[int] = None, num_warm_down_iterations: Optional[int] = None, warm_down_min_lr: float = 3e-05, agc_clipping_value: float = 0.01, agc_eps: float = 0.001, centralize_gradients: bool = True, normalize_gradients: bool = True, lookahead_merge_time: int = 5, lookahead_blending_alpha: float = 0.5, weight_decay: float = 0.0001, weight_decouple: bool = True, fixed_decay: bool = False, norm_loss_factor: float = 0.0001, adam_debias: bool = False, eps: float = 1e-08, torch_compile: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified only; constructor requires explicit arguments and may need host-specific wrapping."
+  },
+  {
+    "name": "RelAdamW",
+    "kind": "optimizer",
+    "class": "RelAdamW.RelAdamW",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Iterable[torch.Tensor], lr: float = 0.01, betas=(0.95, 0.999), eps: float = 1e-12, weight_decay: float = 0.1, sinkhorn_iter: int = 3, shape_mode: str = 'multi_axis', unit_clamp: float = 1.0, nesterov: bool = True, cautious_update: bool = True, cautious_wd: bool = True, overshoot_protection: bool = True, debias: bool = True, stochastic_fp: bool = True, compile_step: bool = False, foreach: bool = False)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "RexAnnealingWarmRestarts",
+    "kind": "scheduler",
+    "class": "RexAnnealingWarmRestarts.RexAnnealingWarmRestarts",
+    "status": "imported",
+    "required_args": [
+      "gamma"
+    ],
+    "signature": "(self, optimizer: torch.optim.optimizer.Optimizer, gamma: float, cycle_multiplier: float = 1, first_cycle_max_steps: int = 1, min_lr: float = 1e-06, warmup_steps: int = 0, last_epoch: int = -1, d: float = 0.9) -> None",
+    "tested_update": false,
+    "host_notes": "Import verified only; constructor requires explicit arguments and may need host-specific wrapping."
+  },
+  {
+    "name": "RMSProp",
+    "kind": "optimizer",
+    "class": "rmsprop.RMSProp",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.001, betas: float = 0.95, eps: float = 1e-08, eps2: float = 0.01, eps_floor: float = None, weight_decay: float = 0.0, weight_decouple: bool = True, fixed_decay: bool = False, centralization: float = 0.0, stable_decay: bool = False, clip: float = 0.0, clip_eps: float = 1e-08, adaptive_clipping: bool = False, adaptive_clip_eps: float = 0.001, rectify_variance: bool = False, n_sma_threshold: int = 5, degenerated_to_sgd: bool = False, clip_loc: Literal['gradient', 'update', 'both'] = 'gradient', adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "RMSPropADOPT",
+    "kind": "optimizer",
+    "class": "rmsprop.RMSPropADOPT",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0005, betas: float = 0.9999, weight_decay: float = 0.0, weight_decouple: bool = False, stable_weight_decay: bool = False, eps: float = 1e-06, eps2: float = 0.01, eps_floor: Optional[float] = None, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', factor_second_moment: bool = False, debias_beta: bool = True, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "RMSPropADOPTMARS",
+    "kind": "optimizer",
+    "class": "rmsprop.RMSPropADOPTMARS",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0005, betas: float = 0.9999, weight_decay: float = 0.0, weight_decouple: bool = False, stable_weight_decay: bool = False, eps: float = 1e-06, eps2: float = 0.01, eps_floor: Optional[float] = None, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', factor_second_moment: bool = False, debias_beta: bool = True, gamma: float = 0.025, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "SCGOpt",
+    "kind": "optimizer",
+    "class": "scgopt.SCGOpt",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.0001, betas: float = (0.95, 0.9999999, 0.9999999), weight_decay: float = 0.0, weight_decay_rate: float = 0.998, centralization: float = 1.0, spectral_clip: bool = False, spectral_adaptive: bool = True, spectral_clip_compile: bool = True, spectral_clip_dtype=None, adaptive: bool = True, adaptive_min: float = -1.0, adaptive_max: float = 1.0, use_sign: bool = True, lowpass_grad: float = 0.0, sim_match: bool = False, cautious_min: float = 0.0, stochastic_fp: bool = True)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "ScheduleFreeWrapper",
+    "kind": "optimizer",
+    "class": "schedulefree.ScheduleFreeWrapper",
+    "status": "imported",
+    "required_args": [
+      "base_optimizer"
+    ],
+    "signature": "(self, params: Dict[str, Any], base_optimizer: Type[torch.optim.optimizer.Optimizer], sf_weight_decay_at_y: float = 0.0, sf_momentum: float = 0.9, sf_weight_lr_power: float = 2.0, sf_r: float = 0.0, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified only; constructor requires explicit arguments and may need host-specific wrapping."
+  },
+  {
+    "name": "ADOPTScheduleFree",
+    "kind": "optimizer",
+    "class": "schedulefree.ADOPTScheduleFree",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0025, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.9999), weight_decay: float = 0.0, weight_decouple: bool = False, stable_weight_decay: bool = False, r: float = 0.0, weight_lr_power: float = 2.0, eps: float = 1e-06, eps2: float = 0.01, eps_floor: Optional[float] = None, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', debias_beta2: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "ADOPTEMAMixScheduleFree",
+    "kind": "optimizer",
+    "class": "schedulefree.ADOPTEMAMixScheduleFree",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0025, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.9999, 0.9999), weight_decay: float = 0.0, weight_decouple: bool = False, stable_weight_decay: bool = False, r: float = 0.0, weight_lr_power: float = 2.0, eps: float = 1e-06, eps2: float = 0.01, eps_floor: Optional[float] = None, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', cautious: bool = True, alpha: float = 2.0, t_alpha_beta3: Optional[float] = None, debias_beta2: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "ADOPTNesterovScheduleFree",
+    "kind": "optimizer",
+    "class": "schedulefree.ADOPTNesterovScheduleFree",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0025, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.92, 0.9999), weight_decay: float = 0.0, weight_decouple: bool = False, stable_weight_decay: bool = False, r: float = 0.0, weight_lr_power: float = 2.0, eps: float = 1e-06, eps2: float = 0.01, eps_floor: Optional[float] = None, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', cautious: bool = True, debias_beta2: bool = False, debias_beta3: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "ADOPTMARSScheduleFree",
+    "kind": "optimizer",
+    "class": "schedulefree.ADOPTMARSScheduleFree",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0025, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.9999), weight_decay: float = 0.0, weight_decouple: bool = False, stable_weight_decay: bool = False, r: float = 0.0, weight_lr_power: float = 2.0, eps: float = 1e-06, eps2: float = 0.01, eps_floor: Optional[float] = None, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', gamma: float = 0.025, debias_beta2: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "FADOPTScheduleFree",
+    "kind": "optimizer",
+    "class": "schedulefree.FADOPTScheduleFree",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0025, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.9999), weight_decay: float = 0.0, weight_decouple: bool = False, stable_weight_decay: bool = False, r: float = 0.0, weight_lr_power: float = 2.0, eps: float = 1e-06, eps2: float = 0.01, eps_floor: Optional[float] = None, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', fisher_clip: float = 1.0, debias_beta2: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "FADOPTEMAMixScheduleFree",
+    "kind": "optimizer",
+    "class": "schedulefree.FADOPTEMAMixScheduleFree",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0025, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.9999, 0.9999), weight_decay: float = 0.0, weight_decouple: bool = False, stable_weight_decay: bool = False, r: float = 0.0, weight_lr_power: float = 2.0, eps: float = 1e-06, eps2: float = 0.01, eps_floor: Optional[float] = None, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', fisher_clip: float = 1.0, cautious: bool = True, alpha: float = 2.0, t_alpha_beta3: Optional[float] = None, debias_beta2: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "FADOPTNesterovScheduleFree",
+    "kind": "optimizer",
+    "class": "schedulefree.FADOPTNesterovScheduleFree",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0025, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.92, 0.9999), weight_decay: float = 0.0, weight_decouple: bool = False, stable_weight_decay: bool = False, r: float = 0.0, weight_lr_power: float = 2.0, eps: float = 1e-06, eps2: float = 0.01, eps_floor: Optional[float] = None, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', fisher_clip: float = 1.0, cautious: bool = True, debias_beta2: bool = False, debias_beta3: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "FADOPTMARSScheduleFree",
+    "kind": "optimizer",
+    "class": "schedulefree.FADOPTMARSScheduleFree",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.0025, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.9999), weight_decay: float = 0.0, weight_decouple: bool = False, weight_decay_lr_decouple: bool = False, stable_weight_decay: bool = False, r: float = 0.0, weight_lr_power: float = 2.0, eps: float = 1e-06, eps2: float = 0.01, eps_floor: Optional[float] = None, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', fisher_clip: float = 1.0, gamma: float = 0.025, debias_beta2: bool = False, weight_decay_lr_max: Optional[float] = None, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "_ADOPTAOScheduleFreeBase",
+    "kind": "optimizer",
+    "class": "schedulefree._ADOPTAOScheduleFreeBase",
+    "status": "imported",
+    "required_args": [
+      "lr",
+      "betas",
+      "eps",
+      "eps2",
+      "eps_floor",
+      "weight_decay",
+      "weight_decouple",
+      "stable_weight_decay",
+      "adaptive_clip",
+      "adaptive_clip_eps",
+      "adaptive_clip_type",
+      "debias_beta2",
+      "use_beta2_warmup",
+      "beta2_warmup_initial",
+      "beta2_warmup_steps",
+      "mars_gamma",
+      "r",
+      "weight_lr_power",
+      "fisher",
+      "update_strategy",
+      "stable_update",
+      "stable_update_clip_threshold",
+      "atan2_denom",
+      "use_orthograd",
+      "use_spam_clipping",
+      "spam_clipping_type",
+      "spam_clipping_threshold",
+      "spam_clipping_start_step",
+      "spam_clipping_eps",
+      "use_spam_momentum_reset",
+      "spam_momentum_reset_warmup_steps",
+      "spam_momentum_reset_interval_steps",
+      "use_focus",
+      "focus_gamma",
+      "focus_beta",
+      "use_stable_spam_clipping",
+      "ssc_t_max",
+      "debug",
+      "block_size",
+      "min_quant_size",
+      "state_precision",
+      "torch_compile"
+    ],
+    "signature": "(self, params, lr, betas, eps, eps2, eps_floor, weight_decay, weight_decouple, stable_weight_decay, adaptive_clip, adaptive_clip_eps, adaptive_clip_type, debias_beta2, use_beta2_warmup, beta2_warmup_initial, beta2_warmup_steps, mars_gamma, r, weight_lr_power, fisher, update_strategy, stable_update, stable_update_clip_threshold, atan2_denom, use_orthograd, use_spam_clipping, spam_clipping_type, spam_clipping_threshold, spam_clipping_start_step, spam_clipping_eps, use_spam_momentum_reset, spam_momentum_reset_warmup_steps, spam_momentum_reset_interval_steps, use_focus, focus_gamma, focus_beta, use_stable_spam_clipping, ssc_t_max, debug, *, block_size, min_quant_size, state_precision, torch_compile) -> None",
+    "tested_update": false,
+    "host_notes": "Import verified only; constructor requires explicit arguments and may need host-specific wrapping."
+  },
+  {
+    "name": "ADOPTAOScheduleFree",
+    "kind": "optimizer",
+    "class": "schedulefree.ADOPTAOScheduleFree",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr=0.0005, betas=(0.85, 0.9998), eps: float = 1e-08, eps2: float = 0.01, eps_floor: Optional[float] = None, weight_decay: float = 0.0, weight_decouple: bool = False, stable_weight_decay: bool = False, adaptive_clip: float = 1.0, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', debias_beta2: bool = False, use_beta2_warmup: bool = False, beta2_warmup_initial: float = 0.9, beta2_warmup_steps: int = 0, mars_gamma: float = 0.0, r: float = 0.0, weight_lr_power: float = 2.0, fisher: float = False, update_strategy: Literal['unmodified', 'cautious', 'grams', 'both'] = 'unmodified', stable_update: bool = False, stable_update_clip_threshold: float = 1.0, atan2_denom: bool = False, use_orthograd: bool = False, use_spam_clipping: bool = False, spam_clipping_threshold: float = 500.0, spam_clipping_start_step: int = 20, spam_clipping_type: Literal['unit', 'layer', 'element'] = 'element', spam_clipping_eps: Optional[float] = None, use_spam_momentum_reset: bool = False, spam_momentum_reset_warmup_steps: int = 20, spam_momentum_reset_interval_steps: int = 41, use_focus: bool = False, focus_gamma: float = 0.1, focus_beta: float = 0.9, debug: bool = False, use_stable_spam_clipping: bool = False, ssc_t_max: Optional[int] = None, *, block_size: Optional[int] = None, min_quant_size: int = 4096, state_precision: Literal['parameter', 'q4bit', 'q8bit', 'qfp8'] = 'parameter', torch_compile: bool = True, **kwargs) -> None",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "SCION",
+    "kind": "optimizer",
+    "class": "scion.SCION",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.001, momentum: float = 0.1, constraint: bool = False, norm_type: int = <LMONorm.AUTO: 1>, norm_kwargs: Optional[Dict] = None, scale: float = 1.0, weight_decay: float = 0.0, weight_decouple: bool = True, use_orthograd: bool = False, adaptive_clip: Optional[float] = None, adaptive_clip_eps: float = 0.001, adaptive_clip_type: Literal['unit', 'global', 'layer'] = 'layer', update_strategy: Literal['unmodified', 'cautious', 'grams', 'both'] = 'unmodified', use_stable_spam_clipping: bool = False, ssc_t_max: Optional[int] = None, use_focus: bool = False, focus_beta: float = 0.999, torch_compile: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "SCORN",
+    "kind": "optimizer",
+    "class": "scorn.SCORN",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.0001, betas: tuple = (0.95, 0.9999), focus_ratio: float = 0.0, weight_decay: float = 0.0, weight_decay_rate: float = 0.998, amp: float = 5.0, reset_interval: int = 0, reset_increment: int = 0, orthograd: bool = False, spectral_update_scale: float = 1.0, constrain: bool = False, cautious_min: float = 1.0, stochastic_fp: bool = True, use_stable_spam_clipping: bool = False, torch_compile: bool = False, **kwargs)",
+    "tested_update": true,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "SCORNMachina",
+    "kind": "optimizer",
+    "class": "scornmachina.SCORNMachina",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.0006, betas: tuple = (0.95, 0.997), focus_ratio: float = 0.0, weight_decay: float = 0.0, weight_decay_rate: float = 0.998, amp: float = 5.0, reset_interval: int = 0, reset_increment: int = 0, orthograd: bool = True, orthograd_alpha: float = 1.0, spectral_update_scale: float = 1.0, constrain: bool = False, cautious_min: float = 1.0, stochastic_fp: bool = True, use_stable_spam_clipping: bool = False, eps: float = 1e-08, eps2: float = 0.01, eps_floor: float = 1e-16, use_adagc: bool = False, adagc_warmup_steps: int = 0, amsgrad: bool = False, amsgrad_decay_rate: Optional[float] = None, torch_compile: bool = False, sync_chunk_size: int = 128, state_storage_dtype: str | torch.dtype = torch.bfloat16, state_storage_device: str | torch.device = 'cpu', **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "SGDSaI",
+    "kind": "optimizer",
+    "class": "sgd.SGDSaI",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.01, momentum: float = 0.9, weight_decay: float = 0.01, weight_decouple: bool = True, eps: float = 1e-08, cautious: bool = False, torch_compile: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "ScalableShampoo",
+    "kind": "optimizer",
+    "class": "shampoo.ScalableShampoo",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.001, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.999), moving_average_for_momentum: bool = False, weight_decay: float = 0.0, decoupled_weight_decay: bool = False, decoupled_learning_rate: bool = True, inverse_exponent_override: int = 0, start_preconditioning_step: int = 25, preconditioning_compute_steps: int = 1000, statistics_compute_steps: int = 1, block_size: int = 512, skip_preconditioning_rank_lt: int = 1, no_preconditioning_for_layers_with_dim_gt: int = 8192, shape_interpretation: bool = True, graft_type: int = <LayerWiseGrafting.SGD: 1>, pre_conditioner_type: int = <PreConditionerType.ALL: 0>, nesterov: bool = True, diagonal_eps: float = 1e-10, matrix_eps: float = 1e-06, use_svd: bool = False, torch_compile: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "SimplifiedAdEMAMixAINO",
+    "kind": "optimizer",
+    "class": "simplified_ademamix_aino.SimplifiedAdEMAMixAINO",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: Union[float, torch.Tensor] = 0.0001, betas: Tuple[float, float, float] = (0.99, 0.95, 0.999), alpha: float = 0.0, beta1_warmup: Optional[int] = None, min_beta1: float = 0.9, bias_correction1: bool = False, bias_correction2: bool = True, weight_decay: float = 0.0, cautious_update: bool = True, cautious_wd: bool = True, stochastic_fp: bool = True, kahan_sum: bool = False, meta_ema: bool = False, meta_ema_beta: float = 0.85, compile_step: bool = False, foreach: bool = False, sinkhorn_steps: int = 5, ortho_dtype: torch.dtype = torch.bfloat16, eps: float = 1e-16, meta_lr: float = 0.05, meta_wd: float = 0.01, warp_dtype: torch.dtype = torch.bfloat16, warp_mode: str = 'spectral', spectral_bilateral: bool = True, spectral_log_bound: float = 1.0, relative_wd: bool = False, relative_wd_delta: float = 0.001, relative_wd_max_contraction: float = 0.99)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "SingState",
+    "kind": "optimizer",
+    "class": "singstate.SingState",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.0001, beta: float = 0.9, weight_decay: float = 0.0, weight_decay_rate: float = 0.995, spectral_clip: bool = False, spectral_clip_compile: bool = True, spectral_clip_dtype=None, spectral_min: float = -1.0, spectral_max: float = 1.0, spectral_adaptive: bool = False, lowpass_grad: float = 1.0, stochastic_fp: bool = True, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "SNOO_ASGD",
+    "kind": "optimizer",
+    "class": "snoo_asgd.SNOO_ASGD",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, optimizer, lr=1.0, alpha: float = 0.75, lambd: float = None, t0: int = 0, accelerate_k: int = 20, accelerate_lr: float = 0.5, accelerate_momentum: float = 0.5, accelerate_nesterov=True) -> None",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "SOAP",
+    "kind": "optimizer",
+    "class": "soap.SOAP",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.003, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.95, 0.95), shampoo_beta: Optional[float] = None, weight_decay: float = 0.01, precondition_frequency: int = 10, max_precondition_dim: int = 10000, merge_dims: bool = False, precondition_1d: bool = False, correct_bias: bool = True, data_format: Literal['channels_first', 'channels_last'] = 'channels_first', eps: float = 1e-08, torch_compile: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "SODA",
+    "kind": "optimizer",
+    "class": "soda.SODA",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr=0.0001, dual_momentum1=0.05, dual_momentum2=0.05, primal_momentum1=None, primal_momentum2=0, norm: str = 'Spectral', norm_kwargs: dict = None, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "SODAWrapper",
+    "kind": "optimizer",
+    "class": "soda_wrapper.SODAWrapper",
+    "status": "imported",
+    "required_args": [
+      "base_optimizer"
+    ],
+    "signature": "(self, params: collections.abc.Iterable[torch.Tensor] | collections.abc.Iterable[dict[str, typing.Any]] | collections.abc.Iterable[tuple[str, torch.Tensor]], base_optimizer: torch.optim.optimizer.Optimizer, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified only; constructor requires explicit arguments and may need host-specific wrapping."
+  },
+  {
+    "name": "StableSPAM",
+    "kind": "optimizer",
+    "class": "spam.StableSPAM",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.001, betas: Union[Tuple[float, float], Tuple[float, float, float]] = (0.9, 0.999), gamma1: float = 0.85, gamma2: float = 0.99999, gamma3: float = 0.999, t_max: Optional[int] = None, eta_min: float = 0.5, weight_decay: float = 0.0, update_proj_gap: int = 1000, eps: float = 1e-08, use_orthograd: bool = False, use_adopt: bool = False, update_strategy: Literal['unmodified', 'cautious', 'grams', 'both'] = 'unmodified', torch_compile: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "TALON",
+    "kind": "optimizer",
+    "class": "talon.TALON",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: float = 0.0001, betas: tuple = (0.9, 0.99, 0.9999999), weight_decay: float = 0.0, weight_decay_rate: float = 0.995, denom_atan2: bool = True, separate_frequencies: float = 0.0, highfreq_mult: float = 0.1, lowpass_grad: float = 0.0, invariant: bool = False, spectral_clip: bool = True, spectral_clip_compile: bool = True, spectral_min: float = -1.0, spectral_max: float = 1.0, spectral_adaptive: bool = False, signscale_power: float = 1.0, orthograd: bool = False, stochastic_fp: bool = True, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "VSGD",
+    "kind": "optimizer",
+    "class": "vsgd.VSGD",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Dict[str, Any], lr: float = 0.1, ghattg: float = 30.0, ps: float = 1e-08, tau1: float = 0.81, tau2: float = 0.9, weight_decay: float = 0.0, weight_decouple: bool = True, eps: float = 1e-08, maximize: bool = False, torch_compile: bool = False, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "WarpAdam",
+    "kind": "optimizer",
+    "class": "warpadam.WarpAdam",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Iterable[torch.Tensor], lr: float = 0.001, betas: Tuple[float, float] = (0.9, 0.999), eps: float = 1e-08, weight_decay: float = 0.0, rank: int = 16, mode: str = 'online', meta_lr: float = 0.001, meta_wd: float = 0.01, cautious_update: bool = True, stochastic_fp: bool = True, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "WarpAINO",
+    "kind": "optimizer",
+    "class": "warpaino.WarpAINO",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params, lr: Union[float, torch.Tensor] = 0.0001, betas: Tuple[float, float, float] = (0.95, 0.95, 0.999), weight_decay: float = 0.0, cautious_update: bool = True, cautious_wd: bool = True, stochastic_fp: bool = True, kahan_sum: bool = False, nesterov_value: bool = False, aino_mix_alpha: float = 0.0, came_confidence: bool = False, came_beta: float = 0.9999, compile_step: bool = False, foreach: bool = False, sinkhorn_steps: int = 5, ortho_dtype: torch.dtype = torch.bfloat16, eps: float = 1e-16, meta_lr: float = 0.0, meta_wd: float = 0.01, warp_dtype: torch.dtype = torch.bfloat16, warp_mode: str = 'spectral', spectral_bilateral: bool = True, spectral_log_bound: float = 1.0, relative_wd: bool = False, relative_wd_delta: float = 0.001, relative_wd_max_contraction: float = 0.99)",
+    "tested_update": true,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  },
+  {
+    "name": "WiwiOpt",
+    "kind": "optimizer",
+    "class": "wiwiopt.WiwiOpt",
+    "status": "imported",
+    "required_args": [],
+    "signature": "(self, params: Iterable[torch.Tensor], lr: float = 0.0001, betas: Tuple[float, float, float] = (0.95, 0.95, 0.995), eps: float = 1e-16, weight_decay: float = 0.0, weight_decay_rate: float = 1.0, muon: bool = True, use_compile: bool = True, ortho_dtype: Optional[torch.dtype] = None, dynamic_lr: bool = True, dynamic_lr_boost: bool = True, egd: bool = True, egd_online: bool = True, egd_method: Literal['oja', 'past', 'svd', 'fapi'] = 'fapi', cautious_xi: float = 1.0, normuon: bool = True, rms_max: float = 10.0, stochastic_fp: bool = True, **kwargs)",
+    "tested_update": false,
+    "host_notes": "Import verified; runtime compatibility requires a finite parameter-update trial."
+  }
+]

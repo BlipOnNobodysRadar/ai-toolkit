@@ -189,6 +189,13 @@ class NetworkConfig:
         self.conv_alpha: float = kwargs.get('conv_alpha', self.conv)
         self.dropout: Union[float, None] = kwargs.get('dropout', None)
         self.network_kwargs: dict = kwargs.get('network_kwargs', {})
+        self.respect_alpha = bool(kwargs.get('respect_alpha', False))
+        self.lora_plus_ratio = float(kwargs.get('lora_plus_ratio', 1.0))
+        self.lora_plus_text_encoder_ratio = float(kwargs.get('lora_plus_text_encoder_ratio', self.lora_plus_ratio))
+        if self.lora_plus_ratio <= 0 or self.lora_plus_text_encoder_ratio <= 0:
+            raise ValueError('LoRA+ ratios must be positive')
+        if (self.lora_plus_ratio != 1 or self.lora_plus_text_encoder_ratio != 1) and self.type.lower() not in ('lora', 'dora', 'locon'):
+            raise ValueError('LoRA+ learning-rate splitting requires LoRA or DoRA factors')
 
         self.lorm_config: Union[LoRMConfig, None] = None
         lorm = kwargs.get('lorm', None)
@@ -355,6 +362,10 @@ class ValidationConfig:
         self.resolution: int = kwargs.get('resolution', 512)
         self.validate_every_n_steps: int = kwargs.get('validate_every_n_steps', 10)
         self.validation_sigmas: List[float] = kwargs.get('validation_sigmas', [1.0, 0.75, 0.5, 0.25])
+        self.datasets = kwargs.get('datasets', [])
+        self.max_batches = int(kwargs.get('max_batches', 5))
+        self.seed = int(kwargs.get('seed', 42))
+        if self.max_batches < 1: raise ValueError('validation max_batches must be positive')
 
 
 class EmbeddingConfig:
@@ -523,6 +534,9 @@ class TrainConfig:
         self.correct_pred_norm_multiplier = kwargs.get('correct_pred_norm_multiplier', 1.0)
 
         self.loss_type = kwargs.get('loss_type', 'mse') # mse, mae, wavelet, pixelspace, mean_flow, pseudo_huber
+        self.training_extras = kwargs.get('training_extras', None)
+        if self.training_extras is not None and not isinstance(self.training_extras, dict):
+            raise ValueError('training_extras must be a mapping')
         
         # do the loss on a timestep to 0 prediction
         self.t0_loss_target = kwargs.get('t0_loss_target', False)

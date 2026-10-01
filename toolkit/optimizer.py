@@ -10,6 +10,9 @@ def get_optimizer(
     if optimizer_params is None:
         optimizer_params = {}
     lower_type = optimizer_type.lower()
+    if lower_type.startswith('easy:') or '.' in optimizer_type:
+        from training_extras.optim import create_optimizer
+        return create_optimizer(params, optimizer_type, learning_rate, optimizer_params)
     if lower_type.startswith("dadaptation"):
         # dadaptation optimizer does not use standard learning rate. 1 is the default value
         import dadaptation

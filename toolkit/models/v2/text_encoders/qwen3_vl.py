@@ -41,6 +41,18 @@ class Qwen3VLTextEncoder(Qwen3VLForConditionalGeneration, OstrisTransformersMixi
     aitk_processor_subfolder = "processor"
 
     @classmethod
+    def convert_state_dict_on_load(cls, state_dict):
+        # Comfy checkpoints use the decoder's inner model names.
+        return {("model.language_model." + k[len("model."):] if k.startswith(("model.layers.", "model.embed_tokens.", "model.norm.")) else
+                 "model." + k if k.startswith("visual.") else k): v for k, v in state_dict.items()}
+
+    @staticmethod
+    def _load_state_dict_with_quantized(model, state_dict):
+        if "lm_head.weight" not in state_dict:
+            model.lm_head = None  # Conditioning consumes hidden states, never logits.
+        OstrisTransformersMixin._load_state_dict_with_quantized(model, state_dict)
+
+    @classmethod
     def get_transformer_block_names(cls):
         return ["model.language_model.layers"]
 

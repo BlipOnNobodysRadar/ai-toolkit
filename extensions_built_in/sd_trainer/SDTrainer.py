@@ -307,6 +307,20 @@ class SDTrainer(BaseSDTrainProcess):
 
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
+        self.training_extras = None
+        if self.train_config.training_extras is not None:
+            from training_extras.runtime import TrainingExtras
+            if self.train_config.loss_type == 'mean_flow' or self.do_guided_loss or getattr(self.sd, 'is_llm', False):
+                raise ValueError('training_extras is supported on the standard diffusion loss path; use the caption trainer for MiniCPM')
+            if self.train_config.t0_loss_target or self.train_config.train_turbo:
+                raise ValueError('training_extras requires the canonical diffusion prediction, without t0/turbo conversion')
+            self.training_extras = TrainingExtras(self.train_config.training_extras, self.sd.noise_scheduler,
+                self.sd.is_flow_matching, getattr(self.sd, 'prediction_type', 'epsilon'),
+                self.device_torch, self.train_config.steps)
+            if self.training_extras.edm.enabled and self.train_config.dtype not in ('bf16','bfloat16','float32','fp32'):
+                raise ValueError('EDM2 currently requires BF16 or FP32 in this host; FP16 AMP is unsupported')
+            state = os.path.join(self.save_root, 'training_extras.pt')
+            if os.path.exists(state): self.training_extras.restore(state)
         if self.is_caching_text_embeddings:
             # make sure model is on cpu for this part so we don't oom.
             self.sd.unet.to('cpu')
@@ -944,7 +958,11 @@ class SDTrainer(BaseSDTrainProcess):
                     fft_loss = fft_loss.mean()
                     self.additional_logs['loss/fft'] = fft_loss.item()
                     additional_loss += fft_loss
-            if self.train_config.loss_type == "pseudo_huber":
+            if getattr(self, 'training_extras', None) is not None:
+                loss = self.training_extras.bridge.element_loss(pred, target, timesteps)
+                loss, element_logs = self.training_extras.elements.apply(loss, noisy_latents, timesteps)
+                self.additional_logs.update({k:float(v) for k,v in element_logs.items()})
+            elif self.train_config.loss_type == "pseudo_huber":
                 diff = pred.float() - target.float()
                 c=0.01
                 loss =(torch.sqrt(diff.pow(2) + c ** 2) - c)
@@ -1066,6 +1084,13 @@ class SDTrainer(BaseSDTrainProcess):
                 # add min_snr_gamma
                 loss = apply_snr_weight(loss, timesteps, self.sd.noise_scheduler, self.train_config.min_snr_gamma)
 
+        if getattr(self, 'training_extras', None) is not None:
+            if has_mask and self.training_extras.bridge._aux_enabled():
+                raise ValueError('Spatial auxiliary losses currently require unmasked examples')
+            parameters = self.network.parameters() if self.network is not None else self.sd.unet.parameters()
+            loss, extra_logs = self.training_extras.augment(loss, noise_pred, batch.latents, noisy_latents,
+                timesteps, (p for p in parameters if p.requires_grad))
+            self.additional_logs.update(extra_logs)
         loss = loss.mean()
         
         # check for audio loss
@@ -2344,7 +2369,8 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             batch_list = [batch]
         total_loss = None
-        self.optimizer.zero_grad()
+        # The host clears gradients before the loop and after optimizer steps.
+        # Clearing here would discard preceding accumulation calls.
         # micro-batches per optimizer step: a batch list (gradient_accumulation) or repeated
         # calls (gradient_accumulation_steps). -1 (whole epoch) has no fixed count; left summed.
         n_accum = len(batch_list)
@@ -2388,6 +2414,8 @@ class SDTrainer(BaseSDTrainProcess):
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
                 self.optimizer.step()
+                if getattr(self, 'training_extras', None) is not None:
+                    self.training_extras.step()
 
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.adapter and isinstance(self.adapter, CustomAdapter):

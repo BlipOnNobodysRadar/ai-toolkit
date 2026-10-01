@@ -87,6 +87,17 @@ class DTO(torch.Tensor):
     def __reduce_ex__(self, protocol):
         return (_rebuild_dto, (self.tensor, self._dto_extras))
 
+    def __deepcopy__(self, memo):
+        # Cached audiovisual latents are copied by the dataset before use.
+        # Tensor's default subclass deepcopy loses the DTO constructor/extras.
+        import copy
+        if id(self) in memo:
+            return memo[id(self)]
+        result = DTO(copy.deepcopy(self.tensor, memo))
+        memo[id(self)] = result
+        result._dto_extras = copy.deepcopy(self._dto_extras, memo)
+        return result
+
     def map(self, fn):
         """Apply fn to the main tensor and every tensor extra, keep the rest."""
         return DTO(

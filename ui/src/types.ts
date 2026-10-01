@@ -153,6 +153,9 @@ export interface ValidationConfig {
   resolution: number;
   validate_every_n_steps: number;
   validation_sigmas?: number[];
+  datasets?: DatasetConfig[];
+  max_batches?: number;
+  seed?: number;
 }
 
 export interface TrainConfig {
@@ -174,6 +177,7 @@ export interface TrainConfig {
   cache_text_embeddings: boolean;
   optimizer_params: {
     weight_decay: number;
+    [key: string]: unknown;
   };
   skip_first_sample: boolean;
   force_first_sample: boolean;
@@ -190,6 +194,9 @@ export interface TrainConfig {
   audio_loss_multiplier?: number;
   max_loss?: number | null;
   validation_config?: ValidationConfig;
+  training_extras?: Record<string, unknown>;
+  lr_scheduler?: string;
+  lr_scheduler_params?: Record<string, unknown>;
   do_guidance_loss?: boolean;
   guidance_loss_target?: number;
 }
