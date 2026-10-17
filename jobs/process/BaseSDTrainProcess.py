@@ -1036,9 +1036,22 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 latents, noise, timestep
             )
 
+        if self.train_config.multires_noise_iterations and not getattr(self, '_disable_noise_augmentation', False):
+            from toolkit.noise_augmentation import augmentation_seed, multires_noise_like
+            noise = multires_noise_like(
+                noise, self.train_config.multires_noise_iterations,
+                self.train_config.multires_noise_discount,
+                seed=augmentation_seed(self.train_config.noise_augmentation_seed,
+                                       self.step_num, self.grad_accumulation_step, 1,
+                                       batch_index=getattr(self, '_noise_augmentation_batch_index', 0)),
+            )
+
         return noise
 
     def process_general_training_batch(self, batch: 'DataLoaderBatchDTO'):
+        if (self.train_config.multires_noise_iterations or self.train_config.ip_noise_gamma) and not getattr(self, '_disable_noise_augmentation', False):
+            from toolkit.noise_augmentation import begin_noise_augmentation_batch
+            begin_noise_augmentation_batch(self)
         with torch.no_grad():
             with self.timer('prepare_prompt'):
                 prompts = batch.get_caption_list()
@@ -1397,7 +1410,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # mean_zero_latents = latents - latents.mean()
                 # latents = mean_zero_latents / mean_zero_latents.std()
 
-                noisy_latents = self.sd.add_noise(latents, noise, timesteps)
+                input_noise = noise
+                if self.train_config.ip_noise_gamma and not getattr(self, '_disable_noise_augmentation', False):
+                    from toolkit.noise_augmentation import augmentation_seed, input_perturbed_noise
+                    input_noise = input_perturbed_noise(
+                        noise, self.train_config.ip_noise_gamma,
+                        random_strength=self.train_config.ip_noise_gamma_random_strength,
+                        seed=augmentation_seed(self.train_config.noise_augmentation_seed,
+                                               self.step_num, self.grad_accumulation_step, 2,
+                                               batch_index=getattr(self, '_noise_augmentation_batch_index', 0)),
+                    )
+                noisy_latents = self.sd.add_noise(latents, input_noise, timesteps)
 
                 # determine scaled noise
                 # todo do we need to scale this or does it always predict full intensity
@@ -1429,7 +1452,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     # add our new timesteps on to end
                     timesteps = torch.cat([timesteps, refiner_timesteps], dim=0)
 
-                    refiner_noisy_latents = self.sd.noise_scheduler.add_noise(latents, noise, refiner_timesteps)
+                    refiner_noisy_latents = self.sd.noise_scheduler.add_noise(latents, input_noise, refiner_timesteps)
                     noisy_latents = torch.cat([noisy_latents, refiner_noisy_latents], dim=0)
 
                 else:
@@ -1920,8 +1943,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # default to LoCON if there are any conv layers or if it is named
                 NetworkClass = LoRASpecialNetwork
                 if self.network_config.type.lower() == 'locon' or self.network_config.type.lower() == 'lycoris':
-                    NetworkClass = LycorisSpecialNetwork
-                    is_lycoris = True
+                    if network_kwargs.get('full_locon', False):
+                        # Native LoCon factors plus full deltas for weighted norm
+                        # layers. This route also supports quantized transformers
+                        # and the toolkit's CPU adapter offloading.
+                        NetworkClass = LoRASpecialNetwork
+                    else:
+                        NetworkClass = LycorisSpecialNetwork
+                        is_lycoris = True
 
                 if is_lorm:
                     network_kwargs['ignore_if_contains'] = lorm_ignore_if_contains
@@ -1969,7 +1998,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
 
                 # todo switch everything to proper mixed precision like this
-                self.network.force_to(self.device_torch, dtype=torch.float32)
+                # Offloaded adapters must not first allocate their entire FP32
+                # master weights on CUDA; large ranks can OOM before attach().
+                network_init_device = torch.device('cpu') if self.network_config.layer_offloading else self.device_torch
+                self.network.force_to(network_init_device, dtype=torch.float32)
                 # give network to sd so it can use it
                 self.sd.network = self.network
                 self.network._update_torch_multiplier()
@@ -2056,6 +2088,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         self.network,
                         self.device_torch
                     )
+                    # CPU initialization made the multiplier a CPU tensor. Once
+                    # managed, derive its device from the layer's compute device.
+                    self.network._update_torch_multiplier()
 
             if self.embed_config is not None:
                 # we are doing embedding training as well

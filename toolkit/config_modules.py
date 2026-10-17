@@ -2,6 +2,7 @@ import os
 import time
 from typing import List, Optional, Literal, Tuple, Union, TYPE_CHECKING, Dict
 import random
+import math
 
 import torch
 import torchaudio
@@ -226,7 +227,7 @@ class NetworkConfig:
         # for multi stage models
         self.split_multistage_loras = kwargs.get('split_multistage_loras', True)
         
-        # ramtorch, doesn't work yet
+        # Native CPU layer offloading for compatible trainable adapter modules.
         self.layer_offloading = kwargs.get('layer_offloading', False)
         
         # start from a pretrained lora
@@ -422,6 +423,18 @@ class TrainConfig:
         # this should balance the learning rate across all timesteps over time
         self.learnable_snr_gos = kwargs.get('learnable_snr_gos', False)
         self.noise_offset = kwargs.get('noise_offset', 0.0)
+        self.multires_noise_iterations = kwargs.get('multires_noise_iterations', 0)
+        self.multires_noise_discount = float(kwargs.get('multires_noise_discount', 0.1))
+        self.ip_noise_gamma = float(kwargs.get('ip_noise_gamma', 0.0))
+        self.ip_noise_gamma_random_strength = kwargs.get('ip_noise_gamma_random_strength', False)
+        self.noise_augmentation_seed = int(kwargs.get('noise_augmentation_seed', 0))
+        if (not isinstance(self.multires_noise_iterations, int)
+                or not 0 <= self.multires_noise_iterations <= 32):
+            raise ValueError('multires_noise_iterations must be an integer from 0 to 32')
+        if not math.isfinite(self.multires_noise_discount) or not 0 <= self.multires_noise_discount <= 1:
+            raise ValueError('multires_noise_discount must be finite and between 0 and 1')
+        if not math.isfinite(self.ip_noise_gamma) or self.ip_noise_gamma < 0:
+            raise ValueError('ip_noise_gamma must be finite and nonnegative')
         self.skip_first_sample = kwargs.get('skip_first_sample', False)
         self.force_first_sample = kwargs.get('force_first_sample', False)
         self.gradient_checkpointing = kwargs.get('gradient_checkpointing', True)

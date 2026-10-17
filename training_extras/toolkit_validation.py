@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from .optim import evaluation_optimizer
+from toolkit.noise_augmentation import disable_noise_augmentation
 
 @contextmanager
 def fixed_rng(seed, device):
@@ -35,7 +36,7 @@ def setup(trainer):
     device, dtype = trainer.device_torch, trainer.sd.torch_dtype
     trainer.sd.set_device_state_preset('cache_latents')
     try:
-        with torch.no_grad(), fixed_rng(cfg.seed, device):
+        with torch.no_grad(), fixed_rng(cfg.seed, device), disable_noise_augmentation(trainer):
             loader = get_dataloader_from_datasets(configs, 1, trainer.sd)
             for i, batch in enumerate(loader):
                 if i >= cfg.max_batches: break

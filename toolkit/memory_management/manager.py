@@ -10,6 +10,7 @@ from .manager_modules import (
     _DEVICE_STATE,
     _move_own_param,
     _storage_device,
+    _ensure_cpu_pinned,
 )
 import random
 
@@ -296,6 +297,11 @@ class MemoryManager:
             # quantized linear (offload_percent < 1) would stay on cpu; _move_own_param
             # swaps the Parameter in that case
             for name, p in list(sub.named_parameters(recurse=False)):
+                if name in getattr(sub, '_cpu_master_parameter_names', ()):
+                    # Adapter scalars and full norm deltas materialize explicitly
+                    # in their forward. Their masters and optimizer stay on CPU.
+                    p.data = _ensure_cpu_pinned(p.data).detach()
+                    continue
                 if p is not None and _storage_device(p) != device:
                     _move_own_param(sub, name, p, device)
             for name, b in sub._buffers.items():

@@ -2405,7 +2405,7 @@ class SDTrainer(BaseSDTrainProcess):
             # pinned tensors; join them before anything on the CPU reads .grad
             sync_grad_transfers()
             # fix this for multi params
-            if self.train_config.optimizer != 'adafactor':
+            if self.train_config.optimizer != 'adafactor' and self.train_config.max_grad_norm > 0:
                 if isinstance(self.params[0], dict):
                     for i in range(len(self.params)):
                         self.accelerator.clip_grad_norm_(self.params[i]['params'], self.train_config.max_grad_norm)
