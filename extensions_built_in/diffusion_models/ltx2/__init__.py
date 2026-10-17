@@ -1,4 +1,4 @@
-from .ltx2 import LTX2Model, LTX23Model
+from .ltx2 import LTX2Model, LTX23Model, LTX25Model
 
 
 # Preserve the fork's dataset-level LTX modality isolation without replacing

@@ -29,7 +29,7 @@ The original default `unsloth/Qwen3-VL-32B-Instruct-bnb-4bit` checkpoint loaded 
 
 The proposer and H3 scorer are never resident together. Qwen is unloaded before H3 loads. H3 uses the same fully-offloaded low-VRAM path as training, H3 scoring defaults to a 256-pixel longest edge, the VAEs are returned to CPU after latent extraction, and the DiT is parked on CPU while H3's 32B Qwen conditioner produces text embeddings.
 
-Use the normal ai-toolkit environment. TorchCodec 0.13 is required for the optional audio path with the current PyTorch build.
+Use the normal ai-toolkit environment and its `requirements_base.txt` TorchCodec pin for the optional audio path. The initial field test used TorchCodec 0.13 with its then-current PyTorch build; do not downgrade the toolkit's current pin to reproduce that historical environment.
 
 ## Full caption + rank
 
