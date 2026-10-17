@@ -1,0 +1,56 @@
+{
+  "name": "h3_gens_10",
+  "query": "Describe the video and audio in detail.",
+  "entries": [
+    {
+      "index": 1,
+      "file": "MiniMax_H3_00157_.mp4",
+      "target": "A young boy interviews several women about their workout routines on a sunny beach boardwalk. The women wear bright athletic outfits, including orange, white and black, lime green, and briefly purple. Ocean waves, wind, beach ambience, footsteps, speech, and light laughter are audible; there is no non-diegetic music."
+    },
+    {
+      "index": 2,
+      "file": "MiniMax_H3_00158_.mp4",
+      "target": "At night in heavy rain, a young woman in a black coat walks beneath a translucent umbrella through a neon-lit cyberpunk city street. Wet pavement reflects colored signs, cars splash through water, steam rises, a train passes overhead, and atmospheric synth music plays beneath rain and traffic sounds."
+    },
+    {
+      "index": 3,
+      "file": "MiniMax_H3_00159_.mp4",
+      "target": "In a warmly lit home kitchen, a middle-aged man in a navy shirt and apron cooks pasta sauce with a teenage girl who slices and adds basil. They talk and laugh while sauce bubbles, a knife taps the cutting board, dishes clink, and soft acoustic guitar and piano music play."
+    },
+    {
+      "index": 4,
+      "file": "MiniMax_H3_00160_.mp4",
+      "target": "A golden retriever carrying a red tennis ball runs through a sunlit autumn park covered in orange and yellow leaves. It races toward a woman in a green jacket, drops the ball, is petted, and later leaps for the ball as leaves scatter, accompanied by playful orchestral music and park ambience."
+    },
+    {
+      "index": 5,
+      "file": "MiniMax_H3_00161_.mp4",
+      "target": "A young woman in a black shirt and jeans gives an explanation in a bright modern classroom beside a whiteboard containing diagrams and phrases such as The Future of AI and Machine Learning. She writes and points with a marker while speaking; marker squeaks and classroom room tone are audible, with no music."
+    },
+    {
+      "index": 6,
+      "file": "MiniMax_H3_00162_.mp4",
+      "target": "At dusk on a mountain lookout, a lone hiker in a yellow rain jacket watches a storm move across a valley. Strong wind bends trees, lightning flashes, rain strikes the hiker and rocks, thunder sounds in the distance, and tense cinematic drones and low strings underscore the scene."
+    },
+    {
+      "index": 7,
+      "file": "MiniMax_H3_00163_.mp4",
+      "target": "During golden hour on a busy pedestrian street, a young Black man in a denim jacket and knit beanie plays acoustic guitar and sings into a microphone beside an open guitar case. A little girl dances nearby while her mother watches; guitar, singing, footsteps, conversation, and coins are heard, with no non-diegetic music."
+    },
+    {
+      "index": 8,
+      "file": "MiniMax_H3_00164_.mp4",
+      "target": "At night in a cozy home office, an orange tabby cat sits on a cluttered desk and deliberately knocks a pen and then a pair of glasses onto the floor. An off-screen person reacts while the cat sits innocently afterward; object impacts and room tone are accompanied by light comedic pizzicato strings."
+    },
+    {
+      "index": 9,
+      "file": "MiniMax_H3_00165_.mp4",
+      "target": "In a floodlit soccer stadium at night, players in blue attack defenders in white. A midfielder advances, the ball is played down the right wing and crossed, and a blue striker scores with a volley before the crowd celebrates and the goal is replayed in slow motion. Crowd noise, kicks, shouts, and a whistle are heard, with no music."
+    },
+    {
+      "index": 10,
+      "file": "MiniMax_H3_00166_.mp4",
+      "target": "At night in a grand old library, a young woman in a dark coat walks between tall shelves with a flashlight and an old book. She discovers a handwritten note, reacts to it, then turns toward the sound of an off-screen falling book as suspenseful piano and low strings play beneath quiet footsteps, page turns, room echo, and breathing."
+    }
+  ]
+}
