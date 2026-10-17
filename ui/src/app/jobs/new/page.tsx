@@ -70,6 +70,7 @@ export default function TrainingForm() {
 
         migrateJobConfig(parsed);
         setJobConfig(parsed);
+        if (parsed.config?.process?.[0]?.train?.training_extras || parsed.config?.process?.[0]?.train?.validation_config?.datasets?.length) setShowAdvancedView(true);
       } catch (err) {
         console.error('Failed to parse config file:', err);
         alert('Failed to parse config file. Please check the file format.');

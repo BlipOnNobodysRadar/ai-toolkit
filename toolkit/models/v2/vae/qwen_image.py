@@ -9,6 +9,14 @@ class QwenImageVAE(AutoencoderKLQwenImage, OstrisModelMixin):
     nucleus_image and krea2."""
 
     aitk_subfolder = "vae"
+    aitk_config_repo = "Qwen/Qwen-Image"
+
+    @classmethod
+    def convert_state_dict_on_load(cls, state_dict):
+        if "encoder.conv1.weight" in state_dict:
+            from diffusers.loaders.single_file_utils import convert_wan_vae_to_diffusers
+            return convert_wan_vae_to_diffusers(dict(state_dict))
+        return state_dict
 
 
 class QwenImageVAEHolderMixin:

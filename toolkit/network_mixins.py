@@ -234,8 +234,7 @@ class ToolkitModuleMixin:
 
         # handle trainable scaler method locon does
         if hasattr(self, 'scalar'):
-            scale = scale * self.scalar
-
+            lx = lx * self.scalar.to(device=lx.device, dtype=lx.dtype)
         return lx * scale
 
     def lorm_forward(self: Network, x, *args, **kwargs):
@@ -308,7 +307,7 @@ class ToolkitModuleMixin:
         # always cast to float32
         lora_input = x.to(self.lora_down.weight.dtype)
         lora_output = self._call_forward(lora_input)
-        multiplier = self.network_ref().torch_multiplier
+        multiplier = self.network_ref().torch_multiplier.to(device=lora_output.device)
 
         lora_output_batch_size = lora_output.size(0)
         multiplier_batch_size = multiplier.size(0)
@@ -611,6 +610,9 @@ class ToolkitNetworkMixin:
 
             new_save_dict = {}
             for key, value in save_dict.items():
+                if key.endswith('.lora_up.weight') and getattr(getattr(self, 'network_config', None), 'respect_alpha', False):
+                    alpha_key = key[:-len('lora_up.weight')] + 'alpha'
+                    value = value * (float(save_dict[alpha_key]) / value.shape[1])
                 # lokr needs alpha
                 if key.endswith('.alpha') and self.network_type.lower() != "lokr":
                     continue
@@ -688,6 +690,7 @@ class ToolkitNetworkMixin:
             weights_sd = self.base_model_ref().convert_lora_weights_before_load(weights_sd)
 
         load_sd = OrderedDict()
+        alpha_state = self.state_dict() if getattr(getattr(self, 'network_config', None), 'respect_alpha', False) else None
         for key, value in weights_sd.items():
             load_key = keymap[key] if key in keymap else key
             # replace old double __ with single _
@@ -706,12 +709,19 @@ class ToolkitNetworkMixin:
                 load_key = load_key.replace('.', '$$')
                 load_key = load_key.replace('$$lora_down$$', '.lora_down.')
                 load_key = load_key.replace('$$lora_up$$', '.lora_up.')
+                if alpha_state is not None and load_key.endswith('.lora_up.weight'):
+                    alpha_key = load_key[:-len('lora_up.weight')] + 'alpha'
+                    scale = float(alpha_state[alpha_key]) / alpha_state[load_key].shape[1]
+                    if scale <= 0: raise ValueError('Training alpha must be positive')
+                    value = value / scale
                 # full weight modules store their delta as `.diff` / `.diff_b` (anchored at the
                 # end so this is a no-op for any non-full-weight key)
                 if load_key.endswith('$$diff'):
                     load_key = load_key[:-len('$$diff')] + '.diff'
                 elif load_key.endswith('$$diff_b'):
                     load_key = load_key[:-len('$$diff_b')] + '.diff_b'
+                elif load_key.endswith('$$scalar'):
+                    load_key = load_key[:-len('$$scalar')] + '.scalar'
 
                 # patch lokr, not sure why we need to but whatever
                 if self.network_type.lower() == "lokr":
@@ -820,6 +830,10 @@ class ToolkitNetworkMixin:
             dtype = first_module.diff.dtype
         else:
             raise ValueError("Unknown module type")
+        if hasattr(self, '_memory_manager'):
+            # Full norm deltas may be first in module traversal. Their CPU
+            # master device is not the network's execution device.
+            device = self._memory_manager.process_device
         with torch.no_grad():
             tensor_multiplier = None
             if isinstance(multiplier, int) or isinstance(multiplier, float):

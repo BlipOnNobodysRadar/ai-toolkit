@@ -2,6 +2,7 @@ import os
 import time
 from typing import List, Optional, Literal, Tuple, Union, TYPE_CHECKING, Dict
 import random
+import math
 
 import torch
 import torchaudio
@@ -189,6 +190,13 @@ class NetworkConfig:
         self.conv_alpha: float = kwargs.get('conv_alpha', self.conv)
         self.dropout: Union[float, None] = kwargs.get('dropout', None)
         self.network_kwargs: dict = kwargs.get('network_kwargs', {})
+        self.respect_alpha = bool(kwargs.get('respect_alpha', False))
+        self.lora_plus_ratio = float(kwargs.get('lora_plus_ratio', 1.0))
+        self.lora_plus_text_encoder_ratio = float(kwargs.get('lora_plus_text_encoder_ratio', self.lora_plus_ratio))
+        if self.lora_plus_ratio <= 0 or self.lora_plus_text_encoder_ratio <= 0:
+            raise ValueError('LoRA+ ratios must be positive')
+        if (self.lora_plus_ratio != 1 or self.lora_plus_text_encoder_ratio != 1) and self.type.lower() not in ('lora', 'dora', 'locon'):
+            raise ValueError('LoRA+ learning-rate splitting requires LoRA or DoRA factors')
 
         self.lorm_config: Union[LoRMConfig, None] = None
         lorm = kwargs.get('lorm', None)
@@ -219,7 +227,7 @@ class NetworkConfig:
         # for multi stage models
         self.split_multistage_loras = kwargs.get('split_multistage_loras', True)
         
-        # ramtorch, doesn't work yet
+        # Native CPU layer offloading for compatible trainable adapter modules.
         self.layer_offloading = kwargs.get('layer_offloading', False)
         
         # start from a pretrained lora
@@ -355,6 +363,10 @@ class ValidationConfig:
         self.resolution: int = kwargs.get('resolution', 512)
         self.validate_every_n_steps: int = kwargs.get('validate_every_n_steps', 10)
         self.validation_sigmas: List[float] = kwargs.get('validation_sigmas', [1.0, 0.75, 0.5, 0.25])
+        self.datasets = kwargs.get('datasets', [])
+        self.max_batches = int(kwargs.get('max_batches', 5))
+        self.seed = int(kwargs.get('seed', 42))
+        if self.max_batches < 1: raise ValueError('validation max_batches must be positive')
 
 
 class EmbeddingConfig:
@@ -411,6 +423,18 @@ class TrainConfig:
         # this should balance the learning rate across all timesteps over time
         self.learnable_snr_gos = kwargs.get('learnable_snr_gos', False)
         self.noise_offset = kwargs.get('noise_offset', 0.0)
+        self.multires_noise_iterations = kwargs.get('multires_noise_iterations', 0)
+        self.multires_noise_discount = float(kwargs.get('multires_noise_discount', 0.1))
+        self.ip_noise_gamma = float(kwargs.get('ip_noise_gamma', 0.0))
+        self.ip_noise_gamma_random_strength = kwargs.get('ip_noise_gamma_random_strength', False)
+        self.noise_augmentation_seed = int(kwargs.get('noise_augmentation_seed', 0))
+        if (not isinstance(self.multires_noise_iterations, int)
+                or not 0 <= self.multires_noise_iterations <= 32):
+            raise ValueError('multires_noise_iterations must be an integer from 0 to 32')
+        if not math.isfinite(self.multires_noise_discount) or not 0 <= self.multires_noise_discount <= 1:
+            raise ValueError('multires_noise_discount must be finite and between 0 and 1')
+        if not math.isfinite(self.ip_noise_gamma) or self.ip_noise_gamma < 0:
+            raise ValueError('ip_noise_gamma must be finite and nonnegative')
         self.skip_first_sample = kwargs.get('skip_first_sample', False)
         self.force_first_sample = kwargs.get('force_first_sample', False)
         self.gradient_checkpointing = kwargs.get('gradient_checkpointing', True)
@@ -523,6 +547,9 @@ class TrainConfig:
         self.correct_pred_norm_multiplier = kwargs.get('correct_pred_norm_multiplier', 1.0)
 
         self.loss_type = kwargs.get('loss_type', 'mse') # mse, mae, wavelet, pixelspace, mean_flow, pseudo_huber
+        self.training_extras = kwargs.get('training_extras', None)
+        if self.training_extras is not None and not isinstance(self.training_extras, dict):
+            raise ValueError('training_extras must be a mapping')
         
         # do the loss on a timestep to 0 prediction
         self.t0_loss_target = kwargs.get('t0_loss_target', False)

@@ -203,6 +203,7 @@ export default function SimpleJob({
   const showGPUSelect = !isMac();
 
   const validationConfig = jobConfig.config.process[0].train.validation_config;
+  const validationItems = validationConfig?.validation_items ?? [];
 
   let numDatasetCols = 4;
   let numSampleTopCols = 4;
@@ -1057,9 +1058,9 @@ export default function SimpleJob({
                   </div>
                   <div className="mt-4">
                     <label className="block text-xs text-gray-300 mb-2">
-                      Validation Images ({validationConfig.validation_items.length})
+                      Validation Images ({validationItems.length})
                     </label>
-                    {validationConfig.validation_items.map((item, i) => (
+                    {validationItems.map((item, i) => (
                       <div key={i} className="rounded-lg pl-4 pr-1 py-3 mb-4 bg-gray-950">
                         <div className="flex items-center space-x-4">
                           <SampleControlImage
@@ -1090,7 +1091,7 @@ export default function SimpleJob({
                               type="button"
                               onClick={() =>
                                 setJobConfig(
-                                  validationConfig.validation_items.filter((_, index) => index !== i),
+                                  validationItems.filter((_, index) => index !== i),
                                   'config.process[0].train.validation_config.validation_items',
                                 )
                               }
@@ -1106,7 +1107,7 @@ export default function SimpleJob({
                       type="button"
                       onClick={() =>
                         setJobConfig(
-                          [...validationConfig.validation_items, { image_path: '', prompt: '' }],
+                          [...validationItems, { image_path: '', prompt: '' }],
                           'config.process[0].train.validation_config.validation_items',
                         )
                       }

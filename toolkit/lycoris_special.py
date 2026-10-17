@@ -377,3 +377,12 @@ class LycorisSpecialNetwork(ToolkitNetworkMixin, LycorisNetwork):
         for lora in self.text_encoder_loras + self.unet_loras:
             assert lora.lora_name not in names, f"duplicated lora name: {lora.lora_name}"
             names.add(lora.lora_name)
+
+    def prepare_optimizer_params(self, text_encoder_lr, unet_lr):
+        groups = super().prepare_optimizer_params(text_encoder_lr, unet_lr)
+        cfg = self.network_config
+        if cfg is not None and (cfg.lora_plus_ratio != 1 or cfg.lora_plus_text_encoder_ratio != 1):
+            from training_extras.optim import lora_plus_groups
+            groups = lora_plus_groups(groups, self, unet_lr or text_encoder_lr,
+                                      cfg.lora_plus_ratio, cfg.lora_plus_text_encoder_ratio)
+        return groups

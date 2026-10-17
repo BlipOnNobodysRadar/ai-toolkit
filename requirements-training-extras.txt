@@ -1,0 +1,4 @@
+# Install into the existing Toolkit environment. Do not replace its CUDA/Torch build.
+pytorch-optimizer==3.10.1
+# Plotting only; already present in this installation.
+matplotlib>=3.8

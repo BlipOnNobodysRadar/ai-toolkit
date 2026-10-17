@@ -239,6 +239,10 @@ def import_comfy_quantized_layers(
 
         weight = state_dict.pop(f"{prefix}.weight")
         weight_scale = state_dict.pop(f"{prefix}.weight_scale", None)
+        # Older ConvRot exporters omitted the format field. Infer only the
+        # unambiguous signed-int8 + explicit ConvRot case.
+        if fmt is None and conf.get("convrot") and weight.dtype == torch.int8:
+            fmt = "int8_tensorwise"
 
         if isinstance(module, torch.nn.Embedding):
             if fmt != "int8_tensorwise":

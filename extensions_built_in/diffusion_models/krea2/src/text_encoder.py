@@ -122,7 +122,7 @@ def encode_krea_prompt(
             [tt, torch.zeros_like(suffix_ids, dtype=tt.dtype)], dim=1
         )
 
-    states = qwen(
+    states = qwen.model(
         input_ids=input_ids,
         attention_mask=mask,
         output_hidden_states=True,

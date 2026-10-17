@@ -8,6 +8,9 @@ def get_lr_scheduler(
         optimizer: torch.optim.Optimizer,
         **kwargs,
 ):
+    if name and (name.lower().startswith('easy:') or '.' in name):
+        from training_extras.optim import create_scheduler
+        return create_scheduler(optimizer, name, kwargs.pop('total_iters', kwargs.pop('total_steps', 1000)), kwargs)
     if name == "cosine":
         if 'total_iters' in kwargs:
             kwargs['T_max'] = kwargs.pop('total_iters')

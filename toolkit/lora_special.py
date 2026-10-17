@@ -119,7 +119,20 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
         # same as microsoft's
         torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
         if not self.full_rank:
-            torch.nn.init.zeros_(self.lora_up.weight)
+            self.use_scalar = bool(kwargs.get('use_scalar', False))
+            if self.use_scalar:
+                # Nonzero factors with an explicit scalar initializer. Keep zero
+                # as the historical default; the installed 67372a LyCORIS fork
+                # uses 0.1. Preserve the raw scalar for training/resume and fold
+                # it into the up factor only in inference exports.
+                scalar_init_value = float(kwargs.get('scalar_init_value', 0.0))
+                if not math.isfinite(scalar_init_value):
+                    raise ValueError('scalar_init_value must be finite')
+                self.scalar = torch.nn.Parameter(torch.tensor(scalar_init_value, dtype=torch.float32))
+                self._cpu_master_parameter_names = ('scalar',)
+                torch.nn.init.kaiming_uniform_(self.lora_up.weight, a=math.sqrt(5))
+            else:
+                torch.nn.init.zeros_(self.lora_up.weight)
 
         self.multiplier: Union[float, List[float]] = multiplier
         # wrap the original module so it doesn't get weights updated
@@ -170,6 +183,7 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
         torch.nn.Module.__init__(self)
         self.lora_name = lora_name
         # keep the original module out of our state_dict (list hides it from nn.Module registration)
+        self.parameter_name = kwargs.get('parameter_name', 'weight')
         self.org_module = [org_module]
         self.orig_module_ref = weakref.ref(org_module)
         self.multiplier: Union[float, List[float]] = multiplier
@@ -181,12 +195,13 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
 
         # trainable delta, zero initialized so an untrained layer is a no-op (zero diff)
         # dequantize first so the delta is full precision and shaped like the real (unpacked) weight
-        org_weight = org_module.weight  # single access: dequantizes on OstrisLinear
+        org_weight = getattr(org_module, self.parameter_name)  # single access: dequantizes on OstrisLinear
         self.weight_is_quantized = _is_quantized_tensor(org_weight)
         ref_weight = _dequantize_if_needed(org_weight)
         self.diff = torch.nn.Parameter(torch.zeros_like(ref_weight))
+        self._cpu_master_parameter_names = ('diff', 'diff_b')
         # some modules (e.g. Embedding) have no bias attribute at all
-        org_bias = getattr(org_module, 'bias', None)
+        org_bias = getattr(org_module, 'bias', None) if self.parameter_name == 'weight' else None
         if org_bias is not None:
             self.diff_b = torch.nn.Parameter(torch.zeros_like(org_bias))
         else:
@@ -207,7 +222,7 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
         # weight space application can't be done per sample, so use the mean (same as the DoRA path)
         mult = multiplier.mean() if isinstance(multiplier, torch.Tensor) else multiplier
 
-        orig_weight = om._parameters['weight']
+        orig_weight = om._parameters[self.parameter_name]
         # dequantize quantized weights to full precision so the delta can be added (the original
         # quantized tensor is restored in the finally block below)
         base_weight = _dequantize_if_needed(orig_weight)
@@ -220,13 +235,13 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
 
         # temporarily swap in the effective weights so the original forward (norm/linear/etc) uses them.
         # this keeps autograd flowing into our delta while supporting any layer type.
-        om._parameters['weight'] = eff_weight
+        om._parameters[self.parameter_name] = eff_weight
         if has_bias:
             om._parameters['bias'] = eff_bias
         try:
             out = self.org_forward(x, *args, **kwargs)
         finally:
-            om._parameters['weight'] = orig_weight
+            om._parameters[self.parameter_name] = orig_weight
             if has_bias:
                 om._parameters['bias'] = orig_bias
         return out
@@ -250,7 +265,7 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
             if 'weight._data' in om.state_dict():
                 # quanto quantized weight, can't merge
                 return
-            org_weight = om.weight
+            org_weight = getattr(om, self.parameter_name)
             orig_dtype = org_weight.dtype
             base_weight = _dequantize_if_needed(org_weight).float()
             weight_device = org_weight.device
@@ -261,7 +276,7 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
             from toolkit.util.quantize import get_torchao_config, requantize_module_weight
             requantize_module_weight(om, merged_weight, orig_dtype, get_torchao_config(self._get_base_qtype()))
         else:
-            om.weight.data = merged_weight.to(weight_device, orig_dtype)
+            getattr(om, self.parameter_name).data = merged_weight.to(weight_device, orig_dtype)
         # bias is never quantized
         if self.diff_b is not None and getattr(om, 'bias', None) is not None:
             om.bias.data = (om.bias.data.float() + merge_weight * self.diff_b.float().to(om.bias.device)).to(om.bias.dtype)
@@ -425,7 +440,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             if self.network_type.lower() != "lokr" or not self.use_old_lokr_format:
                 self.peft_format = True
 
-        if self.peft_format:
+        if self.peft_format and not getattr(self.network_config, 'respect_alpha', False):
             # no alpha for peft
             self.alpha = self.lora_dim
             alpha = self.alpha
@@ -507,9 +522,16 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                         # - full_if_contains: any matching layer, INCLUDING linear/conv, overriding the
                         #   normal lora for it
                         all_layers = self.network_config is not None and getattr(self.network_config, 'all_layers', False)
+                        full_parameter_name = 'weight'
+                        if kwargs.get('full_named_parameters', False) and not (is_linear or is_conv2d) and not isinstance(getattr(child_module, 'weight', None), torch.nn.Parameter):
+                            # Krea2's affine norms and modulation offsets use scale/lin.
+                            full_parameter_name = next((key for key in ('scale', 'lin')
+                                if isinstance(child_module._parameters.get(key), torch.nn.Parameter)), 'weight')
                         is_leaf_with_weight = (
-                            len(list(child_module.children())) == 0
-                            and isinstance(getattr(child_module, 'weight', None), torch.nn.Parameter)
+                            (all_layers or len(self.full_if_contains) > 0)
+                            and (not (is_linear or is_conv2d) or any(word in clean_name for word in self.full_if_contains))
+                            and len(list(child_module.children())) == 0
+                            and isinstance(getattr(child_module, full_parameter_name, None), torch.nn.Parameter)
                         )
                         matches_full_if_contains = len(self.full_if_contains) > 0 and (
                             any([word in clean_name for word in self.full_if_contains])
@@ -597,6 +619,8 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                                 continue
                             
                             module_kwargs = {}
+                            module_kwargs['use_scalar'] = bool(kwargs.get('use_scalar', False))
+                            module_kwargs['scalar_init_value'] = float(kwargs.get('scalar_init_value', 0.0))
                             
                             if self.network_type.lower() == "lokr":
                                 module_kwargs["factor"] = self.network_config.lokr_factor
@@ -635,12 +659,15 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
                                 if not any([word in clean_name for word in self.only_if_contains]) and not any([word in lora_name for word in self.only_if_contains]):
                                     continue
 
+                            if full_parameter_name != 'weight':
+                                lora_name += ('$$' if self.peft_format else '_') + full_parameter_name
                             lora = FullModule(
                                 lora_name,
                                 child_module,
                                 self.multiplier,
                                 network=self,
                                 parent=module,
+                                parameter_name=full_parameter_name,
                             )
                             loras.append(lora)
                             lora_shape_dict[lora_name] = [list(lora.diff.shape)]
@@ -762,6 +789,11 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
     def prepare_optimizer_params(self, text_encoder_lr, unet_lr, default_lr):
         # call Lora prepare_optimizer_params
         all_params = super().prepare_optimizer_params(text_encoder_lr, unet_lr, default_lr)
+        cfg = self.network_config
+        if cfg is not None and (cfg.lora_plus_ratio != 1 or cfg.lora_plus_text_encoder_ratio != 1):
+            from training_extras.optim import lora_plus_groups
+            all_params = lora_plus_groups(all_params, self, default_lr, cfg.lora_plus_ratio,
+                                         cfg.lora_plus_text_encoder_ratio)
 
         if self.full_train_in_out:
             base_model = self.base_model_ref() if self.base_model_ref is not None else None
