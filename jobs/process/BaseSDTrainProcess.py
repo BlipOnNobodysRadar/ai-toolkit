@@ -521,6 +521,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
             step_num = f"_{str(step).zfill(9)}"
 
         self.update_training_metadata()
+        # In-loop saves happen after the update but before step_num increments.
+        # New RAWR checkpoints must resume at the next update, not replay one.
+        from training_extras import rawr_checkpoint
+        checkpoint_step = rawr_checkpoint.completed_step(
+            self.step_num, getattr(self, '_checkpoint_completed_step', None),
+            getattr(self, '_rawr_checkpoint_config', None))
+        if checkpoint_step != self.step_num:
+            self.meta['training_info']['step'] = checkpoint_step
         filename = f'{self.job.name}{step_num}.safetensors'
         file_path = os.path.join(self.save_root, filename)
 
@@ -708,9 +716,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     state_dict = unwrap_model(self.optimizer).state_dict()
                 except Exception as e:
                     state_dict = self.optimizer.state_dict()
+                from training_extras import rawr_checkpoint
+                state_dict = rawr_checkpoint.add_state(
+                    state_dict, self.lr_scheduler,
+                    getattr(self, '_rawr_checkpoint_config', None), checkpoint_step)
                 torch.save(state_dict, file_path)
                 print_acc(f"Saved optimizer to {file_path}")
             except Exception as e:
+                if getattr(self, '_rawr_checkpoint_config', None) is not None:
+                    raise RuntimeError('Could not save RAWR optimizer/scheduler checkpoint') from e
                 print_acc(e)
                 print_acc("Could not save optimizer")
 
@@ -2211,9 +2225,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # only works for adafactor, but it should have thrown an error prior to this otherwise
             self.optimizer.enable_paramiter_swapping(self.train_config.paramiter_swapping_factor)
 
+        from training_extras import rawr_checkpoint
+        rawr_resume_enabled = rawr_checkpoint.is_rawr_name(self.train_config.lr_scheduler)
+        self._rawr_checkpoint_config = (rawr_checkpoint.configuration(
+            optimizer, self.train_config.steps, self.train_config.lr_scheduler_params)
+            if rawr_resume_enabled else None)
+        rawr_resume = None
+        self._rawr_scheduler_restored = False
+
         # check if it exists
         optimizer_state_filename = f'optimizer.pt'
         optimizer_state_file_path = os.path.join(self.save_root, optimizer_state_filename)
+        if rawr_resume_enabled and self.step_num > 0 and not os.path.exists(optimizer_state_file_path):
+            raise RuntimeError('RAWR resume requires the optimizer.pt paired with the selected model; start a new run for weights-only training')
         if os.path.exists(optimizer_state_file_path):
             # try to load
             # previous param groups
@@ -2234,9 +2258,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     print_acc(f"Loading optimizer state from {optimizer_state_file_path}")
                     optimizer_state_dict = torch.load(optimizer_state_file_path, weights_only=True)
                     optimizer.load_state_dict(optimizer_state_dict)
+                    if rawr_resume_enabled:
+                        rawr_resume = rawr_checkpoint.capture(optimizer_state_dict)
                     del optimizer_state_dict
                     flush()
                 except Exception as e:
+                    if rawr_resume_enabled:
+                        raise RuntimeError('Could not load RAWR optimizer/scheduler checkpoint; refusing a partial resume') from e
                     print_acc(f"Failed to load optimizer state from {optimizer_state_file_path}")
                     print_acc(e)
 
@@ -2265,6 +2293,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
             **lr_scheduler_params
         )
         self.lr_scheduler = lr_scheduler
+        # Construction advances RAWR's retained cycle fields. Restore them and
+        # scheduler state together; non-RAWR schedulers retain their old path.
+        self._rawr_scheduler_restored = rawr_checkpoint.restore(
+            lr_scheduler, rawr_resume, self._rawr_checkpoint_config, self.step_num)
 
         # cache validation latents and embeddings now, the vae and text encoder
         # may be dumped before the train loop starts
@@ -2555,7 +2587,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # zero any gradients
         optimizer.zero_grad()
 
-        self.lr_scheduler.step(self.step_num)
+        if not self._rawr_scheduler_restored:
+            self.lr_scheduler.step(self.step_num)
 
         self.sd.set_device_state(self.train_device_state_preset)
         flush()
@@ -2578,6 +2611,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
 
         start_step_num = self.step_num
+        self._checkpoint_completed_step = self.step_num
         did_first_flush = False
         flush_next = False
         for step in range(start_step_num, self.train_config.steps):
@@ -2673,6 +2707,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             try:
                 with self.accelerator.accumulate(self.modules_being_trained):
                     loss_dict = self.hook_train_loop(batch_list)
+                self._checkpoint_completed_step = step + 1
             except torch.cuda.OutOfMemoryError:
                 did_oom = True
             except RuntimeError as e:
