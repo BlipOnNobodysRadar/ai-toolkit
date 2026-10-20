@@ -3,8 +3,8 @@
 For training configuration, tuning, optimizer/scheduler, and trainer changes,
 obtain a second opinion from the latest DeepSeek Flash through the installed
 DeepSeek Harness. Verify the exact model ID against the live provider catalog.
-Use bounded, narrow reviews and independently verify the result. Truncated or
-empty responses do not count as reviews.
+Use focused reviews with recommended Harness settings and independently verify
+the result. Truncated or empty responses do not count as reviews.
 
 The installed SDK is `C:/Users/someb/AI/envs/dsh`. A source-review caller and
 evidence are under `C:/Users/someb/AI/training/rawr-resume-review-20261019`.
@@ -12,7 +12,7 @@ Use its OpenRouter pi-ai route for OpenRouter credentials; the direct DeepSeek
 adapter speaks a different reasoning-parameter dialect. Keep credentials out
 of prompts and evidence. Preserve existing harnesses and other agents' work.
 
-Prefer deterministic tools and bounded inexpensive-model work for mechanical
+Prefer deterministic tools and inexpensive-model work for mechanical
 edits and test generation. Do not spawn Codex subagents. Keep coordinator and
 worker usage separate, report provider cost when available, and identify
 missing cost telemetry rather than presenting an estimate as a bill.
@@ -41,3 +41,13 @@ I want to be able to see what happened without being buried in it.
 - Don't slow down or restructure work for this. Background processes are
   fine. The requirement is that they leave a trail I can open later, not
   that I watch them live.
+
+## Delegated model defaults
+
+Prioritize useful second opinions over saving a few cents. Use the recommended
+DeepSeek Harness settings by default, with reasoning enabled and its documented
+output allowance. If a reasoning response truncates, allow the recommended
+larger output budget rather than disabling reasoning to obtain a quick reply.
+Consult me before adding arbitrary message/iteration limits, low output caps,
+custom time/call/spend limits, or other unasked-for gates. Reasonable task scope,
+permissions, credential protection, and preserving running work still apply.
