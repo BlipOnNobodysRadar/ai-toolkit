@@ -5,6 +5,7 @@ import warnings
 import pytest
 import torch
 from accelerate import Accelerator
+from accelerate.state import AcceleratorState
 from torch.optim import AdamW
 
 from training_extras import rawr_checkpoint
@@ -31,7 +32,11 @@ def _scheduler_params(d, mult):
 def _cpu_only(monkeypatch):
     monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda *a, **kw: None, raising=False)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    # other test files import toolkit modules that build the global accelerator
+    # first; Accelerator(cpu=True) refuses an already-initialized state
+    AcceleratorState._reset_state(reset_partial_state=True)
     yield
+    AcceleratorState._reset_state(reset_partial_state=True)
 
 
 def _new_params():
