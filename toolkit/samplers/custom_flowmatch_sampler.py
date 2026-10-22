@@ -133,13 +133,15 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
                 top = torch.special.ndtr(torch.tensor((math.log(cutoff / (1 - cutoff)) - logit_mean) / logit_std))
                 u = torch.rand((num_timesteps,), device=device).clamp_min(1e-7)
                 z = torch.special.ndtri(u * top.to(device))
-            sigmas = torch.sigmoid(logit_mean + logit_std * z) / cutoff
+            sigmas = (torch.sigmoid(logit_mean + logit_std * z) / cutoff).clamp(max=1.0)
             if uniform_mix > 0:
                 uniform = torch.rand((num_timesteps,), device=device)
                 sigmas = torch.where(torch.rand((num_timesteps,), device=device) < uniform_mix, uniform, sigmas)
-            timesteps, _ = torch.sort(sigmas * 1000, descending=True)
-            self.timesteps = timesteps
-            return timesteps
+            sigmas, _ = torch.sort(sigmas, descending=True)
+            self.timesteps = sigmas * 1000
+            # get_sigmas() looks these up by timestep (loss_target source / unaugmented)
+            self.sigmas = torch.cat([sigmas, torch.zeros(1, device=device)])
+            return self.timesteps
         elif timestep_type == 'sigmoid':
             # distribute them closer to center. Inference distributes them as a bias toward first
             # Generate values from 0 to 1

@@ -127,6 +127,49 @@ def test_logit_normal_cutoff_matches_tech_report_sampler():
     assert abs(ref_median - 0.78) < 0.01
 
 
+def test_logit_normal_get_sigmas_matches_timesteps():
+    # loss_target source / unaugmented read sigmas through get_sigmas(), keyed by timestep
+    torch.manual_seed(5)
+    sched = _scheduler()
+    t = sched.set_train_timesteps(1000, "cpu", timestep_type="logit_normal", logit_mean=1.09, logit_std=0.95,
+                                  cutoff=0.95, uniform_mix=0.01)
+    picked = t[torch.tensor([0, 1, 500, 999])]
+    sigma = sched.get_sigmas(picked, n_dim=1, dtype=torch.float32, device="cpu")
+    assert torch.allclose(sigma, picked / 1000)
+    assert t.max() <= 1000
+
+
+def test_scheduler_overrides_accept_logit_normal_options():
+    from extensions_built_in.diffusion_models.ming_image.ming_image import (
+        MingImageFlowMatchScheduler, scheduler_config as ming_config)
+    kwargs = TrainConfig(timestep_type="logit_normal", logit_normal_mean=1.09).flow_timestep_kwargs("logit_normal")
+    t = MingImageFlowMatchScheduler(**ming_config).set_train_timesteps(
+        200, "cpu", timestep_type="logit_normal", latents=torch.zeros(1, 16, 64, 64), patch_size=2, **kwargs)
+    assert t.shape == (200,) and abs((t / 1000).median().item() - 0.748) < 0.06
+
+
+def test_every_typed_set_train_timesteps_call_forwards_the_options():
+    """Calls that pick a timestep_type must pass that type's options along."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1]
+    checked = 0
+    for rel in ("jobs/process/BaseSDTrainProcess.py", "jobs/process/TrainSliderProcess.py", "toolkit/guidance.py"):
+        src = (root / rel).read_text(encoding="utf-8")
+        start = src.find("set_train_timesteps(")
+        while start != -1:
+            depth, end = 0, start + len("set_train_timesteps")
+            for end in range(end, len(src)):
+                depth += {"(": 1, ")": -1}.get(src[end], 0)
+                if depth == 0:
+                    break
+            call = src[start:end]
+            if "timestep_type=" in call:
+                assert "flow_timestep_kwargs(timestep_type)" in call, f"{rel}: {call[:80]}"
+                checked += 1
+            start = src.find("set_train_timesteps(", end)
+    assert checked == 3
+
+
 def test_logit_normal_defaults_equal_sigmoid_distribution():
     torch.manual_seed(1)
     sched = _scheduler()
