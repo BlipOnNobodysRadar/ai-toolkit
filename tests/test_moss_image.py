@@ -166,20 +166,20 @@ from toolkit.lora_special import LoRASpecialNetwork
 TINY = MossImageParams(dim=64, ffn_dim=128, num_heads=2, num_layers=24, text_dim=32, freq_dim=16, latent_channels=8)
 
 
-def _network(network_type="lora", transformer_only=False, **network_kwargs):
-    """The trainer's construction (BaseSDTrainProcess) on a tiny MOSS DiT; LoRA keys convert like MossImageModel."""
+def _network(network_type="lora", network_kwargs=None, **config):
+    """BaseSDTrainProcess's construction on a tiny MOSS DiT (network arguments come from the NetworkConfig,
+    whose transformer_only defaults to True); LoRA keys convert like MossImageModel."""
     torch.manual_seed(0)
     transformer = MossImageTransformer(TINY)
     model = MossImageModel.__new__(MossImageModel)  # only its LoRA key conversions are used
     model.lora_keys_use_comfy_prefix = True
     model.use_old_lokr_format = False
-    network_kwargs.setdefault("ignore_if_contains", ["layers.22."])
-    config = NetworkConfig(type=network_type, linear=4, linear_alpha=4, transformer_only=transformer_only,
-                           network_kwargs=network_kwargs)
+    network_kwargs = {"ignore_if_contains": ["layers.22."], **(network_kwargs or {})}
+    config = NetworkConfig(type=network_type, linear=4, linear_alpha=4, network_kwargs=network_kwargs, **config)
     network = LoRASpecialNetwork(
-        text_encoder=None, unet=transformer, lora_dim=4, alpha=4, multiplier=1.0, train_unet=True,
-        train_text_encoder=False, network_config=config, network_type=network_type,
-        transformer_only=transformer_only, is_transformer=True, base_model=model,
+        text_encoder=None, unet=transformer, lora_dim=config.linear, alpha=config.linear_alpha, multiplier=1.0,
+        train_unet=True, train_text_encoder=False, network_config=config, network_type=config.type,
+        transformer_only=config.transformer_only, is_transformer=True, base_model=model,
         target_lin_modules=["MossImageTransformer"],
         **network_kwargs,
     )
@@ -205,38 +205,38 @@ def _roundtrip(network, tmp_path, factory):
     return saved
 
 
-def test_default_keys_skip_block_22_and_unfuse_qkv(tmp_path):
+def test_default_targets_blocks_skip_22_and_unfuse_qkv(tmp_path):
     saved = _roundtrip(_network(), tmp_path, _network)
-    assert saved and all(k.startswith("diffusion_model.") for k in saved)
+    assert saved and all(k.startswith("diffusion_model.layers.") for k in saved)
     assert not any(".layers.22." in k for k in saved)
+    # q k v o up_gate down per block: kohya's 252 MOSS targets less block 22
+    assert len({k.rsplit(".", 2)[0] for k in saved}) == 6 * (TINY.num_layers - 1)
     # q/k/v saved as ComfyUI's separate projections, sharing the down factor
     assert not any(".proj.qkv." in k for k in saved)
     for n in range(TINY.num_layers):
         if n != 22:
             q, k = (f"diffusion_model.layers.{n}.proj.{p}.lora_A.weight" for p in "qk")
             assert torch.equal(saved[q], saved[k])
-    # also targeted by default: shared modulation, embedders, head, text refiner
+
+
+def test_all_modules_adds_modulation_embedders_head_refiner(tmp_path):
+    make = lambda: _network(transformer_only=False)
+    saved = _roundtrip(make(), tmp_path, make)
     for name in ("shared_block_modulation", "time_embedding", "video_embedder", "final_linear_video",
                  "text_embedder.blocks.0.ffn_down"):
         assert any(f"diffusion_model.{name}." in k for k in saved), name
 
 
 def test_ffn_down_only_targets_one_linear_per_block(tmp_path):
-    make = lambda: _network(only_if_contains=["proj.ffn_down"])
+    make = lambda: _network(network_kwargs={"only_if_contains": ["proj.ffn_down"]})
     saved = _roundtrip(make(), tmp_path, make)
     modules = {k.rsplit(".", 2)[0] for k in saved}
     assert modules == {f"diffusion_model.layers.{n}.proj.ffn_down" for n in range(TINY.num_layers) if n != 22}
 
 
-def test_transformer_only_keeps_the_blocks(tmp_path):
-    make = lambda: _network(transformer_only=True)
-    saved = _roundtrip(make(), tmp_path, make)
-    assert all(k.startswith("diffusion_model.layers.") for k in saved)
-    assert len({k.rsplit(".", 2)[0] for k in saved}) == 6 * (TINY.num_layers - 1)  # q k v o up_gate down
-
-
-def test_lokr_keeps_qkv_fused(tmp_path):
-    make = lambda: _network(network_type="lokr")
+def test_full_rank_lokr_keeps_qkv_fused(tmp_path):
+    make = lambda: _network(network_type="lokr", lokr_factor=4)
     saved = _roundtrip(make(), tmp_path, make)
     assert any(k.endswith(".proj.qkv.lokr_w1") for k in saved)
+    assert not any(k.endswith("lokr_w2_a") for k in saved), "lokr_full_rank (default) stores w2 whole"
     assert not any(".layers.22." in k for k in saved)
