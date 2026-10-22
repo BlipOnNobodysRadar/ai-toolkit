@@ -115,6 +115,7 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         logit_mean=0.0,
         logit_std=1.0,
         uniform_mix=0.0,
+        cutoff=1.0,
     ):
         self.timestep_type = timestep_type
         if timestep_type == 'linear' or timestep_type == 'weighted':
@@ -123,8 +124,16 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             return timesteps
         elif timestep_type == 'logit_normal':
             # sigma = sigmoid(N(logit_mean, logit_std)) on the unshifted grid, a uniform_mix share drawn
-            # uniformly instead. MOSS-Image pre-training: mean 1.09, std 0.95, 1% uniform (median sigma ~0.75)
-            sigmas = torch.sigmoid(logit_mean + logit_std * torch.randn((num_timesteps,), device=device))
+            # uniformly instead. cutoff < 1 truncates the logit-normal at sigma = cutoff and stretches it
+            # back over (0, 1). MOSS-Image pre-training (tech report A.2): mean 1.09, std 0.95, cutoff 0.95,
+            # 1% uniform, median sigma ~0.78
+            z = torch.randn((num_timesteps,), device=device)
+            if cutoff < 1.0:
+                # inverse-CDF draw from the normal truncated at logit(cutoff)
+                top = torch.special.ndtr(torch.tensor((math.log(cutoff / (1 - cutoff)) - logit_mean) / logit_std))
+                u = torch.rand((num_timesteps,), device=device).clamp_min(1e-7)
+                z = torch.special.ndtri(u * top.to(device))
+            sigmas = torch.sigmoid(logit_mean + logit_std * z) / cutoff
             if uniform_mix > 0:
                 uniform = torch.rand((num_timesteps,), device=device)
                 sigmas = torch.where(torch.rand((num_timesteps,), device=device) < uniform_mix, uniform, sigmas)

@@ -90,11 +90,13 @@ def test_logit_normal_config_defaults_and_kwargs():
     assert cfg.flow_timestep_kwargs("shift") == {}
     cfg = TrainConfig(timestep_type="logit_normal", logit_normal_mean=1.09, logit_normal_std=0.95,
                       logit_normal_uniform=0.01)
-    assert cfg.flow_timestep_kwargs(cfg.timestep_type) == {"logit_mean": 1.09, "logit_std": 0.95, "uniform_mix": 0.01}
+    assert cfg.flow_timestep_kwargs(cfg.timestep_type) == {
+        "logit_mean": 1.09, "logit_std": 0.95, "uniform_mix": 0.01, "cutoff": 1.0}
 
 
 @pytest.mark.parametrize("bad", [{"logit_normal_std": 0}, {"logit_normal_std": -1},
-                                 {"logit_normal_uniform": 1.5}, {"logit_normal_mean": float("nan")}])
+                                 {"logit_normal_uniform": 1.5}, {"logit_normal_mean": float("nan")},
+                                 {"logit_normal_cutoff": 0}, {"logit_normal_cutoff": 1.2}])
 def test_logit_normal_config_rejects_bad_values(bad):
     with pytest.raises(ValueError):
         TrainConfig(timestep_type="logit_normal", **bad)
@@ -108,6 +110,21 @@ def test_logit_normal_matches_moss_pretraining_median():
     assert 0 < sigma.min() and sigma.max() < 1
     # median of sigmoid(N(1.09, .95)) is sigmoid(1.09) = 0.748; shift 5 uniform would be 0.833
     assert abs(sigma.median().item() - 1 / (1 + math.exp(-1.09))) < 0.01
+
+
+def test_logit_normal_cutoff_matches_tech_report_sampler():
+    """Truncated at 0.95 and stretched: the SimpleTuner / KohakuMoss MOSS sampler (median sigma ~0.78)."""
+    torch.manual_seed(4)
+    sigma = _scheduler().set_train_timesteps(
+        40000, "cpu", timestep_type="logit_normal", logit_mean=1.09, logit_std=0.95, cutoff=0.95) / 1000
+    assert 0 <= sigma.min() and sigma.max() <= 1
+    # reference: SimpleTuner's binned CDF over [0, 0.95] mapped onto the 1000-step grid
+    edges = torch.linspace(0, 0.95, 1001, dtype=torch.float64)
+    cdf = torch.special.ndtr((torch.logit(edges) - 1.09) / 0.95)
+    cdf = cdf / cdf[-1]
+    ref_median = (torch.searchsorted(cdf, torch.tensor(0.5, dtype=torch.float64)).item()) / 1000
+    assert abs(sigma.median().item() - ref_median) < 0.01
+    assert abs(ref_median - 0.78) < 0.01
 
 
 def test_logit_normal_defaults_equal_sigmoid_distribution():

@@ -582,15 +582,19 @@ class TrainConfig:
         self.target_norm_std = kwargs.get('target_norm_std', None)
         self.target_norm_std_value = kwargs.get('target_norm_std_value', 1.0)
         self.timestep_type = kwargs.get('timestep_type', 'sigmoid')  # sigmoid, linear, lognorm_blend, next_sample, weighted, one_step, logit_normal
-        # timestep_type 'logit_normal' (flowmatch): sigma = sigmoid(N(mean, std)), a `uniform` share drawn uniformly.
-        # MOSS-Image pre-training used mean 1.09, std 0.95, uniform 0.01 on the unshifted grid
+        # timestep_type 'logit_normal' (flowmatch): sigma = sigmoid(N(mean, std)), a `uniform` share drawn uniformly;
+        # cutoff < 1 truncates at sigma = cutoff and stretches back over (0, 1). MOSS-Image pre-training used
+        # mean 1.09, std 0.95, cutoff 0.95, uniform 0.01 on the unshifted grid
         self.logit_normal_mean = float(kwargs.get('logit_normal_mean', 0.0))
         self.logit_normal_std = float(kwargs.get('logit_normal_std', 1.0))
         self.logit_normal_uniform = float(kwargs.get('logit_normal_uniform', 0.0))
+        self.logit_normal_cutoff = float(kwargs.get('logit_normal_cutoff', 1.0))
         if not (math.isfinite(self.logit_normal_mean) and math.isfinite(self.logit_normal_std)) or self.logit_normal_std <= 0:
             raise ValueError('logit_normal_mean must be finite and logit_normal_std positive')
         if not 0 <= self.logit_normal_uniform <= 1:
             raise ValueError('logit_normal_uniform must be between 0 and 1')
+        if not 0 < self.logit_normal_cutoff <= 1:
+            raise ValueError('logit_normal_cutoff must be in (0, 1]')
 
         self.first_timestep_chance = kwargs.get('first_timestep_chance', 0.0)
         
@@ -670,6 +674,7 @@ class TrainConfig:
             'logit_mean': self.logit_normal_mean,
             'logit_std': self.logit_normal_std,
             'uniform_mix': self.logit_normal_uniform,
+            'cutoff': self.logit_normal_cutoff,
         }
 
 
