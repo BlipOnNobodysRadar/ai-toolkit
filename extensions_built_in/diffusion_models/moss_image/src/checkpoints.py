@@ -11,8 +11,8 @@ Comfy-Org/MOSS-Image repack (DiT: the vendor's keys with q/k/v fused).
   ``diffusion_models/moss_image_sft_bf16.safetensors`` in the Comfy layout.
   Other hub repos (fine-tunes) merge into a file named after the repo, never
   substituted.
-- ``Comfy-Org/MOSS-Image``: the repack's SFT DiT (int8 convrot only; a local
-  merged bf16 SFT also counts).
+- ``Comfy-Org/MOSS-Image``: the repack's SFT DiT (int8 convrot download; a
+  local bf16 SFT, merged or from the repack, also counts).
 - ``org/repo/path/file.safetensors``: that file, downloaded to its comfy spot.
 
 The vendor text_encoder/ is stock Qwen3.5-9B (A_log / gated norm stored in
@@ -51,18 +51,23 @@ VENDOR_TRANSFORMER_INDEX = "transformer/diffusion_pytorch_model.safetensors.inde
 COMFY_VAE_FILE = "vae/flux2-vae.safetensors"
 
 # variant -> (files in the repack, extra local-only candidates). The merged
-# vendor SFT is the bf16 SFT the repack does not ship.
+# vendor SFT is the bf16 SFT the repack does not ship. The repack dropped the
+# "_attn" suffix of its int8 files on 2026-10-22; the old names stay local-only
+# candidates so earlier downloads keep loading.
 COMFY_TRANSFORMER_FILES = {
     "sft": (
-        ["diffusion_models/moss_image_sft_int8_convrot_attn.safetensors"],
-        ["diffusion_models/moss_image_sft_bf16.safetensors"],
+        ["diffusion_models/moss_image_sft_int8_convrot.safetensors"],
+        [
+            "diffusion_models/moss_image_sft_int8_convrot_attn.safetensors",
+            "diffusion_models/moss_image_sft_bf16.safetensors",
+        ],
     ),
     "base": (
         [
-            "diffusion_models/moss_image_base_int8_convrot_attn.safetensors",
+            "diffusion_models/moss_image_base_int8_convrot.safetensors",
             "diffusion_models/moss_image_base_bf16.safetensors",
         ],
-        [],
+        ["diffusion_models/moss_image_base_int8_convrot_attn.safetensors"],
     ),
 }
 REPO_VARIANT = {SFT_REPO: "sft", BASE_REPO: "base", COMFY_REPO: "sft"}
