@@ -1232,6 +1232,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         timestep_type=timestep_type,
                         latents=latents,
                         patch_size=patch_size,
+                        **self.train_config.flow_timestep_kwargs(timestep_type),
                     )
                 else:
                     self.sd.noise_scheduler.set_timesteps(

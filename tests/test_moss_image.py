@@ -1,4 +1,5 @@
-"""MOSS-Image checks that need no weights: checkpoint naming."""
+"""MOSS-Image checks that need no weights: checkpoint naming, LoRA targeting and
+key layout on a tiny transformer."""
 
 import os
 
@@ -67,3 +68,158 @@ def test_repack_listing_names():
         assert set(repo_files) <= listed
     assert set(checkpoints.VENDOR_MIRROR.values()) <= listed
     assert checkpoints.COMFY_TEXT_ENCODER_FILES[0][1] in listed
+
+
+# ---- timestep_type 'logit_normal' (MOSS-Image pre-training distribution) ----
+
+import math
+
+import torch
+
+from toolkit.config_modules import TrainConfig
+from toolkit.samplers.custom_flowmatch_sampler import CustomFlowMatchEulerDiscreteScheduler
+
+
+def _scheduler():
+    return CustomFlowMatchEulerDiscreteScheduler(shift=5.0, num_train_timesteps=1000, use_dynamic_shifting=False)
+
+
+def test_logit_normal_config_defaults_and_kwargs():
+    cfg = TrainConfig()
+    assert cfg.flow_timestep_kwargs("sigmoid") == {}
+    assert cfg.flow_timestep_kwargs("shift") == {}
+    cfg = TrainConfig(timestep_type="logit_normal", logit_normal_mean=1.09, logit_normal_std=0.95,
+                      logit_normal_uniform=0.01)
+    assert cfg.flow_timestep_kwargs(cfg.timestep_type) == {"logit_mean": 1.09, "logit_std": 0.95, "uniform_mix": 0.01}
+
+
+@pytest.mark.parametrize("bad", [{"logit_normal_std": 0}, {"logit_normal_std": -1},
+                                 {"logit_normal_uniform": 1.5}, {"logit_normal_mean": float("nan")}])
+def test_logit_normal_config_rejects_bad_values(bad):
+    with pytest.raises(ValueError):
+        TrainConfig(timestep_type="logit_normal", **bad)
+
+
+def test_logit_normal_matches_moss_pretraining_median():
+    torch.manual_seed(0)
+    t = _scheduler().set_train_timesteps(20000, "cpu", timestep_type="logit_normal", logit_mean=1.09, logit_std=0.95)
+    sigma = t / 1000
+    assert torch.all(t[:-1] >= t[1:]), "sorted descending like the other types"
+    assert 0 < sigma.min() and sigma.max() < 1
+    # median of sigmoid(N(1.09, .95)) is sigmoid(1.09) = 0.748; shift 5 uniform would be 0.833
+    assert abs(sigma.median().item() - 1 / (1 + math.exp(-1.09))) < 0.01
+
+
+def test_logit_normal_defaults_equal_sigmoid_distribution():
+    torch.manual_seed(1)
+    sched = _scheduler()
+    a = sched.set_train_timesteps(20000, "cpu", timestep_type="logit_normal")
+    b = sched.set_train_timesteps(20000, "cpu", timestep_type="sigmoid")
+    for q in (0.1, 0.5, 0.9):
+        assert abs(torch.quantile(a, q) - torch.quantile(b, q)).item() < 15
+
+
+def test_logit_normal_uniform_mix():
+    torch.manual_seed(2)
+    sched = _scheduler()
+    full = sched.set_train_timesteps(20000, "cpu", timestep_type="logit_normal", logit_mean=4.0, uniform_mix=1.0)
+    assert abs(full.mean().item() / 1000 - 0.5) < 0.02  # all uniform
+    some = sched.set_train_timesteps(20000, "cpu", timestep_type="logit_normal", logit_mean=4.0, uniform_mix=0.2)
+    low = (some < 500).float().mean().item()  # N(4,1) puts ~0 mass below sigma 0.5; uniform puts half
+    assert 0.08 < low < 0.12
+
+
+def test_logit_normal_timesteps_drive_add_noise():
+    torch.manual_seed(3)
+    sched = _scheduler()
+    t = sched.set_train_timesteps(1000, "cpu", timestep_type="logit_normal", logit_mean=1.09, logit_std=0.95)
+    x, noise = torch.zeros(4, 2, 2, 2), torch.ones(4, 2, 2, 2)
+    picked = t[torch.tensor([0, 250, 500, 999])]
+    noisy = sched.add_noise(x, noise, picked.view(-1, 1, 1, 1))
+    assert torch.allclose(noisy[:, 0, 0, 0], picked / 1000)
+
+
+# ---- LoRA targeting and key layout on a tiny MOSS transformer ----
+
+from extensions_built_in.diffusion_models.moss_image.moss_image import MossImageModel
+from extensions_built_in.diffusion_models.moss_image.src.transformer import MossImageParams, MossImageTransformer
+from toolkit.config_modules import NetworkConfig
+from toolkit.lora_special import LoRASpecialNetwork
+
+TINY = MossImageParams(dim=64, ffn_dim=128, num_heads=2, num_layers=24, text_dim=32, freq_dim=16, latent_channels=8)
+
+
+def _network(network_type="lora", transformer_only=False, **network_kwargs):
+    """The trainer's construction (BaseSDTrainProcess) on a tiny MOSS DiT; LoRA keys convert like MossImageModel."""
+    torch.manual_seed(0)
+    transformer = MossImageTransformer(TINY)
+    model = MossImageModel.__new__(MossImageModel)  # only its LoRA key conversions are used
+    model.lora_keys_use_comfy_prefix = True
+    model.use_old_lokr_format = False
+    network_kwargs.setdefault("ignore_if_contains", ["layers.22."])
+    config = NetworkConfig(type=network_type, linear=4, linear_alpha=4, transformer_only=transformer_only,
+                           network_kwargs=network_kwargs)
+    network = LoRASpecialNetwork(
+        text_encoder=None, unet=transformer, lora_dim=4, alpha=4, multiplier=1.0, train_unet=True,
+        train_text_encoder=False, network_config=config, network_type=network_type,
+        transformer_only=transformer_only, is_transformer=True, base_model=model,
+        target_lin_modules=["MossImageTransformer"],
+        **network_kwargs,
+    )
+    network.model_ref = model  # the network holds the model by weakref only
+    network.apply_to(None, transformer, False, True)
+    network.to("cpu", dtype=torch.float32)
+    with torch.no_grad():  # "trained": non-zero up factors
+        for name, p in network.named_parameters():
+            if "lora_up" in name or "lokr_w1" in name:
+                p.normal_(0, 0.02)
+    return network
+
+
+def _roundtrip(network, tmp_path, factory):
+    path = str(tmp_path / "lora.safetensors")
+    network.save_weights(path, dtype=torch.float32)
+    saved = network.get_state_dict(dtype=torch.float32)
+    fresh = factory()
+    fresh.load_weights(path)
+    again = fresh.get_state_dict(dtype=torch.float32)
+    assert sorted(again) == sorted(saved)
+    assert all(torch.equal(again[k], saved[k]) for k in saved)
+    return saved
+
+
+def test_default_keys_skip_block_22_and_unfuse_qkv(tmp_path):
+    saved = _roundtrip(_network(), tmp_path, _network)
+    assert saved and all(k.startswith("diffusion_model.") for k in saved)
+    assert not any(".layers.22." in k for k in saved)
+    # q/k/v saved as ComfyUI's separate projections, sharing the down factor
+    assert not any(".proj.qkv." in k for k in saved)
+    for n in range(TINY.num_layers):
+        if n != 22:
+            q, k = (f"diffusion_model.layers.{n}.proj.{p}.lora_A.weight" for p in "qk")
+            assert torch.equal(saved[q], saved[k])
+    # also targeted by default: shared modulation, embedders, head, text refiner
+    for name in ("shared_block_modulation", "time_embedding", "video_embedder", "final_linear_video",
+                 "text_embedder.blocks.0.ffn_down"):
+        assert any(f"diffusion_model.{name}." in k for k in saved), name
+
+
+def test_ffn_down_only_targets_one_linear_per_block(tmp_path):
+    make = lambda: _network(only_if_contains=["proj.ffn_down"])
+    saved = _roundtrip(make(), tmp_path, make)
+    modules = {k.rsplit(".", 2)[0] for k in saved}
+    assert modules == {f"diffusion_model.layers.{n}.proj.ffn_down" for n in range(TINY.num_layers) if n != 22}
+
+
+def test_transformer_only_keeps_the_blocks(tmp_path):
+    make = lambda: _network(transformer_only=True)
+    saved = _roundtrip(make(), tmp_path, make)
+    assert all(k.startswith("diffusion_model.layers.") for k in saved)
+    assert len({k.rsplit(".", 2)[0] for k in saved}) == 6 * (TINY.num_layers - 1)  # q k v o up_gate down
+
+
+def test_lokr_keeps_qkv_fused(tmp_path):
+    make = lambda: _network(network_type="lokr")
+    saved = _roundtrip(make(), tmp_path, make)
+    assert any(k.endswith(".proj.qkv.lokr_w1") for k in saved)
+    assert not any(".layers.22." in k for k in saved)

@@ -111,11 +111,24 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         device,
         timestep_type='linear',
         latents=None,
-        patch_size=1
+        patch_size=1,
+        logit_mean=0.0,
+        logit_std=1.0,
+        uniform_mix=0.0,
     ):
         self.timestep_type = timestep_type
         if timestep_type == 'linear' or timestep_type == 'weighted':
             timesteps = torch.linspace(1000, 1, num_timesteps, device=device)
+            self.timesteps = timesteps
+            return timesteps
+        elif timestep_type == 'logit_normal':
+            # sigma = sigmoid(N(logit_mean, logit_std)) on the unshifted grid, a uniform_mix share drawn
+            # uniformly instead. MOSS-Image pre-training: mean 1.09, std 0.95, 1% uniform (median sigma ~0.75)
+            sigmas = torch.sigmoid(logit_mean + logit_std * torch.randn((num_timesteps,), device=device))
+            if uniform_mix > 0:
+                uniform = torch.rand((num_timesteps,), device=device)
+                sigmas = torch.where(torch.rand((num_timesteps,), device=device) < uniform_mix, uniform, sigmas)
+            timesteps, _ = torch.sort(sigmas * 1000, descending=True)
             self.timesteps = timesteps
             return timesteps
         elif timestep_type == 'sigmoid':

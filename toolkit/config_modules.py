@@ -581,8 +581,17 @@ class TrainConfig:
         # adds an additional loss to the network to encourage it output a normalized standard deviation
         self.target_norm_std = kwargs.get('target_norm_std', None)
         self.target_norm_std_value = kwargs.get('target_norm_std_value', 1.0)
-        self.timestep_type = kwargs.get('timestep_type', 'sigmoid')  # sigmoid, linear, lognorm_blend, next_sample, weighted, one_step
-        
+        self.timestep_type = kwargs.get('timestep_type', 'sigmoid')  # sigmoid, linear, lognorm_blend, next_sample, weighted, one_step, logit_normal
+        # timestep_type 'logit_normal' (flowmatch): sigma = sigmoid(N(mean, std)), a `uniform` share drawn uniformly.
+        # MOSS-Image pre-training used mean 1.09, std 0.95, uniform 0.01 on the unshifted grid
+        self.logit_normal_mean = float(kwargs.get('logit_normal_mean', 0.0))
+        self.logit_normal_std = float(kwargs.get('logit_normal_std', 1.0))
+        self.logit_normal_uniform = float(kwargs.get('logit_normal_uniform', 0.0))
+        if not (math.isfinite(self.logit_normal_mean) and math.isfinite(self.logit_normal_std)) or self.logit_normal_std <= 0:
+            raise ValueError('logit_normal_mean must be finite and logit_normal_std positive')
+        if not 0 <= self.logit_normal_uniform <= 1:
+            raise ValueError('logit_normal_uniform must be between 0 and 1')
+
         self.first_timestep_chance = kwargs.get('first_timestep_chance', 0.0)
         
         self.next_sample_timesteps = kwargs.get('next_sample_timesteps', 8)
@@ -653,8 +662,18 @@ class TrainConfig:
         if validation is not None:
             self.validation_config: ValidationConfig = ValidationConfig(**validation)
 
+    def flow_timestep_kwargs(self, timestep_type) -> dict:
+        """Extra set_train_timesteps arguments for the flowmatch timestep type in use."""
+        if timestep_type != 'logit_normal':
+            return {}
+        return {
+            'logit_mean': self.logit_normal_mean,
+            'logit_std': self.logit_normal_std,
+            'uniform_mix': self.logit_normal_uniform,
+        }
 
-ModelArch = Literal['sd1', 'sd2', 'sd3', 'sdxl', 'pixart', 'pixart_sigma', 'auraflow', 'flux', 'flex1', 'flex2', 'lumina2', 'vega', 'ssd', 'wan21', 'anima']
+
+ModelArch =Literal['sd1', 'sd2', 'sd3', 'sdxl', 'pixart', 'pixart_sigma', 'auraflow', 'flux', 'flex1', 'flex2', 'lumina2', 'vega', 'ssd', 'wan21', 'anima']
 
 
 class ModelConfig:
