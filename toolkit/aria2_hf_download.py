@@ -10,6 +10,10 @@ Environment variables:
         Disable this patch and use Hugging Face's native downloader.
     AITK_ARIA2_BIN=/path/to/aria2c
         Override aria2c executable discovery.
+    AITK_ARIA2_AUTO_INSTALL=0
+        Don't install aria2 when it is missing. By default Windows (x64) gets the
+        official aria2 build, pinned by SHA-256, in %LOCALAPPDATA%\\ai-toolkit, and
+        Linux running as root (e.g. Docker) gets it from apt-get.
     AITK_ARIA2_CONNECTIONS=16
         Number of split connections (1-16, default 16).
     AITK_ARIA2_LOG_INTERVAL=5
@@ -18,14 +22,29 @@ Environment variables:
 
 from __future__ import annotations
 
+import hashlib
 import os
+import platform
 import shutil
 import subprocess
+import sys
 import tempfile
+import urllib.request
+import zipfile
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping, Optional
 
 _ORIGINAL_HTTP_GET = None
+
+# Official Windows build from github.com/aria2/aria2 (release-1.37.0). The SHA-256
+# is the one winget's aria2.aria2 1.37.0 manifest records for the same URL.
+_WIN_ARIA2_VERSION = "1.37.0"
+_WIN_ARIA2_URL = (
+    "https://github.com/aria2/aria2/releases/download/release-1.37.0/"
+    "aria2-1.37.0-win-64bit-build1.zip"
+)
+_WIN_ARIA2_SHA256 = "67d015301eef0b612191212d564c5bb0a14b5b9c4796b76454276a4d28d9b288"
+_WIN_ARIA2_MEMBER = "aria2-1.37.0-win-64bit-build1/aria2c.exe"
 
 
 def _human_bytes(value: int) -> str:
@@ -48,16 +67,84 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
 
 
+def _windows_aria2_dir() -> Path:
+    """Per user, shared by every toolkit checkout."""
+    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+    return Path(base) / "ai-toolkit" / f"aria2-{_WIN_ARIA2_VERSION}"
+
+
+def _install_aria2_windows() -> str:
+    target_dir = _windows_aria2_dir()
+    exe = target_dir / "aria2c.exe"
+    if exe.is_file():
+        return str(exe)
+    print(
+        f"[ai-toolkit/aria2] aria2c not found; installing the official aria2 "
+        f"{_WIN_ARIA2_VERSION} build into {target_dir}",
+        flush=True,
+    )
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    # staged on the same volume, so the final move is atomic
+    with tempfile.TemporaryDirectory(prefix="aria2-install-", dir=target_dir.parent) as tmp:
+        archive = Path(tmp) / "aria2.zip"
+        with urllib.request.urlopen(_WIN_ARIA2_URL, timeout=60) as response, open(archive, "wb") as out:
+            shutil.copyfileobj(response, out)
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        if digest != _WIN_ARIA2_SHA256:
+            raise RuntimeError(
+                f"the aria2 download failed verification (sha256 {digest}, expected {_WIN_ARIA2_SHA256})"
+            )
+        staged = Path(tmp) / "aria2c.exe"
+        with zipfile.ZipFile(archive) as zf, zf.open(_WIN_ARIA2_MEMBER) as src, open(staged, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        target_dir.mkdir(exist_ok=True)
+        try:
+            os.replace(staged, exe)
+        except OSError:
+            if not exe.is_file():  # otherwise a concurrent install won the race
+                raise
+    print(f"[ai-toolkit/aria2] Installed {exe}", flush=True)
+    return str(exe)
+
+
+def _install_aria2_apt() -> Optional[str]:
+    """Linux as root (the Docker image): apt-get, non-interactive."""
+    if getattr(os, "geteuid", lambda: -1)() != 0 or shutil.which("apt-get") is None:
+        return None
+    print("[ai-toolkit/aria2] aria2c not found; installing it with apt-get", flush=True)
+    env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
+    subprocess.run(["apt-get", "update"], check=True, env=env)
+    subprocess.run(["apt-get", "install", "-y", "--no-install-recommends", "aria2"], check=True, env=env)
+    return shutil.which("aria2c")
+
+
+def _install_aria2() -> Optional[str]:
+    if os.name == "nt" and platform.machine().lower() in ("amd64", "x86_64"):
+        return _install_aria2_windows()
+    if sys.platform.startswith("linux"):
+        return _install_aria2_apt()
+    return None
+
+
 def _aria2_binary() -> str:
     configured = os.environ.get("AITK_ARIA2_BIN")
     binary = configured or shutil.which("aria2c")
     if binary:
         return binary
+    if os.environ.get("AITK_ARIA2_AUTO_INSTALL", "1").strip().lower() not in ("0", "false", "no", "off"):
+        try:
+            binary = _install_aria2()
+        except Exception as exc:
+            print(f"[ai-toolkit/aria2] Automatic aria2 install failed: {exc}", flush=True)
+            binary = None
+        if binary:
+            return binary
     raise RuntimeError(
         "AI Toolkit is configured to use aria2 for Hugging Face model downloads, "
-        "but aria2c was not found. Install aria2 (on Debian/Ubuntu: "
-        "`sudo apt install aria2`), set AITK_ARIA2_BIN=/path/to/aria2c, or set "
-        "AITK_HF_DOWNLOADER=hf to temporarily use Hugging Face's native downloader."
+        "but aria2c was not found and could not be installed automatically. Install "
+        "aria2 (on Debian/Ubuntu: `sudo apt install aria2`), set "
+        "AITK_ARIA2_BIN=/path/to/aria2c, or set AITK_HF_DOWNLOADER=hf to temporarily "
+        "use Hugging Face's native downloader."
     )
 
 
@@ -83,9 +170,11 @@ def _safe_header_lines(headers: Optional[Mapping[str, Any]]) -> list[str]:
     return [f"  header={key}: {value}" for key, value in clean.items()]
 
 
-def _write_aria2_input(url: str, headers: Optional[Mapping[str, Any]]) -> str:
+def _write_aria2_input(url: str, headers: Optional[Mapping[str, Any]], target: Path) -> str:
     if "\n" in url or "\r" in url:
         raise RuntimeError("Refusing to pass a malformed download URL to aria2")
+    if any(c in str(target) for c in "\r\n"):
+        raise RuntimeError("Refusing to pass a malformed download path to aria2")
 
     fd, path = tempfile.mkstemp(prefix="aitk-aria2-", suffix=".txt")
     try:
@@ -93,6 +182,11 @@ def _write_aria2_input(url: str, headers: Optional[Mapping[str, Any]]) -> str:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(url)
             handle.write("\n")
+            # per-item options: aria2 ignores the command-line --dir/--out for
+            # input-file items and would name the file from Content-Disposition
+            # (e.g. config.json) instead of Hugging Face's .incomplete path
+            handle.write(f"  dir={target.parent}\n")
+            handle.write(f"  out={target.name}\n")
             for line in _safe_header_lines(headers):
                 handle.write(line)
                 handle.write("\n")
@@ -191,7 +285,7 @@ def aria2_http_get(
     else:
         print(f"[ai-toolkit/aria2] Downloading {label}", flush=True)
 
-    input_file = _write_aria2_input(url, headers)
+    input_file = _write_aria2_input(url, headers, target)
     command = [
         binary,
         "--continue=true",
