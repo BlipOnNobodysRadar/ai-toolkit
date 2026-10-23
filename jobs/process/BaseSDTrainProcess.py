@@ -2217,8 +2217,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # esure params require grad
         self.ensure_params_requires_grad(force=True)
 
+        # run-length warmups (SimplifiedAdEMAMixExM beta1_warmup) default to the optimizer-step count
+        from training_extras.optim import apply_run_length_defaults
+        gas = self.train_config.gradient_accumulation_steps
+        optimizer_steps = self.train_config.steps // gas if gas and gas > 0 else None
+        optimizer_params = apply_run_length_defaults(optimizer_type, self.train_config.optimizer_params, optimizer_steps)
         optimizer = get_optimizer(self.params, optimizer_type, learning_rate=self.train_config.lr,
-                                  optimizer_params=self.train_config.optimizer_params)
+                                  optimizer_params=optimizer_params)
         self.optimizer = optimizer
         
         # set it to do paramiter swapping

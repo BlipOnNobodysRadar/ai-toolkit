@@ -199,6 +199,34 @@ def create_optimizer(params, name, lr, kwargs=None):
     return klass(groups, lr=lr, **extra)
 
 
+# Warmups meant to span the whole run, keyed by normalised optimizer class name. SimplifiedAdEMAMixExM ramps beta1 from
+# min_beta1 to betas[0] over beta1_warmup steps; its docstring recommends the run's step count, and a shorter ramp
+# (e.g. 200 copied from a 200-step SDXL config into a 1200-step run) reaches full momentum far too early.
+RUN_LENGTH_WARMUPS = {"simplifiedademamixexm": "beta1_warmup", "ademamixexm": "beta1_warmup"}
+
+
+def _optimizer_key(name):
+    tail = str(name).split(":")[-1].split(".")[-1]
+    return tail.lower().replace("_", "")
+
+
+def apply_run_length_defaults(optimizer_type, optimizer_params, optimizer_steps):
+    """Return optimizer_params with run-length warmups set to the run's optimizer-step count when absent or null, and
+    print a warning when one is set to a different value. Explicit values are always kept."""
+    params = dict(optimizer_params or {})
+    arg = RUN_LENGTH_WARMUPS.get(_optimizer_key(optimizer_type))
+    if arg is None or not optimizer_steps:
+        return params
+    steps = int(optimizer_steps)
+    if params.get(arg) is None:
+        params[arg] = steps
+        print(f"{optimizer_type}: {arg} not set, using the run's {steps} optimizer steps")
+    elif int(params[arg]) != steps:
+        print(f"WARNING: {optimizer_type} {arg}={params[arg]} but this run has {steps} optimizer steps. "
+              f"The warmup is meant to span the whole run: set {arg}: {steps}, or remove it to use the step count.")
+    return params
+
+
 def _step_count(total_steps):
     steps = int(total_steps)
     if steps <= 0:

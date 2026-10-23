@@ -343,14 +343,15 @@ def main():
 
     vocab = llm.get_output_embeddings().weight.shape[0]
 
-    from training_extras.optim import create_optimizer, create_scheduler, evaluation_optimizer
+    from training_extras.optim import apply_run_length_defaults, create_optimizer, create_scheduler, evaluation_optimizer
 
     if ratio != 1:
         groups=[{"params":[p for n,p in trainables if ".lora_B." not in n],"lr":a.lr},
                 {"params":[p for n,p in trainables if ".lora_B." in n],"lr":a.lr*ratio}]
     else:groups=[p for _,p in trainables]
-    opt=create_optimizer(groups,options["optimizer"]["name"],a.lr,options["optimizer"].get("args",{}))
     horizon=resume_state["schedule_steps"] if resume_state else a.steps
+    opt_args=apply_run_length_defaults(options["optimizer"]["name"],options["optimizer"].get("args",{}),horizon)
+    opt=create_optimizer(groups,options["optimizer"]["name"],a.lr,opt_args)
     sched=create_scheduler(opt,options["scheduler"]["name"],horizon,options["scheduler"].get("args",{}))
     sched._extras_horizon=horizon
     start_step=0

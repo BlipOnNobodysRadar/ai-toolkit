@@ -332,3 +332,38 @@ def test_locon_optimizer_routes_lora_plus(monkeypatch):
     assert {g['lr'] for g in groups}=={.01,.04}
     up_ids={id(p) for k,p in n.named_parameters() if 'lora_up.' in k}
     assert up_ids and all(g['lr']==.04 for g in groups for p in g['params'] if id(p) in up_ids)
+
+
+@pytest.mark.parametrize("name", ["easy:SimplifiedAdEMAMixExM", "easy:simplifiedademamixexm", "simplified_ademamix_exm",
+                                  "LoraEasyCustomOptimizer.ademamix.SimplifiedAdEMAMixExM"])
+def test_saem_beta1_warmup_defaults_to_step_count(name, capsys):
+    from training_extras.optim import apply_run_length_defaults
+    given = {"betas": [0.99, 0.997]}
+    out = apply_run_length_defaults(name, given, 1200)
+    assert out["beta1_warmup"] == 1200 and "beta1_warmup" not in given  # caller's dict untouched
+    assert apply_run_length_defaults(name, {"beta1_warmup": None}, 1200)["beta1_warmup"] == 1200
+    assert "WARNING" not in capsys.readouterr().out
+
+
+def test_saem_beta1_warmup_explicit_kept_and_mismatch_warns(capsys):
+    from training_extras.optim import apply_run_length_defaults
+    assert apply_run_length_defaults("easy:SimplifiedAdEMAMixExM", {"beta1_warmup": 1200}, 1200)["beta1_warmup"] == 1200
+    assert "WARNING" not in capsys.readouterr().out
+    assert apply_run_length_defaults("easy:SimplifiedAdEMAMixExM", {"beta1_warmup": 200}, 1200)["beta1_warmup"] == 200
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_run_length_defaults_leave_other_optimizers_alone(capsys):
+    from training_extras.optim import apply_run_length_defaults
+    assert apply_run_length_defaults("adamw8bit", {"weight_decay": 0.01}, 1200) == {"weight_decay": 0.01}
+    assert apply_run_length_defaults("easy:WarpAINO", None, 1200) == {}
+    assert apply_run_length_defaults("easy:SimplifiedAdEMAMixExM", {}, None) == {}  # unknown run length: no guess
+    assert capsys.readouterr().out == ""
+
+
+def test_profiles_usual_mapped_warmup_matches_steps():
+    from training_extras.profiles import generate
+    doc = {"config": {"name": "t", "process": [{"network": {"type": "lora", "linear": 4, "linear_alpha": 4},
+                                                 "datasets": [{"folder_path": "x"}], "train": {"steps": 750}}]}}
+    usual = dict(generate(doc))["usual_mapped"]["config"]["process"][0]["train"]["optimizer_params"]
+    assert usual["beta1_warmup"] == 750

@@ -228,6 +228,8 @@ MiniCPM wrapper: `C:/Users/someb/AI/video-captioning/training/train_lora_extras.
 
 The 16 diffusion presets isolate baseline, WarpAINO, compiled WarpAINO, REX d=.45, alpha at rank/4, LoRA+, EDM2, log-cosh, scheduled Huber, wavelet, token mining, mapped usual recipe, anchor, high frequency, focal frequency, and topology. The original TOML is an SDXL reference; `usual_mapped` preserves the destination model LR/rank and maps only the applicable optimizer/scheduler/weighting controls. IP noise, multiresolution noise, and SDXL parameter targeting are not blindly transplanted into the DiTs or language model.
 
+SimplifiedAdEMAMixExM's `beta1_warmup` is meant to equal the run's optimizer-step count. Both trainers (ai-toolkit jobs and `minicpm_trainer`) now fill it with that count when it is absent or null, and print a WARNING when a set value differs; `profiles.py` writes it per run. On resume the optimizer state restores the value saved at the start.
+
 Current Toolkit adapter implementation is used; the screenshot's experimental LyCORIS branch has not replaced the installed library. New branch-specific bypass/DoRA kernels require separate compatibility work. This port does not claim to reproduce every SDXL-only frontend option on every architecture. Existing Toolkit model-native controls remain available.
 
 ## Provenance and acceptance

@@ -5,7 +5,7 @@ import yaml
 
 WARP = dict(compile_step=False,weight_decay=.1,relative_wd=True,aino_mix_alpha=.05,
             meta_lr=0,came_confidence=True,betas=[.95,.95,.99],came_beta=.999)
-USUAL = dict(alpha=1,beta1_warmup=200,betas=[.99,.997],min_beta1=.95,
+USUAL = dict(alpha=1,betas=[.99,.997],min_beta1=.95,  # beta1_warmup is set per run to the step count below
              amsgrad_max_decay_rate=.96,amsgrad_min_decay_rate=.96,
              use_adabelief=True,torch_compile=False,update_strategy='cautious')
 
@@ -31,7 +31,7 @@ def generate(document, steps=None):
         'huber':{'training_extras':{'loss':'standard_pseudo_huber','delta':.01,'delta_schedule':'exponential'}},
         'wavelet':{'training_extras':{'wavelet':{'enabled':True}}},
         'token_mining':{'training_extras':{'token_mining':{'enabled':True}}},
-        'usual_mapped':{'optimizer':'easy:SimplifiedAdEMAMixExM','optimizer_params':USUAL,
+        'usual_mapped':{'optimizer':'easy:SimplifiedAdEMAMixExM','optimizer_params':dict(USUAL,beta1_warmup=count),
              'lr_scheduler':'easy:RAWR','lr_scheduler_params':dict(rex,d=.9),'training_extras':{'edm2':edm}}}
     for name in ('anchor','hf','frequency','topology'):recipes[name]={'training_extras':{name:{'scale':.01}}}
     for name,patch in recipes.items():
