@@ -1,5 +1,7 @@
 """RAWR-only checkpoint continuation helpers; no trainer or model imports."""
 import copy
+import os
+import tempfile
 import warnings
 
 KEY = '_aitk_rawr_checkpoint'
@@ -61,17 +63,19 @@ def capture(optimizer_state):
             'payload': copy.deepcopy(optimizer_state.get(KEY))}
 
 
-def add_state(optimizer_state, scheduler, config, trainer_step):
+def add_state(optimizer_state, scheduler, config, trainer_step, training_state=None):
     scheduler = underlying_scheduler(scheduler)
     if not is_rawr(scheduler):
         if config is not None:
             raise TypeError('Configured RAWR has an unsupported scheduler wrapper; refusing to omit checkpoint metadata')
         return optimizer_state
     result = dict(optimizer_state)
-    result[KEY] = {'version': 1, 'config': copy.deepcopy(config),
+    result[KEY] = {'version': 2 if training_state is not None else 1, 'config': copy.deepcopy(config),
                    'trainer_step': int(trainer_step),
                    'scheduler': copy.deepcopy(scheduler.state_dict()),
                    'groups': capture(optimizer_state)['groups']}
+    if training_state is not None:
+        result[KEY]['training_state'] = training_state
     return result
 
 
@@ -97,8 +101,10 @@ def restore(scheduler, captured, config, trainer_step):
             raise ValueError('Invalid RAWR checkpoint cycle position')
     payload = captured['payload']
     if payload is not None:
-        if payload.get('version') != 1:
+        if payload.get('version') not in (1, 2):
             raise ValueError('Unsupported RAWR checkpoint version')
+        if payload['version'] == 2 and not isinstance(payload.get('training_state'), dict):
+            raise ValueError('Missing RAWR training checkpoint state')
         if payload.get('config') != config:
             raise ValueError('RAWR resume configuration changed; use the saved configuration or start a new run')
         if payload.get('trainer_step') != int(trainer_step):
@@ -135,3 +141,82 @@ def restore(scheduler, captured, config, trainer_step):
         target.update(copy.deepcopy(saved))
     scheduler.validate_optimizer()
     return True
+
+
+def training_state(trainer, checkpoint_step):
+    """Serialize unfinished microbatches, with the counter for the NEXT loop.
+
+    Periodic saves precede the host's counter increment. UI/end-step/final
+    saves follow it. Completed loop metadata disambiguates those phases.
+    RNG, dataset iterators, and auxiliary optimizers are not captured here.
+    """
+    return {
+        'gradient_accumulation_steps': trainer.train_config.gradient_accumulation_steps,
+        'gradient_accumulation': trainer.train_config.gradient_accumulation,
+        'next_accumulation_step': trainer.grad_accumulation_step + int(checkpoint_step > trainer.step_num),
+        'gradients': [[None if p.grad is None else p.grad.detach().cpu().clone()
+                       for p in g['params']] for g in trainer.optimizer.param_groups],
+    }
+
+
+def restore_training_state(optimizer, captured, config, trainer_step):
+    """Restore after startup zero_grad/Accelerate preparation, before training.
+
+    Old files have no partial gradients. Version-1 completed-loop labels can
+    certify a fixed accumulation boundary; legacy labels cannot certify one.
+    """
+    import torch
+    if captured is None:
+        return 1
+    payload = captured['payload']
+    state = payload.get('training_state') if payload is not None else None
+    gas = config.gradient_accumulation_steps
+    if gas == -1 and trainer_step > 0:
+        raise ValueError('RAWR whole-epoch accumulation resume requires dataset position, which is not saved')
+    if state is None:
+        if gas > 1 and trainer_step > 0:
+            if payload is None or int(trainer_step) % gas:
+                raise ValueError('RAWR checkpoint has no partial gradients; resume from a known optimizer boundary')
+        return 1
+    if (state.get('gradient_accumulation_steps') != gas or
+            state.get('gradient_accumulation') != config.gradient_accumulation):
+        raise ValueError('RAWR gradient accumulation configuration changed')
+    counter = state.get('next_accumulation_step')
+    if type(counter) is not int or not (1 <= counter <= max(1, gas)):
+        raise ValueError('Invalid RAWR accumulation position')
+    gradients = state.get('gradients')
+    groups = optimizer.param_groups
+    if not isinstance(gradients, list) or len(gradients) != len(groups):
+        raise ValueError('Invalid RAWR gradient groups')
+    # Validate everything before changing any gradients.
+    for group, saved in zip(groups, gradients):
+        if not isinstance(saved, list) or len(saved) != len(group['params']):
+            raise ValueError('Invalid RAWR gradient parameter count')
+        for p, grad in zip(group['params'], saved):
+            if grad is not None and (not torch.is_tensor(grad) or grad.shape != p.shape or grad.dtype != p.dtype):
+                raise ValueError('Invalid RAWR gradient shape or dtype')
+    for group, saved in zip(groups, gradients):
+        for p, grad in zip(group['params'], saved):
+            p.grad = None if grad is None else grad.to(device=p.device).clone()
+    return counter
+
+
+def atomic_save(optimizer_state, path):
+    """Replace a complete optimizer file, preserving the previous one on error.
+
+    This is a single-file transaction, not an atomic model/optimizer pair.
+    """
+    import torch
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='wb', prefix='.optimizer.', suffix='.tmp',
+                                         dir=os.path.dirname(os.path.abspath(path)), delete=False) as f:
+            tmp_path = f.name
+            torch.save(optimizer_state, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            os.unlink(tmp_path)

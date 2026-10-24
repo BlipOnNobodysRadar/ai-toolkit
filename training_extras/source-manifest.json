@@ -9,7 +9,8 @@
     "AST extraction of token-mining and wavelet helpers",
     "Explicit host timestep units for EDM2 (no max-value inference)",
     "Pure Torch Haar DWT preserving band/channel axes; avoids obsolete pkg_resources",
-    "Finite PSNR objective at perfect prediction (MSE floor 1e-12)"
+    "Finite PSNR objective at perfect prediction (MSE floor 1e-12)",
+    "SimplifiedAdEMAMixExM: CPU fallback and checkpoint tensor precision/storage preservation"
   ],
   "sha256": {
     "__init__.py": "5ea4623f2be1978118c840ac8313e99fb8e945aa146d187af94975fc15c381f9",
@@ -24,7 +25,7 @@
     "LoraEasyCustomOptimizer/adammini.py": "dcd9a46bd3e68b273f880fd11a3c4cc64193fb5c0be91dd17f1bfe3a603b2632",
     "LoraEasyCustomOptimizer/adamw_schedulefree_plus.py": "15385e6dc8e93289ea4823cbe601c1d5768efc6557bd2089226ca48294589955",
     "LoraEasyCustomOptimizer/adan.py": "f6d412da1de0a491759653de9bbdef01f3db082a197a6da7d227de1d2436a953",
-    "LoraEasyCustomOptimizer/ademamix.py": "cdb2054cfc9ce01a93c96b0b69ed3c8102d07b6c4a6fddd97c16d4531be8d816",
+    "LoraEasyCustomOptimizer/ademamix.py": "67f715498f9c93b7cc1472449837d84f24f5afa17086c0fcae669472bf55f479",
     "LoraEasyCustomOptimizer/adopt.py": "2a642ae82f8b2dae5504ec68c05f72462c6467894eb87bf5e598dccd407ed769",
     "LoraEasyCustomOptimizer/ainoopt.py": "c7b5b8cb3052333b41bafe5469334a1943a5543b5bfcf6097e9556c1f08e8fa7",
     "LoraEasyCustomOptimizer/alice.py": "e4992477f2a3e6ac38a2874265e861a5a7be7b27f044c753192773aa6bf5f85b",

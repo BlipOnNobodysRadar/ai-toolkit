@@ -723,8 +723,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 from training_extras import rawr_checkpoint
                 state_dict = rawr_checkpoint.add_state(
                     state_dict, self.lr_scheduler,
-                    getattr(self, '_rawr_checkpoint_config', None), checkpoint_step)
-                torch.save(state_dict, file_path)
+                    getattr(self, '_rawr_checkpoint_config', None), checkpoint_step,
+                    training_state=(rawr_checkpoint.training_state(self, checkpoint_step)
+                                    if getattr(self, '_rawr_checkpoint_config', None) is not None else None))
+                if getattr(self, '_rawr_checkpoint_config', None) is not None:
+                    rawr_checkpoint.atomic_save(state_dict, file_path)
+                else:
+                    torch.save(state_dict, file_path)
                 print_acc(f"Saved optimizer to {file_path}")
             except Exception as e:
                 if getattr(self, '_rawr_checkpoint_config', None) is not None:
@@ -2291,7 +2296,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if load_optimizer:
                 try:
                     print_acc(f"Loading optimizer state from {optimizer_state_file_path}")
-                    optimizer_state_dict = torch.load(optimizer_state_file_path, weights_only=True)
+                    optimizer_state_dict = torch.load(optimizer_state_file_path, weights_only=True,
+                                                     map_location='cpu' if rawr_resume_enabled else None)
                     optimizer.load_state_dict(optimizer_state_dict)
                     if rawr_resume_enabled:
                         rawr_resume = rawr_checkpoint.capture(optimizer_state_dict)
@@ -2667,6 +2673,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # zero any gradients
         optimizer.zero_grad()
 
+        if self._rawr_scheduler_restored:
+            self.grad_accumulation_step = rawr_checkpoint.restore_training_state(
+                self.optimizer, rawr_resume, self.train_config, self.step_num)
+            rawr_resume = None  # release the saved CPU gradient copies
+
         if not self._rawr_scheduler_restored:
             self.lr_scheduler.step(self.step_num)
 
@@ -2887,8 +2898,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         print_acc(f"\nSaving at step {self.step_num}")
                         self.save(self.step_num)
                         self.ensure_params_requires_grad()
-                        # clear any grads
-                        optimizer.zero_grad()
+                        # RAWR checkpoints retain unfinished microbatches. Saving
+                        # must not discard them from the uninterrupted run either.
+                        if self._rawr_checkpoint_config is None:
+                            optimizer.zero_grad()
                         flush()
                         flush_next = True
                         if self.progress_bar is not None:

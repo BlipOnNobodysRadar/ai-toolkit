@@ -1264,6 +1264,24 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
 
     def __str__(self) -> str:
         return 'SimplifiedAdEMAMixExM'
+
+    def load_state_dict(self, state_dict):
+        # Optimizer.load_state_dict casts floating state to each parameter's
+        # dtype/device. Restore directly from the source tensors: casting back
+        # after a BF16 parameter cast cannot recover lost FP32 precision.
+        super().load_state_dict(state_dict)
+        for group, saved_group in zip(self.param_groups, state_dict['param_groups']):
+            for p, saved_id in zip(group['params'], saved_group['params']):
+                for name, value in state_dict['state'].get(saved_id, {}).items():
+                    if not isinstance(value, torch.Tensor):
+                        continue
+                    moment = name in ('exp_avg', 'exp_avg_sq')
+                    device = self.state_storage_device if moment else self.state[p][name].device
+                    dtype = self.state_storage_dtype if moment else value.dtype
+                    restored = value.detach().to(device=device, dtype=dtype).clone()
+                    if moment and str(device) == 'cpu' and torch.cuda.is_available():
+                        restored = restored.pin_memory()
+                    self.state[p][name] = restored
     
     def init_group(self, group, **kwargs) -> None:
         pass
@@ -1294,7 +1312,9 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        cuda_available = torch.cuda.is_available()
         for group in self.param_groups:
+            compute_cuda_devices = set()
             if 'step' in group:
                 group['step'] += 1
             else:
@@ -1344,7 +1364,7 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
                 state = self.state[p]
 
                 if len(state) == 0:
-                    if self.state_storage_device == "cpu":
+                    if self.state_storage_device == "cpu" and cuda_available:
                         state["exp_avg"] = torch.zeros_like(
                             p.data, dtype=self.state_storage_dtype, device=self.state_storage_device
                         ).pin_memory()
@@ -1360,13 +1380,14 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
                         )
 
                 # ========= Asynchronously queue all operations for this parameter =========
-                # Determine target GPU device for computation
-                if device.type == "cpu":
-                    # If param is on CPU, use default GPU for computation
-                    compute_device = torch.cuda.current_device()
+                # Retain CUDA offload when available; CPU-only runs must never
+                # initialize CUDA just because their parameters live on CPU.
+                if device.type == "cpu" and cuda_available:
+                    compute_device = torch.device("cuda", torch.cuda.current_device())
                 else:
-                    # If param is on GPU, use its device
                     compute_device = device
+                if compute_device.type == "cuda":
+                    compute_cuda_devices.add(compute_device)
 
                 # 1. Queue Host-to-Device copy
                 exp_avg = state["exp_avg"].to(
@@ -1502,12 +1523,13 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
                 # ========= Check if we need to synchronize =========
                 # We synchronize after processing a chunk of parameters.
                 # The (i + 1) ensures we sync after the 1st, 2nd, ... chunk.
-                if (i + 1) % self.sync_chunk_size == 0:
-                    torch.cuda.synchronize()
+                if compute_device.type == "cuda" and (i + 1) % self.sync_chunk_size == 0:
+                    torch.cuda.synchronize(compute_device)
 
             # Final synchronization to handle the last partial chunk
             # This ensures all operations for the group are complete before exiting.
-            torch.cuda.synchronize()
+            for compute_device in compute_cuda_devices:
+                torch.cuda.synchronize(compute_device)
 
         return loss
 
