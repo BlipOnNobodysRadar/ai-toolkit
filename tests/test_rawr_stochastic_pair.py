@@ -216,7 +216,8 @@ def test_dataset_layout_restore_checks_input_identity(tmp_path, changed_caption)
     caption = tmp_path / 'image.txt'
     image.write_bytes(b'fixture image identity')
     caption.write_text('original caption')
-    config = SimpleNamespace(caption_ext='txt')
+    from toolkit.config_modules import DatasetConfig
+    config = DatasetConfig(folder_path=str(tmp_path), caption_ext='txt')
     item = SimpleNamespace(path=str(image), dataset_config=config, flip_x=False, flip_y=False, crop_x=3)
     dataset = SimpleNamespace(file_list=[item], source_configs=[config], caption_dict=None,
                               epoch_num=4, batch_indices=[[0]])

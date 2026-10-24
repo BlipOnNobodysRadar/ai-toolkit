@@ -40,6 +40,8 @@ parser.add_argument('--controlled', action='store_true')
 parser.add_argument('--fixtures', required=True, type=Path)
 parser.add_argument('--evidence-root', required=True, type=Path)
 parser.add_argument('--crash-before-commit', type=int)
+parser.add_argument('--learnable-snr', action='store_true')
+parser.add_argument('--default-export-dtype', action='store_true')
 args = parser.parse_args()
 evidence = args.evidence_root / args.name
 evidence.mkdir(parents=True, exist_ok=True)
@@ -55,6 +57,10 @@ p['save']['max_step_saves_to_keep'] = 20
 p['train']['steps'] = 8
 p['train']['gradient_accumulation_steps'] = args.gas
 p['train']['optimizer_params']['beta1_warmup'] = 8 // args.gas
+if args.learnable_snr:
+    p['train']['learnable_snr_gos'] = True
+if args.default_export_dtype:
+    p['save'].pop('dtype', None)
 cfg_path = evidence / 'config.yaml'
 cfg_path.write_text(yaml.safe_dump(config))
 
@@ -62,6 +68,7 @@ from toolkit.job import get_job
 from jobs.process.BaseSDTrainProcess import BaseSDTrainProcess
 from extensions_built_in.sd_trainer.SDTrainer import SDTrainer
 from training_extras.rawr_checkpoint import underlying_scheduler
+from training_extras.rawr_stochastic import snr_state, rng_state
 
 trace_path = evidence / ('resume.jsonl' if (evidence / 'trace.jsonl').exists() else 'trace.jsonl')
 def params(self):
@@ -80,11 +87,16 @@ def record(kind, self):
         f.write(json.dumps(row, default=str) + '\n')
 
 original_train = SDTrainer.hook_train_loop
+def snapshot(self):
+    return {'params': [x.detach().cpu().clone() for x in params(self)],
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.lr_scheduler.state_dict(),
+            'snr': snr_state(self), 'rng': rng_state(),
+            'gradients': [None if x.grad is None else x.grad.detach().cpu().clone() for x in params(self)]}
+
 def observed_train(self, batch):
     record('before', self)
-    torch.save({'params': [x.detach().cpu().clone() for x in params(self)],
-                'optimizer': self.optimizer.state_dict(),
-                'scheduler': self.lr_scheduler.state_dict()},
+    torch.save(snapshot(self),
                evidence / f'{trace_path.stem}-before-{self.step_num}.pt')
     # Optional isolation of stochastic input: reset RNG per loop, feed the same
     # copied image. Still use actual model/noise/backward/optimizer/scheduler.
@@ -94,9 +106,7 @@ def observed_train(self, batch):
         np.random.seed(4321 + self.step_num)
     result = original_train(self, batch)
     record('after', self)
-    torch.save({'params': [x.detach().cpu().clone() for x in params(self)],
-                'optimizer': self.optimizer.state_dict(),
-                'scheduler': self.lr_scheduler.state_dict()},
+    torch.save(snapshot(self),
                evidence / f'{trace_path.stem}-step-{self.step_num}.pt')
     return result
 SDTrainer.hook_train_loop = observed_train

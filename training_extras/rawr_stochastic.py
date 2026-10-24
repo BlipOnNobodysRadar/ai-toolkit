@@ -85,7 +85,8 @@ def _datasets(loader):
 def dataset_identity(dataset):
     files = []
     for item in dataset.file_list:
-        caption = os.path.splitext(item.path)[0] + '.' + item.dataset_config.caption_ext
+        # DatasetConfig normalizes the dot; match CaptionProcessingDTOMixin.load_caption.
+        caption = os.path.splitext(item.path)[0] + item.dataset_config.caption_ext
         files.append([_file_stamp(item.path), _file_stamp(caption), item.flip_x, item.flip_y])
     configs = [vars(c) for c in dataset.source_configs]
     encoded = json.dumps({'files': files, 'configs': configs, 'captions': dataset.caption_dict},
@@ -116,6 +117,45 @@ def _restore_dataset(dataset, state):
     dataset.epoch_num = state['epoch']
 
 
+SNR_PARAMETERS = ('offset_1', 'offset_2', 'gamma', 'scale')
+
+
+def snr_state(trainer):
+    snr = getattr(trainer, 'snr_gos', None)
+    if snr is None:
+        return None
+    return {'version': 1,
+            'parameters': {key: getattr(snr, key).detach().cpu().clone() for key in SNR_PARAMETERS},
+            'optimizer': copy.deepcopy(snr.optimizer.state_dict()),
+            'buffer': [value.detach().cpu().clone() for value in snr.buffer],
+            'max_buffer_size': snr.max_buffer_size}
+
+
+def restore_snr(trainer, saved):
+    snr = getattr(trainer, 'snr_gos', None)
+    if (snr is None) != (saved is None):
+        raise ValueError('Cannot restore RAWR stochastic state: learnable SNR configuration changed')
+    if snr is None:
+        return
+    if (saved.get('version') != 1 or saved.get('max_buffer_size') != snr.max_buffer_size
+            or set(saved.get('parameters', {})) != set(SNR_PARAMETERS)
+            or not isinstance(saved.get('buffer'), list)
+            or len(saved['buffer']) > snr.max_buffer_size):
+        raise ValueError('Invalid RAWR learnable SNR state')
+    for key in SNR_PARAMETERS:
+        value, parameter = saved['parameters'][key], getattr(snr, key)
+        if not torch.is_tensor(value) or value.shape != parameter.shape or value.dtype != parameter.dtype:
+            raise ValueError('RAWR learnable SNR parameter layout changed')
+    if any(not torch.is_tensor(value) or value.numel() != 1 for value in saved['buffer']):
+        raise ValueError('Invalid RAWR learnable SNR loss history')
+    snr.optimizer.load_state_dict(saved['optimizer'])
+    with torch.no_grad():
+        for key in SNR_PARAMETERS:
+            getattr(snr, key).copy_(saved['parameters'][key])
+    snr.optimizer.zero_grad()
+    snr.buffer = [value.to(snr.device).clone() for value in saved['buffer']]
+
+
 def unsupported_reason(trainer):
     if str(trainer.accelerator.device) != 'cpu' or trainer.accelerator.num_processes != 1:
         return 'only single-process CPU execution is supported'
@@ -126,6 +166,11 @@ def unsupported_reason(trainer):
         return 'sampling/validation after a checkpoint may consume unsaved RNG'
     if trainer.ema is not None or getattr(trainer, 'training_extras', None) is not None:
         return 'EMA/auxiliary state is outside this continuation path'
+    snr = getattr(trainer, 'snr_gos', None)
+    if snr is not None:
+        from toolkit.train_tools import LearnableSNRGamma
+        if type(snr) is not LearnableSNRGamma:
+            return 'custom learnable SNR state is unavailable'
     if getattr(trainer.sd, 'is_multistage', False):
         return 'multistage model state is not recorded'
     if trainer.train_config.do_paramiter_swapping:
@@ -165,8 +210,16 @@ class StochasticResume:
         if self.reason:
             warnings.warn('RAWR stochastic continuation unavailable: ' + self.reason, RuntimeWarning)
             return
-        if saved is not None and saved.get('supported') and saved.get('version') != 1:
-            raise ValueError('Unsupported RAWR stochastic state version')
+        if saved is not None and saved.get('supported'):
+            if saved.get('version') not in (1, 2):
+                raise ValueError('Unsupported RAWR stochastic state version')
+            if saved['version'] == 2 and 'snr' not in saved:
+                raise ValueError('Missing RAWR learnable SNR state')
+            # Version 1 did not capture SNR optimizer/history. Never silently
+            # resume an SNR run from its lossy four-value legacy JSON instead.
+            restore_snr(trainer, saved.get('snr'))
+        elif getattr(trainer, 'snr_gos', None) is not None and getattr(trainer, 'step_num', 0) > 0:
+            raise ValueError('Cannot restore RAWR stochastic state: checkpoint has no complete learnable SNR state')
         for attr in ('data_loader', 'data_loader_reg'):
             loader = getattr(trainer, attr)
             if loader is None:
@@ -199,7 +252,7 @@ class StochasticResume:
     def state_dict(self):
         if self.reason:
             return {'supported': False, 'reason': self.reason}
-        return {'supported': True, 'version': 1, 'rng': rng_state(),
+        return {'supported': True, 'version': 2, 'rng': rng_state(), 'snr': snr_state(self.trainer),
                 'streams': [None if stream is None else {
                     'sampler': stream[1].state_dict(),
                     'datasets': [_dataset_state(d) for d in _datasets(stream[0])]}

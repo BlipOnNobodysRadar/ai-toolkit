@@ -509,6 +509,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         from training_extras import rawr_pair
         rawr_pair_save = rawr_pair.begin(self)
         rawr_model_alias = None
+        rawr_model_export = None
         flush()
         if self.ema is not None:
             # always save params as ema
@@ -570,10 +571,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 embedding_dict = self.embedding.state_dict() if self.embedding else None
                 self.network.save_weights(
                     file_path,
-                    dtype=get_torch_dtype(self.save_config.dtype),
+                    # Preserve training precision in the committed resume pair.
+                    dtype=None if rawr_pair_save is not None else get_torch_dtype(self.save_config.dtype),
                     metadata=save_meta,
                     extra_state_dict=embedding_dict
                 )
+                if rawr_pair_save is not None:
+                    def rawr_model_export(path):
+                        self.network.save_weights(
+                            path, dtype=get_torch_dtype(self.save_config.dtype),
+                            metadata=save_meta, extra_state_dict=embedding_dict)
                 self.network.multiplier = prev_multiplier
                 # if we have an embedding as well, pair it with the network
 
@@ -736,7 +743,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                     if getattr(self, '_rawr_checkpoint_config', None) is not None else None))
                 if rawr_pair_save is not None:
                     rawr_pair.commit(self.save_root, rawr_pair_save, state_dict,
-                                     rawr_model_alias, lora_name, checkpoint_step)
+                                     rawr_model_alias, lora_name, checkpoint_step, rawr_model_export)
                 elif getattr(self, '_rawr_checkpoint_config', None) is not None:
                     rawr_checkpoint.atomic_save(state_dict, file_path)
                 else:
@@ -1992,7 +1999,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
             )
             # check to see if previous settings exist
             path_to_load = os.path.join(self.save_root, 'learnable_snr.json')
-            if os.path.exists(path_to_load):
+            from training_extras import rawr_checkpoint, rawr_pair
+            paired_snr = (rawr_checkpoint.is_rawr_name(self.train_config.lr_scheduler)
+                          and rawr_pair.select(self.save_root, self.job.name + ('_LoRA' if self.named_lora else ''))
+                          is not None)
+            # The committed optimizer includes authoritative SNR parameters,
+            # AdamW state and loss history. Its legacy JSON alias can be newer,
+            # stale or truncated after an interrupted save; do not read it.
+            if os.path.exists(path_to_load) and not paired_snr:
                 with open(path_to_load, 'r') as f:
                     json_data = json.load(f)
                     if 'offset' in json_data:

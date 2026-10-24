@@ -53,12 +53,16 @@ def compare(control, resumed, start):
         expected = torch.load(control / f'trace-step-{step}.pt', map_location='cpu', weights_only=True)
         actual = torch.load(resumed / f'resume-step-{step}.pt', map_location='cpu', weights_only=True)
         assert equal(expected, actual), f'parameters/optimizer/scheduler diverged at loop {step}'
+        expected_before = torch.load(control / f'trace-before-{step}.pt', map_location='cpu', weights_only=True)
+        actual_before = torch.load(resumed / f'resume-before-{step}.pt', map_location='cpu', weights_only=True)
+        assert equal(expected_before, actual_before), f'pre-update state diverged at loop {step}'
         before_a, before_b = a['before', step], b['before', step]
         assert before_a['rng'] == before_b['rng']
         assert before_a['counter'] == before_b['counter']
         assert before_a['grad_norm'] == before_b['grad_norm']
         rows.append({'step': step, 'parameters_optimizer_scheduler_exact': True,
-                     'rng_exact': True, 'pending_gradients_exact': True})
+                     'rng_exact': True, 'pending_gradients_exact': True,
+                     'all_cpu_rng_and_gradient_tensors_exact_before_and_after': True})
     result = json.loads((resumed / 'resume-result.json').read_text())
     assert result['status'] == 'completed' and result['cuda_initialized'] is False
     (resumed / 'comparison.json').write_text(json.dumps(rows, indent=2))
@@ -90,5 +94,19 @@ def test_actual_process_exit_before_pair_commit_recovers_previous_generation(con
     assert manifest['step'] == 3, 'interrupted loop 4 must not replace the loop-2 save'
     assert 'INJECTED_PROCESS_EXIT_BEFORE_MANIFEST' in (root / f'{name}-0.log').read_text(encoding='utf-8')
     run(root, name)
+    assert min(step for kind, step in trace(saved, 'resume') if kind == 'before') == 3
+    compare(baseline, saved, 3)
+
+
+def test_actual_snr_interrupted_pair_ignores_truncated_legacy_json(tmp_path):
+    flags = ('--learnable-snr', '--default-export-dtype')
+    baseline = run(tmp_path, 'snr-control', *flags)
+    name = 'snr-interrupted'
+    saved = run(tmp_path, name, *flags, '--crash-before-commit', '4', expected=87)
+    output = saved / 'output' / name
+    manifest = json.loads((output / 'rawr-resume.json').read_text())
+    assert manifest['step'] == 3
+    (output / 'learnable_snr.json').write_text('{"interrupted":')
+    run(tmp_path, name, *flags)
     assert min(step for kind, step in trace(saved, 'resume') if kind == 'before') == 3
     compare(baseline, saved, 3)

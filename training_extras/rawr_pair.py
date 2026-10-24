@@ -47,10 +47,14 @@ def begin(trainer):
     if getattr(trainer, '_rawr_checkpoint_config', None) is None:
         return None
     previous = _manifest(trainer.save_root)
+    stochastic = getattr(trainer, '_rawr_stochastic', None)
+    unsupported_snr = (getattr(trainer, 'snr_gos', None) is not None
+                       and (stochastic is None or stochastic.reason is not None))
     if (trainer.network is None or trainer.is_fine_tuning
             or trainer.train_config.merge_network_on_save
+            or unsupported_snr
             or any(getattr(trainer, attr, None) is not None for attr in
-                   ('embedding', 'adapter', 'decorator', 'ema', 'snr_gos', 'training_extras'))):
+                   ('embedding', 'adapter', 'decorator', 'ema', 'training_extras'))):
         if previous is not None:
             raise ValueError('Cannot replace a committed RAWR pair with an unsupported save mode; use a new output folder')
         return None
@@ -76,15 +80,19 @@ def _write_manifest(value, path):
             os.unlink(temp)
 
 
-def _publish(source, target):
+def _publish(source, target, writer=None):
     temp = None
     try:
-        with tempfile.NamedTemporaryFile(mode='wb', prefix='.rawr-export.', suffix='.tmp',
+        with tempfile.NamedTemporaryFile(mode='wb', prefix='.rawr-export.', suffix=os.path.splitext(target)[1],
                                          dir=os.path.dirname(target), delete=False) as f:
             temp = f.name
-            with open(source, 'rb') as src:
+        # Close the temporary handle before serializers reopen it on Windows.
+        if writer is not None:
+            writer(temp)
+        else:
+            with open(source, 'rb') as src, open(temp, 'wb') as f:
                 shutil.copyfileobj(src, f, 1024 * 1024)
-            f.flush()
+        with open(temp, 'r+b') as f:
             os.fsync(f.fileno())
         os.replace(temp, target)
         temp = None
@@ -93,7 +101,7 @@ def _publish(source, target):
             os.unlink(temp)
 
 
-def commit(root, pair, state, model_alias, name, step):
+def commit(root, pair, state, model_alias, name, step, export_model=None):
     # Model serializers close their file before returning. Explicitly flush it
     # before publishing a pointer that promises both files are complete.
     # Windows fsync requires a writable descriptor, even though no bytes change.
@@ -109,11 +117,11 @@ def commit(root, pair, state, model_alias, name, step):
     _write_manifest(manifest, os.path.join(root, MANIFEST))
     # The transaction is committed. Alias errors must not turn a committed save
     # into a reported failed transaction; native resume uses the manifest.
-    for source, target in ((pair['model'], model_alias),
-                           (pair['optimizer'], os.path.join(root, 'optimizer.pt'))):
+    for source, target, writer in ((pair['model'], model_alias, export_model),
+                                  (pair['optimizer'], os.path.join(root, 'optimizer.pt'), None)):
         try:
-            _publish(source, target)
-        except OSError as exc:
+            _publish(source, target, writer)
+        except Exception as exc:
             warnings.warn(f'RAWR pair committed, but export alias {target} could not be updated: {exc}', RuntimeWarning)
 
 
