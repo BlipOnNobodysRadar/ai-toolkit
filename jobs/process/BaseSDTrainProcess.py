@@ -506,6 +506,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def save(self, step=None):
         if not self.accelerator.is_main_process:
             return
+        from training_extras import rawr_pair
+        rawr_pair_save = rawr_pair.begin(self)
+        rawr_model_alias = None
         flush()
         if self.ema is not None:
             # always save params as ema
@@ -546,6 +549,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         # prepare meta
         save_meta = get_meta_for_safetensors(save_meta, self.job.name)
+        if rawr_pair_save is not None:
+            save_meta['aitk_rawr_generation'] = json.dumps(rawr_pair_save['generation'])
         if not self.is_fine_tuning and not self.train_config.merge_network_on_save:
             if self.network is not None:
                 lora_name = self.job.name
@@ -555,6 +560,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 filename = f'{lora_name}{step_num}.safetensors'
                 file_path = os.path.join(self.save_root, filename)
+                if rawr_pair_save is not None:
+                    rawr_model_alias = file_path
+                    file_path = rawr_pair_save['model']
                 prev_multiplier = self.network.multiplier
                 self.network.multiplier = 1.0
 
@@ -726,7 +734,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     getattr(self, '_rawr_checkpoint_config', None), checkpoint_step,
                     training_state=(rawr_checkpoint.training_state(self, checkpoint_step)
                                     if getattr(self, '_rawr_checkpoint_config', None) is not None else None))
-                if getattr(self, '_rawr_checkpoint_config', None) is not None:
+                if rawr_pair_save is not None:
+                    rawr_pair.commit(self.save_root, rawr_pair_save, state_dict,
+                                     rawr_model_alias, lora_name, checkpoint_step)
+                elif getattr(self, '_rawr_checkpoint_config', None) is not None:
                     rawr_checkpoint.atomic_save(state_dict, file_path)
                 else:
                     torch.save(state_dict, file_path)
@@ -851,6 +862,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def get_latest_save_path(self, name=None, post='', include_pretrained_lora=True):
         if name == None:
             name = self.job.name
+        from training_extras import rawr_checkpoint, rawr_pair
+        if rawr_checkpoint.is_rawr_name(getattr(self.train_config, 'lr_scheduler', None)) and not post:
+            selected = rawr_pair.select(self.save_root, name)
+            if selected is not None:
+                if self.network_config is None or self.train_config.merge_network_on_save:
+                    raise ValueError('Committed RAWR pair is a LoRA; use its original training configuration')
+                self._rawr_paired_optimizer_path = selected['optimizer']
+                self._rawr_pair_generation = selected['generation']
+                return selected['model']
         # get latest saved step
         latest_path = None
         if os.path.exists(self.save_root):
@@ -908,6 +928,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     meta = yaml.load(f, Loader=yaml.FullLoader)
         else:
             meta = load_metadata_from_safetensors(path)
+        if meta is not None and meta.get('aitk_rawr_generation') is not None:
+            if meta['aitk_rawr_generation'] != getattr(self, '_rawr_pair_generation', None):
+                raise ValueError('RAWR model requires its committed-pair manifest; refusing an unpaired export')
         # if 'training_info' in Orderdict keys
         if meta is not None and 'training_info' in meta and 'step' in meta['training_info'] and self.train_config.start_step is None:
             self.step_num = meta['training_info'].get('completed_steps', meta['training_info']['step'])
@@ -2276,6 +2299,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # check if it exists
         optimizer_state_filename = f'optimizer.pt'
         optimizer_state_file_path = os.path.join(self.save_root, optimizer_state_filename)
+        if rawr_resume_enabled:
+            optimizer_state_file_path = getattr(self, '_rawr_paired_optimizer_path', optimizer_state_file_path)
         if rawr_resume_enabled and self.step_num > 0 and not os.path.exists(optimizer_state_file_path):
             raise RuntimeError('RAWR resume requires the optimizer.pt paired with the selected model; start a new run for weights-only training')
         if os.path.exists(optimizer_state_file_path):
@@ -2621,6 +2646,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             self.progress_bar = None
 
+        rawr_stochastic_saved = None
+        if rawr_resume_enabled:
+            from training_extras.rawr_stochastic import StochasticResume
+            if rawr_resume is not None and rawr_resume['payload'] is not None:
+                rawr_stochastic_saved = rawr_resume['payload'].get('training_state', {}).get('stochastic')
+            self._rawr_stochastic = StochasticResume(self, rawr_stochastic_saved)
+
         self._data_epoch = 0
         if self.step_num > 0 and self._rng_seed(0, 0) is not None:
             concurrent = [d.folder_path for d in (self.datasets or []) + (self.datasets_reg or [])
@@ -2700,6 +2732,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # TRAIN LOOP
         ###################################################################
 
+
+        if rawr_resume_enabled:
+            self._rawr_stochastic.restore_rng(rawr_stochastic_saved)
 
         start_step_num = self.step_num
         self._checkpoint_completed_step = self.step_num

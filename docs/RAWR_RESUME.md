@@ -11,9 +11,10 @@ trainer to skip the startup scheduler step on a restored run. It recognizes
 Accelerate's actual scheduler wrapper. Vendor RAWR arithmetic is unchanged.
 
 New optimizer.pt files contain versioned scheduler state, group metadata,
-declared configuration, and the model metadata step. Trainer saves use version 2
-to include pending gradients and the next accumulation counter; older code
-rejects these files instead of silently dropping the pending work. Changed LR/configuration,
+declared configuration, and the model metadata step. Version 2 includes pending
+gradients and the next accumulation counter. Version 3 also records stochastic
+continuation state (or an explicit unsupported-mode reason). Older code rejects
+new versions instead of silently dropping the pending work. Changed LR/configuration,
 step mismatches, unsupported versions, and inconsistent groups are rejected.
 RAWR optimizer load/save errors propagate instead of silently continuing.
 Resuming model metadata beyond step zero also requires its optimizer.pt;
@@ -36,10 +37,28 @@ the dataset iterator and is rejected explicitly.
 
 RAWR optimizer writes use a same-directory temporary file, flush/fsync, and
 atomic replacement. A serialization or replacement failure leaves the previous
-optimizer file readable. This is **not** an atomic model/optimizer transaction:
-the model saves first, and a failure may leave a newer model with the previous
-optimizer. The existing step-pairing check rejects that combination; retain the
-older matching model. Power-loss durability of directory metadata is unverified.
+optimizer file readable. Plain LoRA training also uses a committed pair:
+
+- `.rawr-checkpoints/a` and `b` alternate as inactive/active slots. The active
+  slot is never written during a save. Internal storage is bounded to two pairs.
+- `rawr-resume.json` is replaced only after model and optimizer files are closed,
+  flushed, and hashed. Its replacement commits both files as one resume point.
+- Native resume selects this manifest, verifies both SHA-256 hashes and the
+  generation in model metadata, then loads the optimizer from the same slot.
+- Normal model filenames and `optimizer.pt` remain export aliases, published
+  after commit. An alias-update failure warns; it cannot invalidate the committed
+  resume point. Copy the manifest and the `.rawr-checkpoints` directory when
+  moving a resumable run. A standalone new model export can still initialize a
+  new run through `pretrained_lora_path`; it cannot masquerade as a paired resume.
+
+This paired protocol covers one plain LoRA file and its optimizer. EMA, merged
+full models, auxiliary optimizers, embeddings, decorators, adapters, and learnable
+SNR files are not part of that transaction. Unsupported save modes cannot replace
+an existing committed pair in place; use a new output folder. Legacy directories
+without a manifest keep their existing selection behavior. An interrupted first
+paired save does not overwrite legacy exports. Concurrent writers/readers of a
+slot and power-loss durability of directory metadata remain unverified; process
+interruption before commit is covered by an actual trainer subprocess test.
 
 SimplifiedAdEMAMixExM supports non-compiled CPU updates when CUDA is unavailable,
 and restores its moment buffers to the configured storage dtype/device instead
@@ -59,6 +78,30 @@ can resume at a known completed-loop boundary, but are rejected mid-group
 because they contain no unfinished gradients. Accumulation-one legacy loading
 retains its warning and continuation behavior.
 
+## Stochastic continuation
+
+The serial CPU `SDTrainer`/`StableDiffusion` image path records Torch CPU, Python,
+and NumPy RNG states, each loader's actual shuffled index order and cursor, and
+dataset batch/crop layout and epoch. Resume restores the iterator state before
+iteration and restores RNG only after startup and iterator creation have finished.
+Already-consumed images are not fetched again. File path/size/mtime, caption,
+configuration, and order identities are checked before accepting dataset state.
+These checks assume stable inputs; they are not content hashes of every image.
+
+The supported path requires one CPU process, standard non-replacement random
+samplers, zero loader workers, serial per-batch loading, sampling and validation
+disabled, and no EMA, auxiliary state, parameter swapping, cached stochastic
+data, controls, or stateful augmentation pipelines. Custom models/hooks and
+GPU execution record an explicit unsupported reason and warn. Resuming a
+supported checkpoint into an unsupported mode fails before training updates.
+Version-1/2 files or version-3 unsupported-mode files warn that stochastic
+continuation is approximate; they retain the applicable legacy boundary policy.
+
+Exact results also require unchanged base weights, configuration, software and
+deterministic CPU kernels. Restoring global RNG cannot restore independent
+generators hidden in custom models or transforms. Worker prefetch queues and
+GPU RNG are deliberately not reconstructed.
+
 ## Verification boundaries
 
 Unit regressions compare independent uninterrupted/resumed parameter,
@@ -67,19 +110,25 @@ The acceptance script runs the real SDTrainer with a tiny diffusion model,
 normal LoRA serialization, on-disk optimizer state, real metadata loading,
 Accelerate preparation, and an interruption immediately after a normal save.
 
-This does not promise bit-identical full diffusion continuation: Toolkit does
-not restore dataset position or RNG state here. CPU tests with controlled
-per-step randomness isolate optimizer/scheduler/accumulation continuity; normal
-stochastic continuation still differs. Distributed execution, EMA, auxiliary
-optimizer gradients, GPU/offload behavior, and atomic paired model/optimizer
-writes remain separate concerns. Keep optimizer.pt paired with its model checkpoint;
-matching numeric labels alone cannot authenticate the pair.
+The supported tiny CPU diffusion path is tested with normal stochastic noise
+and shuffled two-image data, without per-step RNG reseeding. Uninterrupted and
+resumed parameters, optimizer state, scheduler state and RNG must match exactly.
+That claim does not extend to unsupported paths described above.
 
 `tests/test_rawr_trainer_continuity.py` exercises the actual SDTrainer update
 hook and BaseSDTrainProcess save with scalar CPU fixtures, periodic/end-step
 save phases, cycle transitions, future updates, legacy boundaries, malformed
 accumulation state, and injected write/replace failures. The tiny diffusion
 acceptance path additionally covers model serialization and the host loop.
+
+`tests/test_rawr_stochastic_pair.py` checks RNG streams, sampler epoch boundaries,
+save failures at each transaction stage, pair corruption, legacy selection and
+recovery updates. `tests/test_rawr_cpu_integration.py` runs the actual tiny
+trainer in serial subprocesses, including an abrupt exit after model/optimizer
+serialization but before manifest commit. Supply `AITK_RAWR_CPU_FIXTURES` pointing
+to a local directory with `template.yaml`, `tiny-sd/` and `tiny-data/`; no download
+is attempted. Without those local fixtures, these integration tests explicitly
+skip. The worker entry point is `testing/rawr_cpu_probe.py`.
 
 ## Reproduce a real trainer check
 

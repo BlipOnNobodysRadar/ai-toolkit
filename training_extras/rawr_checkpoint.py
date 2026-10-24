@@ -76,6 +76,8 @@ def add_state(optimizer_state, scheduler, config, trainer_step, training_state=N
                    'groups': capture(optimizer_state)['groups']}
     if training_state is not None:
         result[KEY]['training_state'] = training_state
+        if 'stochastic' in training_state:
+            result[KEY]['version'] = 3
     return result
 
 
@@ -101,10 +103,14 @@ def restore(scheduler, captured, config, trainer_step):
             raise ValueError('Invalid RAWR checkpoint cycle position')
     payload = captured['payload']
     if payload is not None:
-        if payload.get('version') not in (1, 2):
+        if payload.get('version') not in (1, 2, 3):
             raise ValueError('Unsupported RAWR checkpoint version')
-        if payload['version'] == 2 and not isinstance(payload.get('training_state'), dict):
+        if payload['version'] >= 2 and not isinstance(payload.get('training_state'), dict):
             raise ValueError('Missing RAWR training checkpoint state')
+        if payload['version'] == 3:
+            stochastic = payload['training_state'].get('stochastic')
+            if not isinstance(stochastic, dict) or type(stochastic.get('supported')) is not bool:
+                raise ValueError('Missing RAWR stochastic checkpoint state')
         if payload.get('config') != config:
             raise ValueError('RAWR resume configuration changed; use the saved configuration or start a new run')
         if payload.get('trainer_step') != int(trainer_step):
@@ -150,13 +156,16 @@ def training_state(trainer, checkpoint_step):
     saves follow it. Completed loop metadata disambiguates those phases.
     RNG, dataset iterators, and auxiliary optimizers are not captured here.
     """
-    return {
+    result = {
         'gradient_accumulation_steps': trainer.train_config.gradient_accumulation_steps,
         'gradient_accumulation': trainer.train_config.gradient_accumulation,
         'next_accumulation_step': trainer.grad_accumulation_step + int(checkpoint_step > trainer.step_num),
         'gradients': [[None if p.grad is None else p.grad.detach().cpu().clone()
                        for p in g['params']] for g in trainer.optimizer.param_groups],
     }
+    if getattr(trainer, '_rawr_stochastic', None) is not None:
+        result['stochastic'] = trainer._rawr_stochastic.state_dict()
+    return result
 
 
 def restore_training_state(optimizer, captured, config, trainer_step):
