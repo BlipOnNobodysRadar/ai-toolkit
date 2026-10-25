@@ -118,7 +118,7 @@ def _release_backward_weight_slot(state, idx):
     state["bwd_slot_free"][idx].record()
 
 
-def _stage_grads_to_cpu(state, idx, grad_w_gpu, grad_b_gpu, weight_cpu, bias_cpu):
+def _stage_grads_to_cpu(state, idx, grad_w_gpu, grad_b_gpu, weight_param, bias_param):
     """Copy freshly-computed device grads (in staging slot idx) to CPU on the
     grad stream, overlapping the next H2D. Returns (grad_w_cpu, grad_b_cpu).
 
@@ -128,7 +128,12 @@ def _stage_grads_to_cpu(state, idx, grad_w_gpu, grad_b_gpu, weight_cpu, bias_cpu
     the optimizer/clip path does so via sync_grad_transfers(). The one host
     read we can't defer is grad accumulation: when the param already holds a
     .grad, AccumulateGrad does `grad += returned` on the engine thread the
-    moment backward returns, so block here until the copy has landed."""
+    moment backward returns, so block here until the copy has landed.
+
+    weight_param/bias_param must be the Parameters themselves (ctx.params), not
+    ctx.saved_tensors: under gradient checkpointing the unpacked saved tensor is
+    a recomputed alias whose .grad is always None, which skipped this sync and
+    let every accumulated micro-batch add a half-copied buffer."""
     gs = state["transfer_grad_stream"]
     state["grad_compute_done"][idx].record()  # on the compute stream
     grad_w_cpu = grad_b_cpu = None
@@ -139,8 +144,8 @@ def _stage_grads_to_cpu(state, idx, grad_w_gpu, grad_b_gpu, weight_cpu, bias_cpu
         if grad_b_gpu is not None:
             grad_b_cpu = grad_b_gpu.to("cpu", non_blocking=True)
         state["grad_xfer_done"][idx].record()
-    if (grad_w_cpu is not None and weight_cpu.grad is not None) or (
-        grad_b_cpu is not None and bias_cpu.grad is not None
+    if (grad_w_cpu is not None and weight_param.grad is not None) or (
+        grad_b_cpu is not None and bias_param.grad is not None
     ):
         state["grad_xfer_done"][idx].synchronize()
     return grad_w_cpu, grad_b_cpu
@@ -359,6 +364,9 @@ class _BouncingLinearFn(torch.autograd.Function):
             _release_forward_slot(state, idx)
 
         ctx.save_for_backward(x, weight_cpu, bias_cpu)
+        # the Parameters themselves, for the .grad check in _stage_grads_to_cpu
+        # (saved_tensors may be checkpoint-recomputed aliases)
+        ctx.params = (weight_cpu, bias_cpu)
         ctx.device = device
         ctx.target_dtype = target_dtype
         return out
@@ -441,7 +449,7 @@ class _BouncingLinearFn(torch.autograd.Function):
                 b_grad_gpu = grad_out.sum(dim=tuple(range(grad_out.ndim - 1)))
                 state["b_grad_buffers"][idx] = b_grad_gpu
             grad_weight, grad_bias = _stage_grads_to_cpu(
-                state, idx, w_grad_gpu, b_grad_gpu, weight_cpu, bias_cpu
+                state, idx, w_grad_gpu, b_grad_gpu, *ctx.params
             )
 
         return grad_input.to(dtype=grad_out.dtype), grad_weight, grad_bias, None
@@ -510,6 +518,7 @@ class _BouncingConv2dFn(torch.autograd.Function):
             _release_forward_slot(state, idx)
 
         ctx.save_for_backward(x, weight_cpu, bias_cpu)
+        ctx.params = (weight_cpu, bias_cpu)  # see _BouncingLinearFn.forward
         ctx.meta = (device, stride, padding, dilation, groups, target_dtype)
         return out
 
@@ -635,7 +644,7 @@ class _BouncingConv2dFn(torch.autograd.Function):
                 b_grad_gpu = grad_out.sum(dim=(0, 2, 3))
                 state["b_grad_buffers"][idx] = b_grad_gpu
             grad_weight, grad_bias = _stage_grads_to_cpu(
-                state, idx, w_grad_gpu, b_grad_gpu, weight_cpu, bias_cpu
+                state, idx, w_grad_gpu, b_grad_gpu, *ctx.params
             )
 
         return (
