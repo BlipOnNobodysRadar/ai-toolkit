@@ -118,6 +118,15 @@ def _release_backward_weight_slot(state, idx):
     state["bwd_slot_free"][idx].record()
 
 
+def _match_param_layout(grad, param):
+    """A grad whose strides or dtype differ from its param's (conv2d_weight can return channels_last) is not adopted
+    as .grad by autograd: it is cast or copied on the host as soon as backward returns, before the async D2H below
+    has landed. Give it the param's layout on the device first, so the returned CPU tensor is adopted untouched."""
+    if grad is None or (grad.stride() == param.stride() and grad.dtype == param.dtype):
+        return grad
+    return torch.empty_strided(param.shape, param.stride(), dtype=param.dtype, device=grad.device).copy_(grad)
+
+
 def _stage_grads_to_cpu(state, idx, grad_w_gpu, grad_b_gpu, weight_param, bias_param):
     """Copy freshly-computed device grads (in staging slot idx) to CPU on the
     grad stream, overlapping the next H2D. Returns (grad_w_cpu, grad_b_cpu).
@@ -133,8 +142,16 @@ def _stage_grads_to_cpu(state, idx, grad_w_gpu, grad_b_gpu, weight_param, bias_p
     weight_param/bias_param must be the Parameters themselves (ctx.params), not
     ctx.saved_tensors: under gradient checkpointing the unpacked saved tensor is
     a recomputed alias whose .grad is always None, which skipped this sync and
-    let every accumulated micro-batch add a half-copied buffer."""
+    let every accumulated micro-batch add a half-copied buffer.
+
+    The staged grads take the param's strides and dtype first (_match_param_layout): otherwise autograd copies or
+    casts the returned tensor on the host straight away, which on the first micro-batch (no .grad yet, so no sync
+    here) read the pinned buffer before the copy landed."""
     gs = state["transfer_grad_stream"]
+    if grad_w_gpu is not None:
+        grad_w_gpu = state["w_grad_buffers"][idx] = _match_param_layout(grad_w_gpu, weight_param)
+    if grad_b_gpu is not None:
+        grad_b_gpu = state["b_grad_buffers"][idx] = _match_param_layout(grad_b_gpu, bias_param)
     state["grad_compute_done"][idx].record()  # on the compute stream
     grad_w_cpu = grad_b_cpu = None
     with torch.cuda.stream(gs):
