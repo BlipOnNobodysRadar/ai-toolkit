@@ -42,6 +42,8 @@ parser.add_argument('--evidence-root', required=True, type=Path)
 parser.add_argument('--crash-before-commit', type=int)
 parser.add_argument('--learnable-snr', action='store_true')
 parser.add_argument('--default-export-dtype', action='store_true')
+# off: the recorded stochastic state carries RNG and data position; on: per-step reseeding does (the trainer default)
+parser.add_argument('--reseed', choices=('on', 'off'), default='off')
 args = parser.parse_args()
 evidence = args.evidence_root / args.name
 evidence.mkdir(parents=True, exist_ok=True)
@@ -57,6 +59,7 @@ p['save']['max_step_saves_to_keep'] = 20
 p['train']['steps'] = 8
 p['train']['gradient_accumulation_steps'] = args.gas
 p['train']['optimizer_params']['beta1_warmup'] = 8 // args.gas
+p['train']['reseed_per_step'] = args.reseed == 'on'
 if args.learnable_snr:
     p['train']['learnable_snr_gos'] = True
 if args.default_export_dtype:
