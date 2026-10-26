@@ -4,6 +4,7 @@ The active slot is never written. A manifest replacement commits the inactive
 slot only after both files are complete and flushed. This bounds internal
 storage to two generations without pruning user checkpoints.
 """
+import glob
 import hashlib
 import json
 import os
@@ -61,6 +62,15 @@ def begin(trainer):
     slot = 'b' if previous is not None and previous['slot'] == 'a' else 'a'
     model, optimizer = _paths(trainer.save_root, slot)
     os.makedirs(os.path.dirname(model), exist_ok=True)
+    # A crash between creating an alias temp and replacing the alias leaves a .rawr-export.* name, which as a hard
+    # link pins a whole old optimizer (and atomic_save can leave .optimizer.*.tmp). One trainer writes a save root,
+    # so nothing else can own these at the start of a save.
+    for stale in (glob.glob(os.path.join(glob.escape(trainer.save_root), '.rawr-export.*'))
+                  + glob.glob(os.path.join(glob.escape(os.path.dirname(model)), '.optimizer.*.tmp'))):
+        try:
+            os.unlink(stale)
+        except OSError:
+            pass
     return {'slot': slot, 'generation': uuid.uuid4().hex, 'model': model, 'optimizer': optimizer}
 
 
@@ -95,6 +105,7 @@ def _hard_link(source, temp):
 
 def _publish(source, target, writer=None, link=False):
     temp = None
+    temp_is_link = False
     try:
         with tempfile.NamedTemporaryFile(mode='wb', prefix='.rawr-export.', suffix=os.path.splitext(target)[1],
                                          dir=os.path.dirname(target), delete=False) as f:
@@ -102,11 +113,15 @@ def _publish(source, target, writer=None, link=False):
         # Close the temporary handle before serializers reopen it on Windows.
         if writer is not None:
             writer(temp)
-        elif not (link and _hard_link(source, temp)):
+        elif link and _hard_link(source, temp):
+            temp_is_link = True
+        else:
             with open(source, 'rb') as src, open(temp, 'wb') as f:
                 shutil.copyfileobj(src, f, 1024 * 1024)
-        with open(temp, 'r+b') as f:
-            os.fsync(f.fileno())
+        if not temp_is_link:
+            # A link is the committed slot itself, already flushed by atomic_save; don't open it for writing.
+            with open(temp, 'r+b') as f:
+                os.fsync(f.fileno())
         os.replace(temp, target)
         temp = None
     finally:

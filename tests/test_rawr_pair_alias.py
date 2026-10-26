@@ -6,6 +6,7 @@ nothing rewrites a linked file in place: atomic_save gives a slot a new file and
 """
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -82,3 +83,70 @@ def test_plain_optimizer_save_never_writes_through_a_link(tmp_path):
     f.save(0)
     assert committed.read_bytes() == b'committed optimizer bytes'
     assert torch.load(tmp_path / 'optimizer.pt', map_location='cpu', weights_only=True)['param_groups']
+
+
+def test_model_alias_is_a_separate_export(tmp_path):
+    needs_hard_links(tmp_path)
+    f, _, _ = paired_trainer(tmp_path)
+    save_steps(f, [0])
+    model_alias = next(tmp_path.glob('tiny*.safetensors'))
+    assert not os.path.samefile(model_alias, pair.select(str(tmp_path), 'tiny')['model'])
+
+
+def test_failed_alias_replace_keeps_the_old_alias_and_leaves_no_temp(tmp_path, monkeypatch):
+    needs_hard_links(tmp_path)
+    f, _, _ = paired_trainer(tmp_path)
+    save_steps(f, [0])
+    alias = tmp_path / 'optimizer.pt'
+    before = alias.read_bytes()
+    real_replace = pair.os.replace
+
+    def fail_alias(source, target):
+        if Path(target) == alias:
+            raise OSError('alias replace interrupted')
+        return real_replace(source, target)
+
+    monkeypatch.setattr(pair.os, 'replace', fail_alias)
+    with pytest.warns(RuntimeWarning, match='pair committed'):
+        save_steps(f, [1])
+    assert alias.read_bytes() == before
+    assert pair.select(str(tmp_path), 'tiny')['step'] == 2
+    assert not list(tmp_path.glob('.rawr-export.*'))
+
+
+def test_crash_leftovers_are_cleared_at_the_next_save(tmp_path):
+    f, _, _ = paired_trainer(tmp_path)
+    save_steps(f, [0])  # slot a; the next save writes slot b
+    stale = [tmp_path / '.rawr-export.crashed.pt', tmp_path / pair.DIRECTORY / 'b' / '.optimizer.crashed.tmp']
+    for path in stale:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'left by a crash')
+    save_steps(f, [1])
+    assert not any(path.exists() for path in stale)
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='checks Windows share modes')
+def test_a_held_open_alias_only_delays_its_update(tmp_path):
+    # CPython, like most readers, opens without FILE_SHARE_DELETE: the held name can't be replaced, but on NTFS the
+    # slot's own name still can (probe: runs/review-alias-hardlink/probe_share.txt, 26 Oct 2026).
+    needs_hard_links(tmp_path)
+    f, _, _ = paired_trainer(tmp_path)
+    save_steps(f, [0])
+    alias = tmp_path / 'optimizer.pt'
+    with open(alias, 'rb'):
+        with pytest.warns(RuntimeWarning, match='pair committed'):
+            save_steps(f, [1, 2])  # slot b, then slot a, whose file the reader still holds through the alias
+        assert pair.select(str(tmp_path), 'tiny')['step'] == 3
+    save_steps(f, [3])
+    assert os.path.samefile(alias, pair.select(str(tmp_path), 'tiny')['optimizer'])
+
+
+def test_embedding_trigger_cannot_overwrite_optimizer_pt(tmp_path):
+    f, _, _ = trainer(tmp_path)
+    advance(f, 0)
+    written = []
+    f.embedding = SimpleNamespace(step=0, save=written.append, state_dict=dict)
+    f.embed_config = SimpleNamespace(trigger='optimizer', save_format='pt')
+    with pytest.raises(ValueError, match="trigger named 'optimizer'"):
+        f.save()  # the final save has no step suffix
+    assert not written

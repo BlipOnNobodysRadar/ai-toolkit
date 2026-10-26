@@ -41,6 +41,17 @@ optimizer file readable. Plain LoRA training also uses a committed pair:
 
 - `.rawr-checkpoints/a` and `b` alternate as inactive/active slots. The active
   slot is never written during a save. Internal storage is bounded to two pairs.
+- `optimizer.pt` in the output folder is a hard link to the committed slot's optimizer where the volume allows it
+  (NTFS, ext4), and a copy otherwise. That saves a full optimizer write per save: about 3 minutes for a 7 GB
+  optimizer on a 40 MB/s drive. Two consequences:
+  - **It is a live alias.** Anything that writes into `optimizer.pt` in place (`torch.save` to that path, opening
+    it `r+b`, copying *over* it) also changes the committed slot. Native resume then refuses the pair on its hash
+    check. Copy it elsewhere before modifying it. Every optimizer writer in the trainer swaps in a new file instead.
+  - **Copies don't keep links.** Copying, zipping or moving the folder to another volume stores the optimizer twice,
+    and folder-size tools count it twice. For a resumable archive, `rawr-resume.json` plus `.rawr-checkpoints` is
+    enough.
+  - A reader holding `optimizer.pt` open only delays the alias update (a warning; the pair is committed). On NTFS it
+    doesn't block rewriting the slot.
 - `rawr-resume.json` is replaced only after model and optimizer files are closed,
   flushed, and hashed. Its replacement commits both files as one resume point.
 - Native resume selects this manifest, verifies both SHA-256 hashes and the

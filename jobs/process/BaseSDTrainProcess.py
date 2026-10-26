@@ -595,6 +595,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.embed_config.save_format == "pt":
                     # replace extension
                     emb_file_path = os.path.splitext(emb_file_path)[0] + ".pt"
+                if os.path.basename(emb_file_path) == 'optimizer.pt':
+                    # it would clobber the optimizer, and optimizer.pt may be a hard link to a committed RAWR slot
+                    raise ValueError("An embedding trigger named 'optimizer' saved as .pt would overwrite "
+                                     "optimizer.pt; rename the trigger")
                 self.embedding.save(emb_file_path)
             
             if self.decorator is not None:
