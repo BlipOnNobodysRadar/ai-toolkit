@@ -16,6 +16,7 @@ from torch.utils.checkpoint import checkpoint
 from toolkit.config_modules import NetworkConfig
 from toolkit.lora_special import LoRASpecialNetwork
 from toolkit.memory_management import MemoryManager, sync_grad_transfers
+from toolkit.memory_management import manager_modules
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="layer offloading needs CUDA")
 DEV = torch.device("cuda")
@@ -117,5 +118,25 @@ def test_real_network_offload_grads_match(base_offload, net_offload, ckpt, micro
     assert ref, "no trainable gradients in the reference"
     assert set(got) == set(ref) and got_missing == ref_missing, (sorted(set(ref) ^ set(got)), got_missing, ref_missing)
     assert any("scalar" in k for k in ref), "scalar not exercised"
+    bad = {k: e for k, e in rel_errors(got, ref).items() if e > 2e-3}
+    assert not bad, f"{len(bad)}/{len(ref)} params off: " + ", ".join(f"{k}={e:.3g}" for k, e in sorted(bad.items())[:6])
+
+
+@pytest.mark.parametrize("base_offload", [None, 1.0], ids=["net", "base+net"])
+def test_staged_grads_survive_a_slow_copy(monkeypatch, base_offload):
+    """Regression (26 Oct 2026): conv2d_weight can return a channels_last grad. Returned as is, autograd can't adopt it
+    as .grad (its strides differ from the param's) and copies it on the host at once, before the async D2H has landed,
+    so a conv LoCon factor's first-micro-batch grad came out as zeros or garbage, now and then (3 in 12 audit runs).
+    Holding the grad stream back before each copy makes that race deterministic."""
+    stage = manager_modules._stage_grads_to_cpu
+
+    def slow_copy(state, *args):
+        with torch.cuda.stream(state["transfer_grad_stream"]):
+            torch.cuda._sleep(50_000_000)
+        return stage(state, *args)
+
+    monkeypatch.setattr(manager_modules, "_stage_grads_to_cpu", slow_copy)
+    ref, _ = grads(None, False, None, 1)
+    got, _ = grads(base_offload, True, None, 1)
     bad = {k: e for k, e in rel_errors(got, ref).items() if e > 2e-3}
     assert not bad, f"{len(bad)}/{len(ref)} params off: " + ", ".join(f"{k}={e:.3g}" for k, e in sorted(bad.items())[:6])
