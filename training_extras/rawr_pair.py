@@ -47,9 +47,13 @@ def begin(trainer):
     if getattr(trainer, '_rawr_checkpoint_config', None) is None:
         return None
     previous = _manifest(trainer.save_root)
-    stochastic = getattr(trainer, '_rawr_stochastic', None)
-    unsupported_snr = (getattr(trainer, 'snr_gos', None) is not None
-                       and (stochastic is None or stochastic.reason is not None))
+    # Learnable SNR state now travels in the pair either way (recorded-state path or training_state['snr']);
+    # only custom SNR classes, whose state isn't captured, keep the pair off.
+    snr = getattr(trainer, 'snr_gos', None)
+    unsupported_snr = False
+    if snr is not None:
+        from toolkit.train_tools import LearnableSNRGamma
+        unsupported_snr = type(snr) is not LearnableSNRGamma
     if (trainer.network is None or trainer.is_fine_tuning
             or trainer.train_config.merge_network_on_save
             or unsupported_snr

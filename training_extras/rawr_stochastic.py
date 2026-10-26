@@ -156,7 +156,31 @@ def restore_snr(trainer, saved):
     snr.buffer = [value.to(snr.device).clone() for value in saved['buffer']]
 
 
+# train.reseed_per_step (BaseSDTrainProcess._rng_seed) already makes every step's draws and the data position a
+# function of (training_seed, step/epoch), on GPU too. Exactly one mechanism may own the data stream, so this
+# recorded-state path stands aside while reseeding is active and serves runs with reseeding off.
+RESEEDED = 'per-step reseeding (train.reseed_per_step) owns the RNG and data position'
+
+
+def loader_identities(trainer):
+    """dataset_identity for every dataset of the training and reg loaders (file stamps, captions, config)."""
+    result = []
+    for attr in ('data_loader', 'data_loader_reg'):
+        loader = getattr(trainer, attr, None)
+        if loader is None:
+            result.append(None)
+            continue
+        try:
+            result.append([dataset_identity(d) for d in _datasets(loader)])
+        except Exception:  # custom datasets without file_list/caption_dict
+            result.append('unavailable')
+    return result
+
+
 def unsupported_reason(trainer):
+    rng_seed = getattr(trainer, '_rng_seed', None)
+    if getattr(trainer, 'training_seed', None) is not None and rng_seed is not None and rng_seed(0, 0) is not None:
+        return RESEEDED
     if str(trainer.accelerator.device) != 'cpu' or trainer.accelerator.num_processes != 1:
         return 'only single-process CPU execution is supported'
     if (type(trainer).__module__ != 'extensions_built_in.sd_trainer.SDTrainer'
@@ -206,9 +230,12 @@ class StochasticResume:
         self.reason = unsupported_reason(trainer)
         self.streams = []
         if saved is not None and saved.get('supported') and self.reason:
-            raise ValueError('Cannot restore RAWR stochastic state: ' + self.reason)
+            hint = ('; this checkpoint recorded its RNG and data state with train.reseed_per_step off, so resume it '
+                    'with reseed_per_step: false' if self.reason == RESEEDED else '')
+            raise ValueError('Cannot restore RAWR stochastic state: ' + self.reason + hint)
         if self.reason:
-            warnings.warn('RAWR stochastic continuation unavailable: ' + self.reason, RuntimeWarning)
+            if self.reason != RESEEDED:  # reseeding is the intended path, not a degradation
+                warnings.warn('RAWR stochastic continuation unavailable: ' + self.reason, RuntimeWarning)
             return
         if saved is not None and saved.get('supported'):
             if saved.get('version') not in (1, 2):

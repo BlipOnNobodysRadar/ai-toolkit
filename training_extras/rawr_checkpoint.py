@@ -163,9 +163,36 @@ def training_state(trainer, checkpoint_step):
         'gradients': [[None if p.grad is None else p.grad.detach().cpu().clone()
                        for p in g['params']] for g in trainer.optimizer.param_groups],
     }
-    if getattr(trainer, '_rawr_stochastic', None) is not None:
-        result['stochastic'] = trainer._rawr_stochastic.state_dict()
+    stochastic = getattr(trainer, '_rawr_stochastic', None)
+    if stochastic is not None:
+        result['stochastic'] = stochastic.state_dict()
+    if stochastic is None or not result['stochastic'].get('supported'):
+        # Outside the recorded-state path (e.g. with per-step reseeding) the learnable SNR state and the data
+        # identity still travel with the pair; the recorded path keeps its own copies.
+        from training_extras.rawr_stochastic import loader_identities, snr_state
+        result['snr'] = snr_state(trainer)
+        result['dataset_identity'] = loader_identities(trainer)
     return result
+
+
+def restore_auxiliary_state(trainer, captured):
+    """Restore learnable SNR and check the data identity for checkpoints saved outside the recorded-state path."""
+    payload = captured['payload'] if captured is not None else None
+    state = payload.get('training_state') if isinstance(payload, dict) else None
+    if not isinstance(state, dict):
+        return
+    stochastic = state.get('stochastic')
+    if isinstance(stochastic, dict) and stochastic.get('supported'):
+        return  # StochasticResume restored SNR and validated the datasets itself
+    from training_extras.rawr_stochastic import loader_identities, restore_snr
+    if 'snr' in state:
+        restore_snr(trainer, state['snr'])
+    elif getattr(trainer, 'snr_gos', None) is not None:
+        warnings.warn('RAWR checkpoint predates learnable SNR capture; SNR state restarts', RuntimeWarning)
+    saved = state.get('dataset_identity')
+    if saved is not None and saved != loader_identities(trainer):
+        warnings.warn('Training images, captions or dataset configuration changed since this checkpoint; '
+                      'the continuation cannot match an uninterrupted run', RuntimeWarning)
 
 
 def restore_training_state(optimizer, captured, config, trainer_step):

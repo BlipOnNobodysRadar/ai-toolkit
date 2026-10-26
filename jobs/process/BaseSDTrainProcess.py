@@ -2722,6 +2722,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self._rawr_scheduler_restored:
             self.grad_accumulation_step = rawr_checkpoint.restore_training_state(
                 self.optimizer, rawr_resume, self.train_config, self.step_num)
+            rawr_checkpoint.restore_auxiliary_state(self, rawr_resume)  # SNR + data identity outside the recorded path
             rawr_resume = None  # release the saved CPU gradient copies
 
         if not self._rawr_scheduler_restored:
