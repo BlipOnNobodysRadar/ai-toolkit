@@ -500,6 +500,9 @@ class MinimaxH3Model(BaseModel):
         self.print_and_status_update("Loading MiniMax-H3 model")
 
         transformer = self._load_transformer()
+        transformer.activation_offloading = bool(
+            getattr(self.model_config, "activation_offloading", False)
+        )
 
         # load assistant lora if specified (merged into the quantized weights)
         if self.model_config.assistant_lora_path is not None:
