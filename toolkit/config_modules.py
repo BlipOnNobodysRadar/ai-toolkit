@@ -488,6 +488,10 @@ class TrainConfig:
         # With a training_seed: reseed every RNG at the start of each step from (seed, step), and the data sampler
         # from (seed, epoch), so a resumed run draws exactly what an uninterrupted one would. Without it a resume
         # reseeds from training_seed and replays the opening steps' images, noise and timesteps.
+        # Exact continuation covers serial loading (dataset num_workers 0, batch_load_threads <= 1). With workers or
+        # load threads, order, noise and timesteps still continue exactly, but per-item draws (caption dropout,
+        # token shuffling, random crops) can land on different items, and a resume never replays. With a reg
+        # dataset the primary order after a resume is fresh rather than reconstructed.
         self.reseed_per_step = bool(kwargs.get('reseed_per_step', True))
         if self.gradient_accumulation > 1:
             if self.gradient_accumulation_steps != 1:

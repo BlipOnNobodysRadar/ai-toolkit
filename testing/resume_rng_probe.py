@@ -66,10 +66,10 @@ def observed_save(self,step=None):
     original_save(self,step)
     opt_path=Path(self.save_root)/'optimizer.pt'
     opt=torch.load(opt_path,weights_only=True,map_location='cpu')
-    assert KEY in opt,'RAWR metadata missing from actual disk save'
-    expected=self.meta['training_info']['step']
-    assert opt[KEY]['trainer_step']==expected
-    record('saved',self,payload=opt[KEY])
+    if KEY in opt:  # RAWR runs: the optimizer payload must match the model metadata
+        expected=self.meta['training_info']['step']
+        assert opt[KEY]['trainer_step']==expected
+    record('saved',self,payload=opt.get(KEY),completed_steps=self.meta['training_info'].get('completed_steps'))
     shutil.copy2(opt_path,evidence/f'optimizer-{self.step_num}.pt')
     if args.stop_after_save is not None and step==args.stop_after_save:
         raise AcceptedStop('Stopped after successful production checkpoint save')

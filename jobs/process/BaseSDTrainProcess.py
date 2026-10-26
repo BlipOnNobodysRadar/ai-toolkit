@@ -529,6 +529,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
             getattr(self, '_rawr_checkpoint_config', None))
         if checkpoint_step != self.step_num:
             self.meta['training_info']['step'] = checkpoint_step
+        # Completed loop steps for every scheduler ('step' keeps its RAWR-checked meaning). Resume prefers this:
+        # a non-RAWR periodic save records the index of the step it just trained, so resuming from 'step' repeats it.
+        completed = getattr(self, '_checkpoint_completed_step', None)
+        self.meta['training_info']['completed_steps'] = int(completed if completed is not None else self.step_num)
         filename = f'{self.job.name}{step_num}.safetensors'
         file_path = os.path.join(self.save_root, filename)
 
@@ -570,8 +574,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 emb_filename = f'{self.embed_config.trigger}{step_num}.safetensors'
                 emb_file_path = os.path.join(self.save_root, emb_filename)
                 # for combo, above will get it
-                # set current step
-                self.embedding.step = self.step_num
+                # set current step: the completed count, which run() resumes from (see completed_steps above)
+                self.embedding.step = self.meta['training_info']['completed_steps']
                 # change filename to pt if that is set
                 if self.embed_config.save_format == "pt":
                     # replace extension
@@ -901,7 +905,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             meta = load_metadata_from_safetensors(path)
         # if 'training_info' in Orderdict keys
         if meta is not None and 'training_info' in meta and 'step' in meta['training_info'] and self.train_config.start_step is None:
-            self.step_num = meta['training_info']['step']
+            self.step_num = meta['training_info'].get('completed_steps', meta['training_info']['step'])
             if 'epoch' in meta['training_info']:
                 self.epoch_num = meta['training_info']['epoch']
             self.start_step = self.step_num
@@ -940,7 +944,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             meta = load_metadata_from_safetensors(latest_save_path)
             # if 'training_info' in Orderdict keys
             if 'training_info' in meta and 'step' in meta['training_info']:
-                self.step_num = meta['training_info']['step']
+                self.step_num = meta['training_info'].get('completed_steps', meta['training_info']['step'])
                 if 'epoch' in meta['training_info']:
                     self.epoch_num = meta['training_info']['epoch']
                 self.start_step = self.step_num
@@ -2612,6 +2616,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.progress_bar = None
 
         self._data_epoch = 0
+        if self.step_num > 0 and self._rng_seed(0, 0) is not None:
+            concurrent = [d.folder_path for d in (self.datasets or []) + (self.datasets_reg or [])
+                          if getattr(d, 'num_workers', 0) > 0 or getattr(d, 'batch_load_threads', 1) > 1]
+            if concurrent or self.data_loader_reg is not None:
+                print_acc("Resume: image order, noise and timesteps continue exactly, but with dataloader workers or "
+                          "batch_load_threads > 1 per-item randomness (caption dropout, token shuffle, crops) may "
+                          "land on different items, and with a reg dataset the image order restarts fresh. For an "
+                          "exact continuation use num_workers: 0 and batch_load_threads: 1.")
         if self.data_loader is not None:
             dataloader = self.data_loader
             skip = 0
@@ -2620,8 +2632,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 per_epoch = len(dataloader)
                 if per_epoch:
                     self._data_epoch, skip = divmod(self.step_num * self.train_config.gradient_accumulation, per_epoch)
-            self._seed_epoch_sampler(dataloader, 1, self._data_epoch)
-            dataloader_iterator = iter(dataloader)
+            if skip == 0 and self._data_epoch > 0:
+                # resumed exactly on an epoch boundary: let the first fetch take the in-loop epoch reset, like an
+                # uninterrupted run (creating an iterator draws a worker base seed from the global RNG, so creating
+                # it here instead would shift that step's noise and timesteps)
+                self._data_epoch -= 1
+                dataloader_iterator = iter(())
+            else:
+                if self.step_num > 0 and self.data_loader_reg is not None:
+                    # with reg batches interleaved the position can't be reconstructed: take a fresh order for
+                    # this resume rather than replaying epoch 0's
+                    self._seed_epoch_sampler(dataloader, 3, self.step_num)
+                else:
+                    self._seed_epoch_sampler(dataloader, 1, self._data_epoch)
+                dataloader_iterator = iter(dataloader)
             for _ in range(skip):
                 if dataloader.num_workers == 0 and hasattr(dataloader_iterator, '_next_index'):
                     dataloader_iterator._next_index()  # advance the sampler without loading the batch
@@ -2671,6 +2695,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         did_first_flush = False
         flush_next = False
         for step in range(start_step_num, self.train_config.steps):
+            self.step_num = step
+            # before any per-step randomness: parameter swapping, random CFG, batch fetching, noise and timesteps
+            self._reseed_step(step)
             if self.train_config.do_paramiter_swapping:
                 self.optimizer.optimizer.swap_paramiters()
             self.timer.start('train_loop')
@@ -2680,8 +2707,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if self.train_config.do_random_cfg:
                 self.train_config.do_cfg = True
                 self.train_config.cfg_scale = value_map(random.random(), 0, 1, 1.0, self.train_config.max_cfg_scale)
-            self.step_num = step
-            self._reseed_step(step)
             # default to true so various things can turn it off
             self.is_grad_accumulation_step = True
             if self.train_config.free_u:
