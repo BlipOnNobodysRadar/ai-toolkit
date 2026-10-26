@@ -122,12 +122,7 @@ def test_real_network_offload_grads_match(base_offload, net_offload, ckpt, micro
     assert not bad, f"{len(bad)}/{len(ref)} params off: " + ", ".join(f"{k}={e:.3g}" for k, e in sorted(bad.items())[:6])
 
 
-@pytest.mark.parametrize("base_offload", [None, 1.0], ids=["net", "base+net"])
-def test_staged_grads_survive_a_slow_copy(monkeypatch, base_offload):
-    """Regression (26 Oct 2026): conv2d_weight can return a channels_last grad. Returned as is, autograd can't adopt it
-    as .grad (its strides differ from the param's) and copies it on the host at once, before the async D2H has landed,
-    so a conv LoCon factor's first-micro-batch grad came out as zeros or garbage, now and then (3 in 12 audit runs).
-    Holding the grad stream back before each copy makes that race deterministic."""
+def slow_grad_copies(monkeypatch):
     stage = manager_modules._stage_grads_to_cpu
 
     def slow_copy(state, *args):
@@ -136,7 +131,39 @@ def test_staged_grads_survive_a_slow_copy(monkeypatch, base_offload):
         return stage(state, *args)
 
     monkeypatch.setattr(manager_modules, "_stage_grads_to_cpu", slow_copy)
-    ref, _ = grads(None, False, None, 1)
-    got, _ = grads(base_offload, True, None, 1)
+
+
+@pytest.mark.parametrize("micro_batches", [1, 4])
+@pytest.mark.parametrize("base_offload", [None, 1.0], ids=["net", "base+net"])
+def test_staged_grads_survive_a_slow_copy(monkeypatch, base_offload, micro_batches):
+    """Regression (26 Oct 2026): conv2d_weight can return a channels_last grad. Returned as is, autograd can't adopt it
+    as .grad (its strides differ from the param's) and copies it on the host at once, before the async D2H has landed,
+    so a conv LoCon factor's first-micro-batch grad came out as zeros or garbage, now and then (3 in 12 audit runs).
+    Holding the grad stream back before each copy makes that race deterministic."""
+    slow_grad_copies(monkeypatch)
+    ref, _ = grads(None, False, None, micro_batches)
+    got, _ = grads(base_offload, True, None, micro_batches)
     bad = {k: e for k, e in rel_errors(got, ref).items() if e > 2e-3}
     assert not bad, f"{len(bad)}/{len(ref)} params off: " + ", ".join(f"{k}={e:.3g}" for k, e in sorted(bad.items())[:6])
+
+
+def test_grad_hooks_see_landed_grads(monkeypatch):
+    """Fused optimizers (Automagic 3/4 by default) step inside a post-accumulate grad hook, which runs as soon as
+    backward returns: before the trainer's sync_grad_transfers(). What a hook sees must already be the real grad."""
+    slow_grad_copies(monkeypatch)
+    ref, _ = grads(None, False, None, 1)
+    seen = {}
+    real_build = build
+
+    def build_with_hooks(*args):
+        model, net = real_build(*args)
+        for n, p in net.named_parameters():
+            if p.requires_grad:
+                p.register_post_accumulate_grad_hook(lambda t, n=n: seen.__setitem__(n, t.grad.detach().float().cpu().clone()))
+        return model, net
+
+    monkeypatch.setitem(globals(), "build", build_with_hooks)
+    grads(None, True, None, 1)
+    bad = {k: e for k, e in rel_errors(seen, ref).items() if e > 2e-3}
+    assert not bad, f"{len(bad)}/{len(ref)} hooks saw an unlanded grad: " + ", ".join(
+        f"{k}={e:.3g}" for k, e in sorted(bad.items())[:6])
