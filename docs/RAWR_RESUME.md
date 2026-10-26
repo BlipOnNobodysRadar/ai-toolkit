@@ -80,6 +80,21 @@ retains its warning and continuation behavior.
 
 ## Stochastic continuation
 
+Two mechanisms cover this, and only one is active in a given run.
+
+**Per-step reseeding (the default with a `training_seed`).** `train.reseed_per_step` (on unless set false)
+reseeds Python, NumPy and Torch (all devices) from (seed, step) at the top of every loop step. It seeds the
+training sampler per epoch, and on resume skips the batches an uninterrupted run would already have consumed.
+Any scheduler, GPU, cached latents and EDM2 work; see `train.reseed_per_step` in `toolkit/config_modules.py`
+for the limits (loader workers, parallel batch loading, reg datasets).
+- **The recorded path stands aside.** Version-3 files store `supported: false` with the reseeding reason, and no
+  warning is printed.
+- **Pairs still carry the rest:** the learnable SNR state and a dataset identity travel in `training_state`. Resume
+  restores the SNR exactly and warns if images, captions or dataset configuration changed.
+- **Mode changes are refused:** a checkpoint recorded with reseeding off refuses to resume with it on. Set
+  `reseed_per_step: false` to continue such a run.
+
+**Recorded state (reseeding off: no `training_seed`, or `reseed_per_step: false`).**
 The serial CPU `SDTrainer`/`StableDiffusion` image path records Torch CPU, Python,
 and NumPy RNG states, each loader's actual shuffled index order and cursor, and
 dataset batch/crop layout and epoch. Resume restores the iterator state before
@@ -111,9 +126,13 @@ normal LoRA serialization, on-disk optimizer state, real metadata loading,
 Accelerate preparation, and an interruption immediately after a normal save.
 
 The supported tiny CPU diffusion path is tested with normal stochastic noise
-and shuffled two-image data, without per-step RNG reseeding. Uninterrupted and
-resumed parameters, optimizer state, scheduler state and RNG must match exactly.
-That claim does not extend to unsupported paths described above.
+and shuffled two-image data, once with the recorded state (reseeding off) and
+once with per-step reseeding. In both modes, uninterrupted and resumed
+parameters, optimizer state, scheduler state, pending gradients and RNG must
+match exactly. That claim does not extend to unsupported paths described above.
+`tests/test_resume_rng.py` covers per-step reseeding separately: every
+micro-batch draw (images, timesteps, noise) across mid-epoch, epoch-boundary,
+bucketed and non-RAWR resumes.
 
 `tests/test_rawr_trainer_continuity.py` exercises the actual SDTrainer update
 hook and BaseSDTrainProcess save with scalar CPU fixtures, periodic/end-step

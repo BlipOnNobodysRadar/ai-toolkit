@@ -84,10 +84,13 @@ def _datasets(loader):
 
 def dataset_identity(dataset):
     files = []
+    captions = dataset.caption_dict or {}
     for item in dataset.file_list:
-        # DatasetConfig normalizes the dot; match CaptionProcessingDTOMixin.load_caption.
+        # Only the caption source actually read counts: a caption_dict entry wins over the sidecar file
+        # (CaptionProcessingDTOMixin.load_caption), whose dot DatasetConfig normalizes.
+        from_dict = 'caption' in (captions.get(item.path) or {})
         caption = os.path.splitext(item.path)[0] + item.dataset_config.caption_ext
-        files.append([_file_stamp(item.path), _file_stamp(caption), item.flip_x, item.flip_y])
+        files.append([_file_stamp(item.path), None if from_dict else _file_stamp(caption), item.flip_x, item.flip_y])
     configs = [vars(c) for c in dataset.source_configs]
     encoded = json.dumps({'files': files, 'configs': configs, 'captions': dataset.caption_dict},
                          sort_keys=True, default=lambda obj: vars(obj)).encode()
@@ -118,6 +121,15 @@ def _restore_dataset(dataset, state):
 
 
 SNR_PARAMETERS = ('offset_1', 'offset_2', 'gamma', 'scale')
+
+
+def snr_capturable(trainer):
+    """Only the standard LearnableSNRGamma's state is known; a custom SNR class keeps its own legacy JSON."""
+    snr = getattr(trainer, 'snr_gos', None)
+    if snr is None:
+        return True
+    from toolkit.train_tools import LearnableSNRGamma
+    return type(snr) is LearnableSNRGamma
 
 
 def snr_state(trainer):
@@ -190,11 +202,8 @@ def unsupported_reason(trainer):
         return 'sampling/validation after a checkpoint may consume unsaved RNG'
     if trainer.ema is not None or getattr(trainer, 'training_extras', None) is not None:
         return 'EMA/auxiliary state is outside this continuation path'
-    snr = getattr(trainer, 'snr_gos', None)
-    if snr is not None:
-        from toolkit.train_tools import LearnableSNRGamma
-        if type(snr) is not LearnableSNRGamma:
-            return 'custom learnable SNR state is unavailable'
+    if not snr_capturable(trainer):
+        return 'custom learnable SNR state is unavailable'
     if getattr(trainer.sd, 'is_multistage', False):
         return 'multistage model state is not recorded'
     if trainer.train_config.do_paramiter_swapping:
@@ -229,6 +238,10 @@ class StochasticResume:
         self.trainer = trainer
         self.reason = unsupported_reason(trainer)
         self.streams = []
+        if saved is not None and saved.get('reason') == RESEEDED and self.reason != RESEEDED:
+            raise ValueError('Cannot restore RAWR stochastic state: this checkpoint was saved with per-step reseeding '
+                             '(train.reseed_per_step with a training_seed); resume it with reseeding on, or start a '
+                             'new output folder')
         if saved is not None and saved.get('supported') and self.reason:
             hint = ('; this checkpoint recorded its RNG and data state with train.reseed_per_step off, so resume it '
                     'with reseed_per_step: false' if self.reason == RESEEDED else '')
@@ -289,6 +302,6 @@ class StochasticResume:
         # Call only AFTER constructing DataLoader iterators and all startup work.
         if saved is not None and saved.get('supported'):
             restore_rng(saved['rng'])
-        elif self.trainer.step_num > 0:
+        elif self.trainer.step_num > 0 and self.reason != RESEEDED:
             warnings.warn('RAWR checkpoint has no restorable RNG/data state; stochastic continuation is approximate',
                           RuntimeWarning)

@@ -20,6 +20,9 @@ from training_extras.optim import create_optimizer, create_scheduler
 
 @pytest.fixture(autouse=True)
 def cpu_only(monkeypatch):
+    # In a mixed suite an earlier GPU test may already have initialized CUDA; the patched entry points below still
+    # forbid any new CUDA use here, so only a CUDA-free process can also assert that nothing initialized it.
+    already = torch.cuda.is_initialized()
     def forbidden(*args, **kwargs):
         raise AssertionError('CUDA operation in CPU regression')
     for name in ('_lazy_init', 'init', 'current_device', 'synchronize'):
@@ -28,7 +31,7 @@ def cpu_only(monkeypatch):
     monkeypatch.setattr(torch.accelerator, 'current_accelerator', lambda *a, **kw: None)
     AcceleratorState._reset_state(reset_partial_state=True)
     yield
-    assert not torch.cuda.is_initialized()
+    assert already or not torch.cuda.is_initialized()
     AcceleratorState._reset_state(reset_partial_state=True)
 
 

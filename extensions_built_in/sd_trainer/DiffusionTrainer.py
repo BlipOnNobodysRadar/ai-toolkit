@@ -195,8 +195,9 @@ class DiffusionTrainer(SDTrainer):
             if self.progress_bar is not None:
                 self.progress_bar.pause()
             print_acc(f"\nSaving at step {self.step_num}")
-            # clear any grads
-            self.optimizer.zero_grad()
+            # clear any grads, except that RAWR checkpoints keep unfinished microbatches (as the periodic save does)
+            if getattr(self, '_rawr_checkpoint_config', None) is None:
+                self.optimizer.zero_grad()
             self.save(self.step_num)
             self.ensure_params_requires_grad()
             flush()

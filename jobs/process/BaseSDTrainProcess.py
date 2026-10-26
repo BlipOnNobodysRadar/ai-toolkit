@@ -2672,10 +2672,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
             concurrent = [d.folder_path for d in (self.datasets or []) + (self.datasets_reg or [])
                           if getattr(d, 'num_workers', 0) > 0 or getattr(d, 'batch_load_threads', 1) > 1]
             if concurrent or self.data_loader_reg is not None:
-                print_acc("Resume: image order, noise and timesteps continue exactly, but with dataloader workers or "
-                          "batch_load_threads > 1 per-item randomness (caption dropout, token shuffle, crops) may "
-                          "land on different items, and with a reg dataset the image order restarts fresh. For an "
-                          "exact continuation use num_workers: 0 and batch_load_threads: 1.")
+                print_acc("Resume: continuing close to, but not exactly like, an uninterrupted run. With dataloader "
+                          "workers or batch_load_threads > 1, per-item randomness (caption dropout, token shuffle, "
+                          "crops) can land on different items, and an epoch-boundary resume can shift that step's "
+                          "noise and timesteps; with a reg dataset the image order restarts fresh. For an exact "
+                          "continuation use num_workers: 0, batch_load_threads: 1 and no reg dataset.")
         if self.data_loader is not None:
             dataloader = self.data_loader
             skip = 0

@@ -168,9 +168,11 @@ def training_state(trainer, checkpoint_step):
         result['stochastic'] = stochastic.state_dict()
     if stochastic is None or not result['stochastic'].get('supported'):
         # Outside the recorded-state path (e.g. with per-step reseeding) the learnable SNR state and the data
-        # identity still travel with the pair; the recorded path keeps its own copies.
-        from training_extras.rawr_stochastic import loader_identities, snr_state
-        result['snr'] = snr_state(trainer)
+        # identity still travel with the pair; the recorded path keeps its own copies. A custom SNR class is
+        # left to its legacy JSON, as before.
+        from training_extras.rawr_stochastic import loader_identities, snr_capturable, snr_state
+        if snr_capturable(trainer):
+            result['snr'] = snr_state(trainer)
         result['dataset_identity'] = loader_identities(trainer)
     return result
 
@@ -184,10 +186,10 @@ def restore_auxiliary_state(trainer, captured):
     stochastic = state.get('stochastic')
     if isinstance(stochastic, dict) and stochastic.get('supported'):
         return  # StochasticResume restored SNR and validated the datasets itself
-    from training_extras.rawr_stochastic import loader_identities, restore_snr
+    from training_extras.rawr_stochastic import loader_identities, restore_snr, snr_capturable
     if 'snr' in state:
         restore_snr(trainer, state['snr'])
-    elif getattr(trainer, 'snr_gos', None) is not None:
+    elif getattr(trainer, 'snr_gos', None) is not None and snr_capturable(trainer):
         warnings.warn('RAWR checkpoint predates learnable SNR capture; SNR state restarts', RuntimeWarning)
     saved = state.get('dataset_identity')
     if saved is not None and saved != loader_identities(trainer):

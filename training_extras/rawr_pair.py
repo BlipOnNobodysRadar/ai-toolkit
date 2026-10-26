@@ -49,14 +49,10 @@ def begin(trainer):
     previous = _manifest(trainer.save_root)
     # Learnable SNR state now travels in the pair either way (recorded-state path or training_state['snr']);
     # only custom SNR classes, whose state isn't captured, keep the pair off.
-    snr = getattr(trainer, 'snr_gos', None)
-    unsupported_snr = False
-    if snr is not None:
-        from toolkit.train_tools import LearnableSNRGamma
-        unsupported_snr = type(snr) is not LearnableSNRGamma
+    from training_extras.rawr_stochastic import snr_capturable
     if (trainer.network is None or trainer.is_fine_tuning
             or trainer.train_config.merge_network_on_save
-            or unsupported_snr
+            or not snr_capturable(trainer)
             or any(getattr(trainer, attr, None) is not None for attr in
                    ('embedding', 'adapter', 'decorator', 'ema', 'training_extras'))):
         if previous is not None:
