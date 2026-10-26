@@ -121,10 +121,20 @@ def _release_backward_weight_slot(state, idx):
 def _match_param_layout(grad, param):
     """A grad whose strides or dtype differ from its param's (conv2d_weight can return channels_last) is not adopted
     as .grad by autograd: it is cast or copied on the host as soon as backward returns, before the async D2H below
-    has landed. Give it the param's layout on the device first, so the returned CPU tensor is adopted untouched."""
+    has landed. Give it the param's layout on the device first (empty_like keeps a dense param's strides and falls
+    back to contiguous otherwise, as autograd's own layout contract does), so the CPU tensor is adopted as is."""
     if grad is None or (grad.stride() == param.stride() and grad.dtype == param.dtype):
         return grad
-    return torch.empty_strided(param.shape, param.stride(), dtype=param.dtype, device=grad.device).copy_(grad)
+    return torch.empty_like(param, device=grad.device).copy_(grad)
+
+
+def _reads_grad_on_return(param):
+    """Grad hooks run on the autograd engine thread as soon as backward returns, before sync_grad_transfers(). Fused
+    optimizers (Automagic 3/4 with fused=True, the default; adafactor and adam8bit stochastic accumulation) step
+    inside a post-accumulate hook, so the staged copy must have landed before we return it."""
+    return param is not None and bool(
+        getattr(param, "_post_accumulate_grad_hooks", None) or getattr(param, "_backward_hooks", None)
+    )
 
 
 def _stage_grads_to_cpu(state, idx, grad_w_gpu, grad_b_gpu, weight_param, bias_param):
@@ -146,7 +156,9 @@ def _stage_grads_to_cpu(state, idx, grad_w_gpu, grad_b_gpu, weight_param, bias_p
 
     The staged grads take the param's strides and dtype first (_match_param_layout): otherwise autograd copies or
     casts the returned tensor on the host straight away, which on the first micro-batch (no .grad yet, so no sync
-    here) read the pinned buffer before the copy landed."""
+    here) read the pinned buffer before the copy landed. Adoption without a host read also assumes an ordinary
+    backward (no create_graph). A param with grad hooks is synchronized here too (_reads_grad_on_return): its
+    hooks read .grad before any caller could join the grad stream."""
     gs = state["transfer_grad_stream"]
     if grad_w_gpu is not None:
         grad_w_gpu = state["w_grad_buffers"][idx] = _match_param_layout(grad_w_gpu, weight_param)
@@ -161,8 +173,8 @@ def _stage_grads_to_cpu(state, idx, grad_w_gpu, grad_b_gpu, weight_param, bias_p
         if grad_b_gpu is not None:
             grad_b_cpu = grad_b_gpu.to("cpu", non_blocking=True)
         state["grad_xfer_done"][idx].record()
-    if (grad_w_cpu is not None and weight_param.grad is not None) or (
-        grad_b_cpu is not None and bias_param.grad is not None
+    if (grad_w_cpu is not None and (weight_param.grad is not None or _reads_grad_on_return(weight_param))) or (
+        grad_b_cpu is not None and (bias_param.grad is not None or _reads_grad_on_return(bias_param))
     ):
         state["grad_xfer_done"][idx].synchronize()
     return grad_w_cpu, grad_b_cpu
