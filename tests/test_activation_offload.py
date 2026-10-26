@@ -197,14 +197,66 @@ def test_without_checkpointing_flag_is_ignored(stash_log):
     assert_identical(plain, offloaded)
 
 
-def test_skips_inputs_that_do_not_own_their_storage():
-    base = torch.randn(4, 8, requires_grad=True)
-    view = base[:, :4]  # a view into a larger storage
-    out = (view * 2).sum(dim=1, keepdim=True)
+@pytest.mark.parametrize("make_view", [lambda b: b[:, :4], lambda b: b.view_as(b), lambda b: b.detach()],
+                         ids=["slice", "full-size-alias", "detached-alias"])
+def test_skips_inputs_that_do_not_own_their_storage(make_view):
+    base = (torch.randn(4, 8) * 1).requires_grad_(True)
+    view = make_view(base)
+    w = torch.ones(view.shape[-1], requires_grad=True)  # so the output needs grad for every variant
+    out = (view * w).sum(dim=1, keepdim=True)
     offloader = ActivationOffloader()
     offloader.stash(view, out)
-    assert offloader.num_offloaded == 0
+    assert offloader.num_offloaded == 0 and offloader.num_skipped == 1
     assert base.untyped_storage().nbytes() == base.numel() * base.element_size()
+
+
+def test_sole_owner_is_offloaded():
+    x = torch.randn(4, 8) * 1
+    out = (x * torch.ones(8, requires_grad=True)).sum(dim=1, keepdim=True)
+    offloader = ActivationOffloader()
+    offloader.stash(x, out)
+    assert offloader.num_offloaded == 1 and x.untyped_storage().nbytes() == 0
+
+
+def test_refilled_inputs_are_released_block_by_block(monkeypatch):
+    """Weak references only: at each refill at most two block inputs hold memory (the one just refilled and the
+    one whose block finished last), and none after backward."""
+    import weakref
+
+    refs, alive_at_refill = [], []
+    orig = ActivationOffloader.stash
+
+    def recording(self, block_input, block_output):
+        before = self.num_offloaded
+        orig(self, block_input, block_output)
+        if self.num_offloaded > before:
+            refs.append(weakref.ref(block_input))
+
+            def count(_grad):  # registered after the refill hook, so it runs right after it
+                alive_at_refill.append(
+                    sum(1 for r in refs if r() is not None and r().untyped_storage().nbytes() > 0)
+                )
+
+            block_output.register_hook(count)
+
+    monkeypatch.setattr(ActivationOffloader, "stash", recording)
+    model = build(num_layers=6)
+    model.activation_offloading = True
+    video_out, audio_out = model(**make_inputs(model.params))
+    assert len(refs) == 6
+    assert all(r() is None or r().untyped_storage().nbytes() == 0 for r in refs)
+    loss = loss_of(video_out, audio_out)
+    loss.backward()
+    assert len(alive_at_refill) == 6 and max(alive_at_refill) <= 2, alive_at_refill
+    del video_out, audio_out, loss
+    assert all(r() is None or r().untyped_storage().nbytes() == 0 for r in refs)
+
+
+def test_compile_is_refused_with_activation_offloading():
+    from toolkit.config_modules import ModelConfig
+
+    with pytest.raises(ValueError, match="eager-only"):
+        ModelConfig(name_or_path="x", activation_offloading=True, compile=True)
 
 
 def test_model_config_flag_defaults_off():
@@ -220,12 +272,12 @@ def test_cuda_pinned_offload_identical_and_saves_memory(monkeypatch):
     block inputs dominate, and a peak-memory comparison."""
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
-    hosts = []
+    hosts = []  # flags only: holding the buffers would mask host-buffer lifetime bugs
     orig_host = ActivationOffloader._host_buffer
 
     def recording_host(self, t):
         buf, pinned = orig_host(self, t)
-        hosts.append((buf, pinned))
+        hosts.append(pinned and buf.is_pinned())
         return buf, pinned
 
     monkeypatch.setattr(ActivationOffloader, "_host_buffer", recording_host)
@@ -256,7 +308,7 @@ def test_cuda_pinned_offload_identical_and_saves_memory(monkeypatch):
     plain, _ = measured(False, SDPBackend.MATH)
     offloaded, _ = measured(True, SDPBackend.MATH)
     assert_identical(plain, offloaded)
-    assert hosts and all(pinned and buf.is_pinned() for buf, pinned in hosts)
+    assert hosts and all(hosts)
 
     # memory under the memory-efficient kernel, whose O(S) footprint doesn't swamp the block inputs
     _, peak_plain = measured(False, SDPBackend.EFFICIENT_ATTENTION)

@@ -821,6 +821,10 @@ class ModelConfig:
         self.compile_mode = kwargs.get("compile_mode", "default")
         self.compile_fullgraph = kwargs.get("compile_fullgraph", False)
         self.compile_dynamic = kwargs.get("compile_dynamic", True)
+        if self.activation_offloading and self.compile:
+            # activation offloading frees and refills storages and registers hooks from Python between blocks,
+            # which compiled graphs can neither capture nor be trusted around
+            raise ValueError("activation_offloading is eager-only; turn off model.compile to use it")
         self.cache_size_limit = kwargs.get("cache_size_limit", None)
         
         # kwargs to pass to the model

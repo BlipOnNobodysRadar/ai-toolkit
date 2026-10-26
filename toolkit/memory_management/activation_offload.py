@@ -11,14 +11,20 @@ a hook on the block's output gradient copies it back just before that block's ba
 object itself never changes (same shape, strides, version counter), so torch.utils.checkpoint (non-reentrant)
 unpacks it as if nothing happened and the math is bit-identical. Gradients never pass through the CPU.
 
-Ordering: both copies are queued on the current stream, the one the block computes on, so the D2H is ordered
-before any reuse of the freed block (the caching allocator recycles it only within that stream) and the H2D is
-ordered before the recompute. The host buffer is pinned on CUDA, so neither copy blocks the host and the layer
-offloading ring keeps running ahead. Pinned buffers come from torch's caching host allocator and are reused
-across steps.
+Ordering: both copies are queued on the current stream. That must be the one stream the blocks compute on (true
+for the eager, single-stream training here; side-stream forwards would need explicit events). The D2H is then
+ordered before any reuse of the freed block (the caching allocator recycles it only within that stream) and the
+H2D before the recompute. The host buffer is pinned on CUDA, so neither copy blocks the host and the layer
+offloading ring keeps running ahead. Pinned buffers come from torch's caching host allocator, which records the
+copy's stream event before reusing them, and are reused across steps.
 
-Only plain, fully owned, contiguous inputs whose block output requires grad are offloaded; anything else is left
-on the device (frozen block ranges, inference, views into a larger storage).
+Only inputs that are the sole owner of their storage (no view, no other tensor or storage handle sharing it),
+contiguous, and whose block output requires grad are offloaded; anything else stays on the device (frozen block
+ranges, inference, aliases). Eager only: ModelConfig refuses activation_offloading together with compile.
+
+Limits: relies on torch.utils.checkpoint (non-reentrant) keeping the saved input as the same tensor object (true in
+torch 2.13; version-sensitive). With retain_graph=True the refilled inputs stay alive with the retained graph, so
+the saving only holds until the first backward.
 """
 
 from typing import List, Optional
@@ -28,16 +34,26 @@ import torch
 from toolkit.print import print_acc
 
 
+_storage_use_count = getattr(torch._C, "_storage_Use_Count", None)
+
+
 def _owns_whole_storage(t: torch.Tensor) -> bool:
-    """True when ``t`` is the only view of a storage sized exactly to it, so freeing that storage frees ``t`` and
-    nothing else, and refilling it restores ``t`` exactly."""
-    if t.is_sparse or not t.is_contiguous() or t.storage_offset() != 0:
+    """True when ``t`` is the only tensor on a storage sized exactly to it, so freeing that storage frees ``t`` and
+    nothing else, and refilling it restores ``t`` exactly. A full-size alias (``x.view_as(x)``) passes every
+    shape check, so ownership is checked on the storage's reference count: ``t``'s own reference plus the handle
+    taken here."""
+    if t.is_sparse or t._base is not None or not t.is_contiguous() or t.storage_offset() != 0:
         return False
     try:
         storage = t.untyped_storage()
     except (RuntimeError, NotImplementedError):
         return False
-    return storage.nbytes() == t.numel() * t.element_size() and storage.nbytes() > 0
+    if storage.nbytes() != t.numel() * t.element_size() or storage.nbytes() == 0:
+        return False
+    if _storage_use_count is None:
+        # without the count, a full-size alias can't be ruled out
+        return False
+    return _storage_use_count(storage._cdata) == 2
 
 
 class ActivationOffloader:
@@ -49,6 +65,7 @@ class ActivationOffloader:
 
     def __init__(self):
         self.num_offloaded = 0
+        self.num_skipped = 0
         self.bytes_offloaded = 0
 
     def _host_buffer(self, t: torch.Tensor):
@@ -71,8 +88,10 @@ class ActivationOffloader:
             and isinstance(block_output, torch.Tensor)
             and block_output.requires_grad
             and isinstance(block_input, torch.Tensor)
-            and _owns_whole_storage(block_input)
         ):
+            return
+        if not _owns_whole_storage(block_input):
+            self.num_skipped += 1
             return
         x = block_input
         host, pinned = self._host_buffer(x)
@@ -107,9 +126,10 @@ class ActivationOffloader:
         self.bytes_offloaded += nbytes
 
     def log_once(self) -> None:
-        if self.num_offloaded and not ActivationOffloader._logged:
+        if (self.num_offloaded or self.num_skipped) and not ActivationOffloader._logged:
             ActivationOffloader._logged = True
             print_acc(
                 f"activation offloading: {self.num_offloaded} block inputs, "
                 f"{self.bytes_offloaded / 2**30:.2f} GiB per forward kept in CPU RAM"
+                + (f"; {self.num_skipped} skipped (not sole owner of their storage)" if self.num_skipped else "")
             )
