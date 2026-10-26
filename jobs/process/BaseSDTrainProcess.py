@@ -1767,6 +1767,31 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if was_unet_training:
             self.sd.unet.train()
 
+    def _rng_seed(self, *parts):
+        """A seed derived from training_seed and parts (stream, step or epoch); None when train.reseed_per_step is
+        off or no training_seed is set. Deriving per step makes a resumed run draw what an uninterrupted one would,
+        instead of replaying the opening steps from the process-start seed."""
+        if self.training_seed is None or not getattr(self.train_config, 'reseed_per_step', True):
+            return None
+        seed = int(self.training_seed)
+        for part in parts:
+            seed = (seed * 1000003 + int(part) + 1) % (2 ** 61 - 1)
+        return seed
+
+    def _reseed_step(self, step):
+        seed = self._rng_seed(0, step)
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed % (2 ** 32))
+            torch.manual_seed(seed)  # all devices
+
+    def _seed_epoch_sampler(self, dataloader, stream, epoch):
+        # the shuffling sampler gets its own per-epoch generator, independent of the global RNG
+        seed = self._rng_seed(stream, epoch)
+        sampler = getattr(dataloader, 'sampler', None)
+        if seed is not None and isinstance(sampler, torch.utils.data.RandomSampler):
+            sampler.generator = torch.Generator().manual_seed(seed)
+
     def run(self):
         # torch.autograd.set_detect_anomaly(True)
         # run base process run
@@ -2586,15 +2611,30 @@ class BaseSDTrainProcess(BaseTrainProcess):
         else:
             self.progress_bar = None
 
+        self._data_epoch = 0
         if self.data_loader is not None:
             dataloader = self.data_loader
+            skip = 0
+            if self.step_num > 0 and self.data_loader_reg is None and self._rng_seed(1, 0) is not None:
+                # resumed: continue in the epoch, and at the batch, an uninterrupted run would be at
+                per_epoch = len(dataloader)
+                if per_epoch:
+                    self._data_epoch, skip = divmod(self.step_num * self.train_config.gradient_accumulation, per_epoch)
+            self._seed_epoch_sampler(dataloader, 1, self._data_epoch)
             dataloader_iterator = iter(dataloader)
+            for _ in range(skip):
+                if dataloader.num_workers == 0 and hasattr(dataloader_iterator, '_next_index'):
+                    dataloader_iterator._next_index()  # advance the sampler without loading the batch
+                else:
+                    next(dataloader_iterator)
         else:
             dataloader = None
             dataloader_iterator = None
 
         if self.data_loader_reg is not None:
             dataloader_reg = self.data_loader_reg
+            # fresh (not replayed) order on resume; reg interleaving is not reconstructed exactly
+            self._seed_epoch_sampler(dataloader_reg, 2, self.step_num)
             dataloader_iterator_reg = iter(dataloader_reg)
         else:
             dataloader_reg = None
@@ -2641,6 +2681,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.train_config.do_cfg = True
                 self.train_config.cfg_scale = value_map(random.random(), 0, 1, 1.0, self.train_config.max_cfg_scale)
             self.step_num = step
+            self._reseed_step(step)
             # default to true so various things can turn it off
             self.is_grad_accumulation_step = True
             if self.train_config.free_u:
@@ -2673,6 +2714,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         except StopIteration:
                             with self.timer('reset_batch:reg'):
                                 # hit the end of an epoch, reset
+                                self._seed_epoch_sampler(dataloader_reg, 2, step)
                                 dataloader_iterator_reg = iter(dataloader_reg)
                                 trigger_dataloader_setup_epoch(dataloader_reg)
 
@@ -2686,6 +2728,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         except StopIteration:
                             with self.timer('reset_batch'):
                                 # hit the end of an epoch, reset
+                                self._data_epoch += 1
+                                self._seed_epoch_sampler(dataloader, 1, self._data_epoch)
                                 dataloader_iterator = iter(dataloader)
                                 trigger_dataloader_setup_epoch(dataloader)
                                 self.epoch_num += 1

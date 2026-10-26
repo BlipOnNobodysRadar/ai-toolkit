@@ -484,6 +484,11 @@ class TrainConfig:
         # this will do proper gradient accumulation where you will not see a step until the end of the accumulation
         # the method above will show a step every accumulation
         self.gradient_accumulation = kwargs.get('gradient_accumulation', 1)
+
+        # With a training_seed: reseed every RNG at the start of each step from (seed, step), and the data sampler
+        # from (seed, epoch), so a resumed run draws exactly what an uninterrupted one would. Without it a resume
+        # reseeds from training_seed and replays the opening steps' images, noise and timesteps.
+        self.reseed_per_step = bool(kwargs.get('reseed_per_step', True))
         if self.gradient_accumulation > 1:
             if self.gradient_accumulation_steps != 1:
                 raise ValueError("gradient_accumulation and gradient_accumulation_steps are mutually exclusive")
