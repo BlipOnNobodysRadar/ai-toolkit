@@ -115,6 +115,9 @@ def get_optimizer(
             lr=float(learning_rate),
             **optimizer_params,
         )
+    elif lower_type == 'automagic4':
+        from toolkit.optimizers.automagic4 import Automagic4
+        optimizer = Automagic4(params, lr=float(learning_rate), **optimizer_params)
     elif lower_type == 'automagicexperiment':
         from toolkit.optimizers.automagicEXPERIMENT import AutomagicEXPERIMENT
         optimizer = AutomagicEXPERIMENT(params, lr=float(learning_rate), **optimizer_params)
