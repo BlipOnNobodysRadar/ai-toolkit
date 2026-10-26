@@ -744,10 +744,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if rawr_pair_save is not None:
                     rawr_pair.commit(self.save_root, rawr_pair_save, state_dict,
                                      rawr_model_alias, lora_name, checkpoint_step, rawr_model_export)
-                elif getattr(self, '_rawr_checkpoint_config', None) is not None:
-                    rawr_checkpoint.atomic_save(state_dict, file_path)
                 else:
-                    torch.save(state_dict, file_path)
+                    # Write a new file and swap the name, never rewrite in place: an interrupted save keeps the
+                    # previous optimizer.pt, and in a folder that once held RAWR pairs optimizer.pt may be a hard
+                    # link to a committed slot (rawr_pair._hard_link), which an in-place write would corrupt.
+                    rawr_checkpoint.atomic_save(state_dict, file_path)
                 print_acc(f"Saved optimizer to {file_path}")
             except Exception as e:
                 if getattr(self, '_rawr_checkpoint_config', None) is not None:

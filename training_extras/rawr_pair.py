@@ -80,7 +80,20 @@ def _write_manifest(value, path):
             os.unlink(temp)
 
 
-def _publish(source, target, writer=None):
+def _hard_link(source, temp):
+    """Point temp at source's bytes instead of copying them: an optimizer slot runs to gigabytes, and a full copy per
+    save doubled the bytes written. Safe only because nothing rewrites these files in place: atomic_save gives a slot
+    a new file and swaps the name, and the trainer's plain optimizer.pt save is atomic too. False where links aren't
+    available (FAT/exFAT, another volume); the caller then copies."""
+    try:
+        os.unlink(temp)
+        os.link(source, temp)
+        return True
+    except OSError:
+        return False
+
+
+def _publish(source, target, writer=None, link=False):
     temp = None
     try:
         with tempfile.NamedTemporaryFile(mode='wb', prefix='.rawr-export.', suffix=os.path.splitext(target)[1],
@@ -89,7 +102,7 @@ def _publish(source, target, writer=None):
         # Close the temporary handle before serializers reopen it on Windows.
         if writer is not None:
             writer(temp)
-        else:
+        elif not (link and _hard_link(source, temp)):
             with open(source, 'rb') as src, open(temp, 'wb') as f:
                 shutil.copyfileobj(src, f, 1024 * 1024)
         with open(temp, 'r+b') as f:
@@ -97,7 +110,7 @@ def _publish(source, target, writer=None):
         os.replace(temp, target)
         temp = None
     finally:
-        if temp is not None:
+        if temp is not None and os.path.lexists(temp):
             os.unlink(temp)
 
 
@@ -117,10 +130,12 @@ def commit(root, pair, state, model_alias, name, step, export_model=None):
     _write_manifest(manifest, os.path.join(root, MANIFEST))
     # The transaction is committed. Alias errors must not turn a committed save
     # into a reported failed transaction; native resume uses the manifest.
-    for source, target, writer in ((pair['model'], model_alias, export_model),
-                                  (pair['optimizer'], os.path.join(root, 'optimizer.pt'), None)):
+    # The optimizer alias is a hard link to its slot where the volume allows it (the model alias is a separate
+    # export at the save dtype, and the slot model is written in place, so it is never linked).
+    for source, target, writer, link in ((pair['model'], model_alias, export_model, False),
+                                        (pair['optimizer'], os.path.join(root, 'optimizer.pt'), None, True)):
         try:
-            _publish(source, target, writer)
+            _publish(source, target, writer, link)
         except Exception as exc:
             warnings.warn(f'RAWR pair committed, but export alias {target} could not be updated: {exc}', RuntimeWarning)
 
