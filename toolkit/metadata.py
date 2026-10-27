@@ -2,6 +2,7 @@ import json
 from collections import OrderedDict
 from io import BytesIO
 
+import psutil
 import safetensors
 from safetensors import safe_open
 
@@ -36,6 +37,16 @@ def add_model_hash_to_meta(state_dict, meta: OrderedDict) -> OrderedDict:
     # sd_models.model_hash(), only retain the training metadata for purposes of
     # calculating the hash, as they are meant to be immutable
     metadata = {k: v for k, v in meta.items() if k.startswith("ss_")}
+
+    # The hash serialises the whole file in RAM first. For a large LoRA saved at training precision (an r512 RAWR
+    # pair is about 20 GB) that copy can exhaust host memory mid-save, so skip the hash when the copy would take
+    # more than half the available RAM. Only sd-webui-additional-networks reads these keys.
+    size = sum(t.numel() * t.element_size() for t in state_dict.values())
+    available = psutil.virtual_memory().available
+    if size * 2 > available:
+        print(f"Skipping the model hash: it would serialise {size / 2**30:.1f} GiB in RAM "
+              f"with {available / 2**30:.1f} GiB available")
+        return meta
 
     bytes = safetensors.torch.save(state_dict, metadata)
     b = BytesIO(bytes)
