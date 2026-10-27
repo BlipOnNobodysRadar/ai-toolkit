@@ -40,7 +40,11 @@ def add_model_hash_to_meta(state_dict, meta: OrderedDict) -> OrderedDict:
 
     # The hash serialises the whole file in RAM first. For a large LoRA saved at training precision (an r512 RAWR
     # pair is about 20 GB) that copy can exhaust host memory mid-save, so skip the hash when the copy would take
-    # more than half the available RAM. Only sd-webui-additional-networks reads these keys.
+    # more than half the available RAM, or when the allocation fails anyway (Windows commit limits are not what
+    # psutil reports). Only sd-webui-additional-networks reads these keys. Drop any carried over from a source
+    # file, so a skipped hash never leaves a stale one.
+    meta.pop("sshs_model_hash", None)
+    meta.pop("sshs_legacy_hash", None)
     size = sum(t.numel() * t.element_size() for t in state_dict.values())
     available = psutil.virtual_memory().available
     if size * 2 > available:
@@ -48,7 +52,14 @@ def add_model_hash_to_meta(state_dict, meta: OrderedDict) -> OrderedDict:
               f"with {available / 2**30:.1f} GiB available")
         return meta
 
-    bytes = safetensors.torch.save(state_dict, metadata)
+    try:
+        bytes = safetensors.torch.save(state_dict, metadata)
+    except BaseException as e:
+        # Out of memory surfaces as MemoryError, or as a pyo3 PanicException when it happens inside safetensors.
+        if not isinstance(e, MemoryError) and type(e).__name__ != "PanicException":
+            raise
+        print(f"Skipping the model hash: serialising {size / 2**30:.1f} GiB failed ({type(e).__name__})")
+        return meta
     b = BytesIO(bytes)
 
     model_hash = addnet_hash_safetensors(b)
