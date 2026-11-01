@@ -36,8 +36,10 @@ class TrainingExtras(torch.nn.Module):
 
     def step(self): self.edm.step()
 
-    def checkpoint(self, path):
-        payload = {'config':self.config, 'module':self.state_dict(), 'dynamic':self.dynamic.state_dict()}
+    def checkpoint(self, path, step=None):
+        # step: completed training steps this state belongs to (what a resume restores into step_num)
+        payload = {'config':self.config, 'module':self.state_dict(), 'dynamic':self.dynamic.state_dict(),
+                   'step':None if step is None else int(step)}
         if self.edm.enabled:
             payload.update(optimizer=self.edm.aux_optimizer.state_dict(), scheduler=self.edm.aux_scheduler.state_dict())
         torch.save(payload, str(path)+'.tmp')
@@ -59,7 +61,34 @@ class TrainingExtras(torch.nn.Module):
             finally:model.train(training)
 
     def restore(self, path):
+        self._apply(torch.load(path, map_location='cpu', weights_only=True))
+
+    def restore_for_step(self, path, step_num, strict=True, log=print):
+        """Restore only state saved at the step being resumed. Returns 'restored', 'legacy' or 'stale'.
+
+        A fresh start (step 0) moves a leftover file aside instead of reviving an old run's EDM2 state;
+        a file from another step raises when strict (warns and restores otherwise); a file written
+        before steps were recorded is restored with a warning.
+        """
         data = torch.load(path, map_location='cpu', weights_only=True)
+        saved = data.get('step')
+        if saved is not None and int(saved) == int(step_num):
+            self._apply(data); return 'restored'
+        if int(step_num) == 0:
+            stale = f'{path}.stale-{int(os.path.getmtime(path))}'
+            os.replace(path, stale)
+            log(f'training_extras: fresh start but {path} holds state from step {saved if saved is not None else "unknown"}; moved it to {stale} and starting EDM2/dynamic weighting fresh')
+            return 'stale'
+        if saved is None:
+            log(f'training_extras: {path} has no recorded step (written before step tracking); restoring it for step {step_num} unchecked')
+            self._apply(data); return 'legacy'
+        msg = (f'training_extras: {path} was saved at step {saved} but training resumes at step {step_num}. '
+               'Delete or rename training_extras.pt to reset EDM2/dynamic loss weighting and resume.')
+        if strict: raise ValueError(msg)
+        log(msg + ' Restoring anyway because train.start_step overrides the step.')
+        self._apply(data); return 'restored'
+
+    def _apply(self, data):
         if data['config'] != self.config: raise ValueError('Loss configuration differs from saved training extras state')
         self.load_state_dict(data['module'])
         self.dynamic.load_state_dict(data['dynamic'])

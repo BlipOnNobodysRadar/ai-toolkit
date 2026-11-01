@@ -761,7 +761,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc("Could not save optimizer")
 
         if getattr(self, 'training_extras', None) is not None:
-            self.training_extras.checkpoint(os.path.join(self.save_root, 'training_extras.pt'))
+            # tag with completed_steps: the value a resume restores into step_num (checked on restore)
+            self.training_extras.checkpoint(os.path.join(self.save_root, 'training_extras.pt'),
+                                            step=self.meta['training_info']['completed_steps'])
         self.clean_up_saves()
         self.post_save_hook(file_path)
 

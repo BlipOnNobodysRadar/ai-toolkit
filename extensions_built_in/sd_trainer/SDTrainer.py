@@ -357,7 +357,9 @@ class SDTrainer(BaseSDTrainProcess):
             if self.training_extras.edm.enabled and self.train_config.dtype not in ('bf16','bfloat16','float32','fp32'):
                 raise ValueError('EDM2 currently requires BF16 or FP32 in this host; FP16 AMP is unsupported')
             state = os.path.join(self.save_root, 'training_extras.pt')
-            if os.path.exists(state): self.training_extras.restore(state)
+            if os.path.exists(state):
+                self.training_extras.restore_for_step(state, self.step_num,
+                                                      strict=self.train_config.start_step is None, log=print_acc)
         if self.is_caching_text_embeddings:
             # make sure model is on cpu for this part so we don't oom.
             self.sd.unet.to('cpu')
