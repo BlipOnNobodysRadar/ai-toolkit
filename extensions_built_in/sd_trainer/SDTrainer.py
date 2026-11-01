@@ -69,6 +69,20 @@ def latent_mask_multiplier(mask: torch.Tensor, latent_shape, mode: str = 'neares
     return (mask / mask.mean()).detach()
 
 
+def inverted_prior_mask_multiplier(mask: torch.Tensor, latent_shape, pred_shape) -> torch.Tensor:
+    """Pixel mask (B,1,H,W) -> mean-1 prior-preservation weight (1 - mask), per sample, shaped like pred."""
+    # resize to size of noise_pred (latents are B,C,H,W or video B,C,T,H,W)
+    prior_mask = torch.nn.functional.interpolate(mask, size=(latent_shape[-2], latent_shape[-1]), mode='bicubic')
+    # stack the mask channel to match channels of noise_pred; keep every batch item's own mask
+    prior_mask = prior_mask[:, :1].expand(-1, pred_shape[1], -1, -1)
+    if len(pred_shape) == 5:
+        prior_mask = prior_mask.unsqueeze(2)  # add time dimension back for video
+        prior_mask = prior_mask.repeat(1, 1, pred_shape[2], 1, 1)
+    prior_mask_multiplier = 1.0 - prior_mask
+    # scale so it is a mean of 1
+    return prior_mask_multiplier / prior_mask_multiplier.mean()
+
+
 class SDTrainer(BaseSDTrainProcess):
 
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
@@ -650,27 +664,8 @@ class SDTrainer(BaseSDTrainProcess):
             if self.train_config.inverted_mask_prior and prior_pred is not None and has_mask:
                 assert not self.train_config.train_turbo
                 with torch.no_grad():
-                    prior_mask = batch.mask_tensor.to(self.device_torch, dtype=dtype)
-                    if len(noise_pred.shape) == 5:
-                        # video B,C,T,H,W
-                        lat_height = batch.latents.shape[3]
-                        lat_width = batch.latents.shape[4]
-                    else: 
-                        lat_height = batch.latents.shape[2]
-                        lat_width = batch.latents.shape[3]
-                    # resize to size of noise_pred
-                    prior_mask = torch.nn.functional.interpolate(prior_mask, size=(lat_height, lat_width), mode='bicubic')
-                    # stack first channel to match channels of noise_pred
-                    prior_mask = torch.cat([prior_mask[:1]] * noise_pred.shape[1], dim=1)
-                    
-                    if len(noise_pred.shape) == 5:
-                        prior_mask = prior_mask.unsqueeze(2)  # add time dimension back for video
-                        prior_mask = prior_mask.repeat(1, 1, noise_pred.shape[2], 1, 1) 
-
-                    prior_mask_multiplier = 1.0 - prior_mask
-                    
-                    # scale so it is a mean of 1
-                    prior_mask_multiplier = prior_mask_multiplier / prior_mask_multiplier.mean()
+                    prior_mask_multiplier = inverted_prior_mask_multiplier(
+                        batch.mask_tensor.to(self.device_torch, dtype=dtype), batch.latents.shape, noise_pred.shape)
                 if hasattr(self.sd, 'get_loss_target'):
                     target = self.sd.get_loss_target(
                         noise=noise, 
