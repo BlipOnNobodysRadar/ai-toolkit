@@ -499,6 +499,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
     
     def done_hook(self):
         pass
+
+    def release_accelerator_state(self):
+        # toolkit/accelerator.py shares one Accelerator per process, and prepare() keeps every model, optimizer and
+        # scheduler in its own lists. Without this, a later job in the same run.py process (several configs, or -r
+        # after a failure) starts with this job's network, optimizer state and base model still referenced.
+        self.modules_being_trained.clear()
+        self.optimizer = None
+        self.lr_scheduler = None
+        self.params = []
+        self.accelerator.free_memory()
+        flush()
     
     def end_step_hook(self):
         pass
@@ -746,8 +757,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     training_state=(rawr_checkpoint.training_state(self, checkpoint_step)
                                     if getattr(self, '_rawr_checkpoint_config', None) is not None else None))
                 if rawr_pair_save is not None:
+                    rawr_extras = None
+                    if getattr(self, 'training_extras', None) is not None:
+                        # The auxiliary loss state (EDM2 etc.) belongs to the same step as the pair; commit hashes it.
+                        rawr_extras = rawr_pair.extras_path(rawr_pair_save)
+                        self.training_extras.checkpoint(rawr_extras, curve_dir=self.save_root,
+                                                        step=self.meta['training_info']['completed_steps'])
                     rawr_pair.commit(self.save_root, rawr_pair_save, state_dict,
-                                     rawr_model_alias, lora_name, checkpoint_step, rawr_model_export)
+                                     rawr_model_alias, lora_name, checkpoint_step, rawr_model_export,
+                                     extras=rawr_extras)
                 else:
                     # Write a new file and swap the name, never rewrite in place: an interrupted save keeps the
                     # previous optimizer.pt, and in a folder that once held RAWR pairs optimizer.pt may be a hard
@@ -760,8 +778,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc(e)
                 print_acc("Could not save optimizer")
 
-        if getattr(self, 'training_extras', None) is not None:
-            # tag with completed_steps: the value a resume restores into step_num (checked on restore)
+        if getattr(self, 'training_extras', None) is not None and (rawr_pair_save is None or self.optimizer is None):
+            # A committed pair already wrote (and aliased) its own copy above.
+            # Stamped with completed_steps: the value a resume restores into step_num (checked on restore).
             self.training_extras.checkpoint(os.path.join(self.save_root, 'training_extras.pt'),
                                             step=self.meta['training_info']['completed_steps'])
         self.clean_up_saves()
@@ -883,11 +902,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.network_config is None or self.train_config.merge_network_on_save:
                     raise ValueError('Committed RAWR pair is a LoRA; use its original training configuration')
                 self._rawr_paired_optimizer_path = selected['optimizer']
+                self._rawr_paired_extras_path = selected.get('training_extras')
                 self._rawr_pair_generation = selected['generation']
                 return selected['model']
         # get latest saved step
         latest_path = None
         if os.path.exists(self.save_root):
+            # Only {name}, {name}_<9-digit step>, plus post and an optional extension (none for a diffusers folder)
+            # are this run's saves. A bare prefix glob also took derived exports such as {name}_000000300-comfy,
+            # whose folded weights and copied metadata resume silently wrong.
+            save_name = re.compile(rf'{re.escape(name)}(_\d{{9}})?{re.escape(post)}(\.safetensors|\.pt)?',
+                                   re.IGNORECASE if os.name == 'nt' else 0)
             # Define patterns for both files and directories
             patterns = [
                 f"{name}*{post}.safetensors",
@@ -901,16 +926,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
             # Filter out non-existent paths and sort by creation time
             if paths:
-                paths = [p for p in paths if os.path.exists(p)]
-                # remove false positives
-                if '_LoRA' not in name:
-                    paths = [p for p in paths if '_LoRA' not in p]
-                if '_refiner' not in name:
-                    paths = [p for p in paths if '_refiner' not in p]
-                if '_t2i' not in name:
-                    paths = [p for p in paths if '_t2i' not in p]
-                if '_cn' not in name:
-                    paths = [p for p in paths if '_cn' not in p]
+                # the exact-name match also drops the _LoRA/_refiner/_t2i/_cn siblings the old substring filters
+                # removed, without misfiring when those strings appear in the folder path
+                paths = [p for p in paths if os.path.exists(p) and save_name.fullmatch(os.path.basename(p))]
 
                 if len(paths) > 0:
                     latest_path = max(paths, key=os.path.getctime)
@@ -3096,6 +3114,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         flush()
         self.done_hook()
+        # after done_hook, so UI status/async work has finished with the job's objects
+        self.release_accelerator_state()
 
     def push_to_hub(
     self,

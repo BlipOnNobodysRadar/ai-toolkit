@@ -1,5 +1,6 @@
 """Opt-in loss composition with independent, resumable weighting state."""
 import os
+import warnings
 import torch
 from .loss_bridge import LossBridge
 from .edm import EDMWeighting
@@ -36,8 +37,9 @@ class TrainingExtras(torch.nn.Module):
 
     def step(self): self.edm.step()
 
-    def checkpoint(self, path, step=None):
-        # step: completed training steps this state belongs to (what a resume restores into step_num)
+    def checkpoint(self, path, curve_dir=None, step=None):
+        # step: completed training steps this state belongs to (what a resume restores into step_num);
+        # restore refuses state from another checkpoint (a stale or mismatched resume).
         payload = {'config':self.config, 'module':self.state_dict(), 'dynamic':self.dynamic.state_dict(),
                    'step':None if step is None else int(step)}
         if self.edm.enabled:
@@ -53,15 +55,24 @@ class TrainingExtras(torch.nn.Module):
                     t=torch.arange(model.num_train_timesteps,device=self.edm.device)
                     logvar=model._forward(t).detach()
                     weight=model.lambda_weights/torch.exp(logvar)
-                curve=os.path.join(os.path.dirname(path),'edm2-weighting.csv')
+                # The curve is a report for the save folder, even when the state lives in a RAWR pair slot.
+                curve=os.path.join(curve_dir if curve_dir is not None else os.path.dirname(path),'edm2-weighting.csv')
                 with open(curve+'.tmp','w',newline='',encoding='utf-8') as f:
                     writer=csv.writer(f);writer.writerow(['timestep','sigma','log_variance','prediction_weight'])
                     writer.writerows(zip(t.cpu().tolist(),(t/model.num_train_timesteps).cpu().tolist(),logvar.cpu().tolist(),weight.cpu().tolist()))
                 os.replace(curve+'.tmp',curve)
             finally:model.train(training)
 
-    def restore(self, path):
-        self._apply(torch.load(path, map_location='cpu', weights_only=True))
+    def restore(self, path, expected_step=None):
+        """Restore, checking the step stamp when expected_step is given (a committed RAWR pair's own copy)."""
+        data = torch.load(path, map_location='cpu', weights_only=True)
+        saved = data.get('step')
+        if expected_step is not None:
+            if saved is None:
+                warnings.warn(f'{path} has no step stamp (legacy file); cannot certify it matches resume step {expected_step}', RuntimeWarning)
+            elif int(saved) != int(expected_step):
+                raise ValueError(f'training_extras state step {saved} does not match resume step {expected_step}')
+        self._apply(data)
 
     def restore_for_step(self, path, step_num, strict=True, log=print):
         """Restore only state saved at the step being resumed. Returns 'restored', 'legacy' or 'stale'.
