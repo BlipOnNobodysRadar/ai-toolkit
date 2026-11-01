@@ -1427,12 +1427,11 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
 
                 if use_stable_spam_clipping:
                     if torch_compile:
-                        if compute_device not in spam_bias_terms:
-                            spam_bias_terms[compute_device] = stable_spam_bias_terms(step, compute_device)
                         grad = stable_spam_clipping_compiled(state,
                                             grad,
-                                            spam_bias_terms[compute_device],
-                                            eps=eps_floor)
+                                            step,
+                                            eps=eps_floor,
+                                            bias_cache=spam_bias_terms)
                     else:
                         grad = _stable_spam_clipping_impl(state, 
                                             grad, 

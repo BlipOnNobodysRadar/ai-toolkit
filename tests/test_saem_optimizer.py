@@ -185,11 +185,27 @@ def test_compiled_stable_spam_clip_matches_eager(counting_compile):
         g = torch.Generator().manual_seed(step)
         grad = torch.randn(6, 5, generator=g) * (1 + step)
         out_e = _stable_spam_clipping_impl(eager_state, grad.clone(), step=step, eps=1e-12)
-        out_c = stable_spam_clipping_compiled(
-            compiled_state, grad.clone(), stable_spam_bias_terms(step, grad.device), eps=1e-12
-        )
+        out_c = stable_spam_clipping_compiled(compiled_state, grad.clone(), step, eps=1e-12)
         torch.testing.assert_close(out_c, out_e, rtol=1e-6, atol=0)
     assert counting_compile.frame_count == 1
+
+
+def test_compiled_stable_spam_clip_matches_eager_at_scale_2(counting_compile):
+    # DeepSeek review B1: the compiled path took caller-built bias terms at the default scale=1,
+    # so any scale != 1 debiased m_norm with 1 - 0.85**step instead of 1 - (0.85*scale)**step.
+    from training_extras.vendor.LoraEasyCustomOptimizer.utils import (
+        _stable_spam_clipping_impl, stable_spam_clipping_compiled,
+    )
+
+    eager_state, compiled_state, cache = {}, {}, {}
+    for step in range(1, 9):
+        g = torch.Generator().manual_seed(step)
+        grad = torch.randn(6, 5, generator=g) * (1 + step)
+        out_e = _stable_spam_clipping_impl(eager_state, grad.clone(), step=step, scale=1.1, eps=1e-12)
+        out_c = stable_spam_clipping_compiled(compiled_state, grad.clone(), step, scale=1.1, eps=1e-12,
+                                              bias_cache=cache)
+        torch.testing.assert_close(out_c, out_e, rtol=1e-5, atol=0)
+    assert len(cache) == 8  # one entry per (step, device, scale, gammas)
 
 
 def test_compiled_stable_spam_matches_eager(counting_compile):

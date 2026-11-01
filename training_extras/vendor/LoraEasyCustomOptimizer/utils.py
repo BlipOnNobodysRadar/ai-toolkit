@@ -642,16 +642,28 @@ def _get_compiled_stable_spam_debiased():
 @torch.no_grad()
 def stable_spam_clipping_compiled(state: dict,
                                   grad: torch.Tensor,
-                                  bias_terms,
+                                  step: int,
                                   scale: float = 1.0,
                                   eps: float = 1e-8,
                                   gamma1: float = 0.85,
                                   gamma2: float = 0.99999,
-                                  gamma3: float = 0.999) -> torch.Tensor:
+                                  gamma3: float = 0.999,
+                                  bias_cache: dict = None) -> torch.Tensor:
     r"""Compiled StableSPAM clipping with the same state keys as the eager path.
     The ssc_* state is kept as fp32 0-d tensors on grad's device, so neither
     the first step (Python floats) nor a resume (state on the param's device)
-    changes the compiled graph's inputs."""
+    changes the compiled graph's inputs.
+
+    The bias corrections are built here from the same step, scale and gammas
+    the clip uses (a caller-built tuple could silently disagree, e.g. scale != 1).
+    Pass one dict per optimizer step as bias_cache to build them once per
+    device instead of once per parameter."""
+    key = (int(step), grad.device, float(scale), float(gamma1), float(gamma2), float(gamma3))
+    bias_terms = bias_cache.get(key) if bias_cache is not None else None
+    if bias_terms is None:
+        bias_terms = stable_spam_bias_terms(step, grad.device, scale, gamma1, gamma2, gamma3)
+        if bias_cache is not None:
+            bias_cache[key] = bias_terms
     ssc = []
     for key in _SSC_STATE_KEYS:
         value = state.get(key, 0.0)
