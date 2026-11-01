@@ -9,7 +9,7 @@ import torch
 from pytorch_optimizer.base.exception import NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Betas, Closure, Defaults, Loss, ParamGroup
-from .utils import apply_weight_decay, copy_stochastic_, UPDATE_STRATEGY, NORM_TYPE, agc, _paper_orthograd, adaptive_eps, _get_compiled_stable_spam_clipping, _stable_spam_clipping_impl
+from .utils import apply_weight_decay, copy_stochastic_, UPDATE_STRATEGY, NORM_TYPE, agc, _paper_orthograd, adaptive_eps, _get_compiled_stable_spam_clipping, _stable_spam_clipping_impl, stable_spam_bias_terms, stable_spam_clipping_compiled
 import logging
 
 logger = logging.getLogger(__name__)
@@ -826,7 +826,9 @@ class SimplifiedAdEMAMix(BaseOptimizer):
                     if p.dtype == torch.bfloat16:
                         copy_stochastic_(p.data, p_fp32, scratch=srng)
                     else:
-                        p.data.copy_(p_fp32)
+                        # Async D2H into pinned memory; the torch.cuda.synchronize after
+                        # _foreach_step returns makes this safe. Do not read p on the host before it.
+                        p.data.copy_(p_fp32, non_blocking=p.data.is_pinned())
                 else:
                     if p.dtype == torch.bfloat16:
                         copy_stochastic_(p, p_fp32, scratch=srng)
@@ -1113,7 +1115,9 @@ class SimplifiedAdEMAMix(BaseOptimizer):
                         if p.dtype == torch.bfloat16:
                             copy_stochastic_(p.data, p_fp32, scratch=srng)
                         else:
-                            p.data.copy_(p_fp32)
+                            # Async D2H into pinned memory; the group-end torch.cuda.synchronize
+                            # below is what makes this safe. Do not read p on the host before it.
+                            p.data.copy_(p_fp32, non_blocking=p.data.is_pinned())
                     else:
                         if p.dtype == torch.bfloat16:
                             copy_stochastic_(p, p_fp32, scratch=srng)
@@ -1262,6 +1266,13 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
 
         super().__init__(params, defaults)
 
+        if torch_compile:
+            # The compiled helpers use dynamic=False + fullgraph=True: one graph
+            # per LoRA shape. Past the default limit of 8 that is a hard failure.
+            torch._dynamo.config.recompile_limit = max(
+                torch._dynamo.config.recompile_limit, 64
+            )
+
     def __str__(self) -> str:
         return 'SimplifiedAdEMAMixExM'
 
@@ -1315,6 +1326,11 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
         cuda_available = torch.cuda.is_available()
         for group in self.param_groups:
             compute_cuda_devices = set()
+            # Per-step lr/wd tensors for the compiled weight decay, one pair per
+            # compute device. Rebuilt every step so scheduler lr changes apply.
+            wd_scalars = {}
+            # Per-step StableSPAM bias corrections for the compiled clip, per device.
+            spam_bias_terms = {}
             if 'step' in group:
                 group['step'] += 1
             else:
@@ -1390,16 +1406,20 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
                     compute_cuda_devices.add(compute_device)
 
                 # 1. Queue Host-to-Device copy
+                # Move first, then cast on the compute device: a combined
+                # device+dtype .to() converts on the CPU into a pageable temp,
+                # which makes the H2D host-synchronous and doubles bf16 bytes.
+                # bf16/fp16 -> fp32 is exact, so results are unchanged.
                 exp_avg = state["exp_avg"].to(
-                    compute_device, non_blocking=True, dtype=torch.float32
-                )
+                    compute_device, non_blocking=True
+                ).to(torch.float32)
                 exp_avg_sq = state["exp_avg_sq"].to(
-                    compute_device, non_blocking=True, dtype=torch.float32
-                )
+                    compute_device, non_blocking=True
+                ).to(torch.float32)
 
-                grad = grad.to(torch.float32).to(compute_device, non_blocking=True)
+                grad = grad.to(compute_device, non_blocking=True).to(torch.float32)
                 p_fp32 = (
-                    p.to(compute_device, dtype=torch.float32, non_blocking=True)
+                    p.to(compute_device, non_blocking=True).to(torch.float32)
                 )
 
                 if apply_ortho_to_group and use_orthograd:
@@ -1407,9 +1427,11 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
 
                 if use_stable_spam_clipping:
                     if torch_compile:
-                        grad = _get_compiled_stable_spam_clipping()(state,
+                        if compute_device not in spam_bias_terms:
+                            spam_bias_terms[compute_device] = stable_spam_bias_terms(step, compute_device)
+                        grad = stable_spam_clipping_compiled(state,
                                             grad,
-                                            step=step,
+                                            spam_bias_terms[compute_device],
                                             eps=eps_floor)
                     else:
                         grad = _stable_spam_clipping_impl(state, 
@@ -1488,11 +1510,23 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
 
                     update.clamp_(-adopt_clip, adopt_clip)
 
+                    wd_lr, wd = group['lr'], group['weight_decay']
+                    if torch_compile and wd != 0.0:
+                        # Same values apply_weight_decay would build per param
+                        # (fp32 on p_fp32's device), but one blocking H2D per
+                        # step instead of two per parameter.
+                        if compute_device not in wd_scalars:
+                            wd_scalars[compute_device] = tuple(
+                                v if isinstance(v, torch.Tensor)
+                                else torch.tensor(v, device=compute_device, dtype=torch.float32)
+                                for v in (wd_lr, wd)
+                            )
+                        wd_lr, wd = wd_scalars[compute_device]
                     apply_weight_decay(
                         p=p_fp32,
                         grad=grad_normed,
-                        lr=group['lr'],
-                        weight_decay=group['weight_decay'],
+                        lr=wd_lr,
+                        weight_decay=wd,
                         weight_decouple=group['weight_decouple'],
                         fixed_decay=False,
                         torch_compile=group.get('torch_compile', False),
@@ -1506,7 +1540,9 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
                     if p.dtype == torch.bfloat16:
                         copy_stochastic_(p.data, p_fp32)
                     else:
-                        p.data.copy_(p_fp32)
+                        # Async D2H into pinned memory; the group-end torch.cuda.synchronize
+                        # below is what makes this safe. Do not read p on the host before it.
+                        p.data.copy_(p_fp32, non_blocking=p.data.is_pinned())
                 else:
                     # Original GPU path
                     if p.dtype == torch.bfloat16:

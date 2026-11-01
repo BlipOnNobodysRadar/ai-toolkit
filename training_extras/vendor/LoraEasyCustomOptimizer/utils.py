@@ -569,6 +569,105 @@ def _stable_spam_clipping_impl(state: dict,
     return grad
 
 @torch.no_grad()
+def _stable_spam_clipping_debiased(grad: torch.Tensor,
+                                   m_max_t: torch.Tensor,
+                                   m_norm_t: torch.Tensor,
+                                   v_norm_t: torch.Tensor,
+                                   bc3: torch.Tensor,
+                                   bc1: torch.Tensor,
+                                   bc2: torch.Tensor,
+                                   scale: float = 1.0,
+                                   eps: float = 1e-8,
+                                   gamma1: float = 0.85,
+                                   gamma2: float = 0.99999,
+                                   gamma3: float = 0.999):
+    r"""_stable_spam_clipping_impl for torch.compile: state in and out as 0-d
+    tensors, and the bias corrections (1 - gamma ** step) passed in as tensors
+    (see stable_spam_bias_terms), so the step never enters the graph and each
+    parameter shape compiles once instead of once per step."""
+    max_grad = torch.max(grad.abs())
+
+    m_max_t = gamma3 * m_max_t + (1 - gamma3) * max_grad
+
+    m_max_hat = m_max_t / bc3
+
+    grad = torch.where(grad.abs() > m_max_hat,
+                        grad / max_grad * m_max_hat,
+                        grad)
+
+    grad_norm = torch.norm(grad)
+
+    m_norm_t = gamma1 * scale * m_norm_t + (1 - gamma1 * scale) * grad_norm
+    v_norm_t = gamma2 * v_norm_t + (1 - gamma2) * grad_norm**2
+
+    m_norm_hat = m_norm_t / bc1
+    v_norm_hat = v_norm_t / bc2
+
+    c_norm_t = m_norm_hat / (torch.sqrt(v_norm_hat) + eps)
+
+    grad = torch.where(grad_norm > 0,
+                        grad / grad_norm * c_norm_t,
+                        grad)
+
+    return grad, m_max_t, m_norm_t, v_norm_t
+
+
+def stable_spam_bias_terms(step: int,
+                           device: torch.device,
+                           scale: float = 1.0,
+                           gamma1: float = 0.85,
+                           gamma2: float = 0.99999,
+                           gamma3: float = 0.999):
+    r"""(1 - gamma3**step, 1 - (gamma1*scale)**step, 1 - gamma2**step) as fp32
+    0-d tensors on device. Computed in Python double like the eager path: an
+    fp32 tensor step would put ~1e-3 relative error into 1 - 0.99999**step.
+    Build once per step and device, not per parameter (each is an H2D copy)."""
+    return tuple(
+        torch.tensor(1.0 - g ** step, dtype=torch.float32, device=device)
+        for g in (gamma3, gamma1 * scale, gamma2)
+    )
+
+
+_SSC_STATE_KEYS = ('ssc_m_max_t', 'ssc_m_norm_t', 'ssc_v_norm_t')
+
+
+def _get_compiled_stable_spam_debiased():
+    if 'stable_spam_debiased' not in _compiled_fns:
+        _compiled_fns['stable_spam_debiased'] = torch.compile(
+            _stable_spam_clipping_debiased, fullgraph=True, dynamic=False
+        )
+    return _compiled_fns['stable_spam_debiased']
+
+
+@torch.no_grad()
+def stable_spam_clipping_compiled(state: dict,
+                                  grad: torch.Tensor,
+                                  bias_terms,
+                                  scale: float = 1.0,
+                                  eps: float = 1e-8,
+                                  gamma1: float = 0.85,
+                                  gamma2: float = 0.99999,
+                                  gamma3: float = 0.999) -> torch.Tensor:
+    r"""Compiled StableSPAM clipping with the same state keys as the eager path.
+    The ssc_* state is kept as fp32 0-d tensors on grad's device, so neither
+    the first step (Python floats) nor a resume (state on the param's device)
+    changes the compiled graph's inputs."""
+    ssc = []
+    for key in _SSC_STATE_KEYS:
+        value = state.get(key, 0.0)
+        if not isinstance(value, torch.Tensor):
+            value = torch.full((), float(value), dtype=torch.float32, device=grad.device)
+        elif value.device != grad.device:
+            value = value.to(grad.device)
+        ssc.append(value)
+    grad, *ssc = _get_compiled_stable_spam_debiased()(
+        grad, *ssc, *bias_terms, scale, eps, gamma1, gamma2, gamma3
+    )
+    for key, value in zip(_SSC_STATE_KEYS, ssc):
+        state[key] = value
+    return grad
+
+@torch.no_grad()
 def stable_spam_clipping_tensors(
     ssc_m_norm_t: torch.Tensor,
     ssc_v_norm_t: torch.Tensor,
@@ -1066,6 +1165,11 @@ def apply_weight_decay(
         cautious_weight_decay (bool): If True, applies cautious weight decay.
         torch_compile (bool): If True, route through torch.compile'd wrapper.
     """
+    # Zero decay is an identity in every branch below (p.mul_(1.0) or a
+    # skipped add); return before paying a full-tensor kernel per param.
+    if (not cautious_weight_decay and not isinstance(weight_decay, torch.Tensor)
+            and weight_decay == 0.0):
+        return
     if torch_compile:
         lr_t = torch.tensor(lr, device=p.device, dtype=p.dtype) if not isinstance(lr, torch.Tensor) else lr
         wd_t = torch.tensor(weight_decay, device=p.device, dtype=p.dtype) if not isinstance(weight_decay, torch.Tensor) else weight_decay
