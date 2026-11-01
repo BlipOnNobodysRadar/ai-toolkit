@@ -185,6 +185,9 @@ class MossImageModel(BaseModel):
         self.uncond_skip_layers = tuple(
             kw.get("uncond_skip_layers", DEFAULT_UNCOND_SKIP_LAYERS) or ()
         )
+        # opt-in: preview CFG as one B=2 forward (offloaded weights stream once
+        # per step instead of twice); bf16 previews differ slightly, default off
+        self.batched_cfg = bool(kw.get("batched_cfg", False))
 
         # model_kwargs.edit: krea2-style reference conditioning for edit LoRAs
         # (the vendor model is t2i only). References ride in the prompt through
@@ -406,6 +409,7 @@ class MossImageModel(BaseModel):
             uncond_skip_layers=self.uncond_skip_layers,
             ref_latents=ref_latents,
             isolate_refs=self.kv_cache,
+            batched_cfg=self.batched_cfg,
         )
         return result[0]
 

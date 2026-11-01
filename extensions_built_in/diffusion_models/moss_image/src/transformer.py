@@ -18,7 +18,7 @@ K/V can be cached across sampling steps.
 """
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -371,6 +371,7 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
         ref_latents: Optional[List[List[torch.Tensor]]] = None,  # per-sample (C, h, w)
         isolate_refs: bool = False,
         ref_kv_cache: Optional[dict] = None,
+        skip_layers_items: Optional[Sequence[int]] = None,
     ):
         """``ref_latents``: clean reference latents appended after the text at
         t=0 (edit LoRAs; the base model never saw them). ``isolate_refs``:
@@ -380,7 +381,9 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
         reference K/V on this call; once filled, later calls skip the
         reference tokens and attend to the cached K/V instead. One cache per
         prompt / skip-layer combination (the reference RoPE follows the text
-        length)."""
+        length). ``skip_layers_items`` (inference only, no references): the
+        batch indices that skip ``skip_layers``; None = all. Lets batched CFG
+        run cond and uncond (uncond skips blocks) in one forward."""
         skip = frozenset(skip_layers or ())
         if ref_kv_cache is not None and not isolate_refs:
             raise ValueError("ref_kv_cache needs isolate_refs: cached K/V are only step-invariant when references attend to themselves")
@@ -455,6 +458,15 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
         elif padded:
             joint_mask = live_valid[:, None, None, :]
 
+        if skip_layers_items is not None:
+            if num_ref or reuse_refs or ref_kv_cache is not None or isolate_split is not None:
+                raise ValueError("skip_layers_items does not support references or ref_kv_cache")
+            if torch.is_grad_enabled():
+                raise ValueError("skip_layers_items is inference only")
+            skip_items = frozenset(int(i) for i in skip_layers_items)
+            keep = [i for i in range(batch) if i not in skip_items]
+            keep_index = torch.tensor(keep, device=device, dtype=torch.long)
+
         video = hidden_states.flatten(2).transpose(1, 2).to(dtype)
         video = self.video_embedder(video.contiguous())
         text = self.text_embedder.proj(context.to(dtype))
@@ -471,6 +483,13 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
         captured = {}
         for index, layer in enumerate(self.layers):
             if index in skip:
+                if skip_layers_items is not None and keep:
+                    # only the items outside skip_layers_items run this block
+                    out = layer(
+                        x[keep_index], rope[keep_index], modulation[keep_index],
+                        None if joint_mask is None else joint_mask[keep_index],
+                    )
+                    x = x.index_copy(0, keep_index, out)
                 continue
             if capture:
                 slot = []

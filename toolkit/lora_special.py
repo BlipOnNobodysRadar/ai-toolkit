@@ -380,6 +380,12 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
         )
         if ignore_if_contains is None:
             ignore_if_contains = []
+        # merge (never replace) model-declared ignores, e.g. layers whose forward
+        # bypasses the lora hook; copy so the config's list is not mutated
+        model_ignores = getattr(base_model, 'lora_ignore_if_contains', None) if base_model is not None else None
+        if model_ignores:
+            ignore_if_contains = list(ignore_if_contains) + [w for w in model_ignores if w not in ignore_if_contains]
+            print(f"LoRA: model {getattr(base_model, 'arch', '?')} also skips modules containing {list(model_ignores)}")
         self.ignore_if_contains = ignore_if_contains
         # full_if_contains: any layer (even linear/conv) whose name matches becomes a full weight
         # module instead of a normal lora module

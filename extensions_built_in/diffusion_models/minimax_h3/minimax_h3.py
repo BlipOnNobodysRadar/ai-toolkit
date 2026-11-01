@@ -184,6 +184,10 @@ class MinimaxH3Model(BaseModel):
     # hub repo for missing files when name_or_path isn't an org/repo id
     comfy_repo = COMFY_REPO
     use_old_lokr_format = False
+    # MiniMaxH3AdalnProj.forward calls F.linear on self.linear.weight, so a lora
+    # hooked on adaln_proj.linear never trains but still exports (non-zero via
+    # use_scalar init) and applies in ComfyUI; LoRASpecialNetwork merges this in
+    lora_ignore_if_contains = ["adaln_proj"]
 
     def __init__(
         self,
