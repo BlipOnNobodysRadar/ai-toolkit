@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from collections import OrderedDict
 from typing import Optional, Union, List, Type, TYPE_CHECKING, Dict, Any, Literal
@@ -75,6 +76,11 @@ def broadcast_and_multiply(tensor, multiplier):
         raise e
 
     return result
+
+
+def _is_power_of_two(value: float) -> bool:
+    # +-2**k: multiplying by it is exact in floating point, so it commutes with matmul rounding
+    return value != 0.0 and math.isfinite(value) and abs(math.frexp(value)[0]) == 0.5
 
 
 def add_bias(tensor, bias):
@@ -237,6 +243,49 @@ class ToolkitModuleMixin:
             lx = lx * self.scalar.to(device=lx.device, dtype=lx.dtype)
         return lx * scale
 
+    def _fast_forward(self: Module, network: Network, x, *args, **kwargs):
+        # Plain LoRA with a uniform multiplier: apply alpha/rank * multiplier to the rank-size
+        # down output instead of the output-size result, which saves two full-size fp32
+        # multiplies per module per pass (and their backward). Only taken when the scale and the
+        # multiplier are powers of two (exact in floating point), so outputs and gradients are
+        # bit-identical to the general path below. Returns None to fall back.
+        m = getattr(network, '_uniform_multiplier', None)
+        if m is None or getattr(network, '_uniform_multiplier_src', None) is not network.torch_multiplier:
+            return None
+        if self.__class__.__name__ != 'LoRAModule':
+            return None  # DoRA, LoKr, LyCORIS and full-weight modules keep their own math
+        lora_up = self.lora_up
+        if getattr(lora_up, 'bias', None) is not None:
+            return None  # a lora_up bias must stay inside the scaled output
+        if self.training and (self.module_dropout is not None
+                              or (self.rank_dropout is not None and self.rank_dropout > 0)):
+            return None
+        if not (_is_power_of_two(self.scale) and _is_power_of_two(m)):
+            return None  # folding a non power of two scale would change rounding
+        factor = self.scale * m
+
+        org_forwarded = self.org_forward(x, *args, **kwargs)
+        if isinstance(x, QTensor):
+            x = x.dequantize()
+        # always cast to float32
+        lora_input = x.to(self.lora_down.weight.dtype)
+        if hasattr(self, 'lora_mid') and self.lora_mid is not None:
+            lx = self.lora_mid(self.lora_down(lora_input))
+        else:
+            lx = self.lora_down(lora_input)
+        if isinstance(self.dropout, nn.Dropout) or isinstance(self.dropout, nn.Identity):
+            lx = self.dropout(lx)
+        elif self.dropout is not None and self.training:
+            lx = torch.nn.functional.dropout(lx, p=self.dropout)
+        if factor != 1.0:
+            scale = self._runtime_scale if m == 1.0 else self._runtime_scale * m
+            lx = lx * scale
+        lx = lora_up(lx)
+        # handle trainable scaler method locon does
+        if hasattr(self, 'scalar'):
+            lx = lx * self.scalar.to(device=lx.device, dtype=lx.dtype)
+        return org_forwarded + lx.to(org_forwarded.dtype)
+
     def lorm_forward(self: Network, x, *args, **kwargs):
         network: Network = self.network_ref()
         if not network.is_active:
@@ -299,6 +348,10 @@ class ToolkitModuleMixin:
         
         if self.__class__.__name__ == "LokrModule":
             return self._call_forward(x)
+
+        fast = self._fast_forward(network, x, *args, **kwargs)
+        if fast is not None:
+            return fast
 
         org_forwarded = self.org_forward(x, *args, **kwargs)
 
@@ -844,6 +897,19 @@ class ToolkitNetworkMixin:
                 tensor_multiplier = multiplier.clone().detach().to(device, dtype=dtype)
 
             self.torch_multiplier = tensor_multiplier.clone().detach()
+            # a plain float, or a flat list with one repeated value (the trainer's [1.0] * batch),
+            # lets LoRA modules fold the multiplier into their rank-side scale. Tensors, nested
+            # lists and mixed values keep the per-sample path. The source tensor is remembered so
+            # a torch_multiplier assigned directly elsewhere never pairs with a stale value.
+            uniform = None
+            if isinstance(multiplier, (int, float)) and not isinstance(multiplier, bool):
+                uniform = float(multiplier)
+            elif isinstance(multiplier, list) and len(multiplier) > 0 and all(
+                    isinstance(v, (int, float)) and not isinstance(v, bool) for v in multiplier
+            ) and all(v == multiplier[0] for v in multiplier):
+                uniform = float(multiplier[0])
+            self._uniform_multiplier = uniform
+            self._uniform_multiplier_src = self.torch_multiplier
 
     @property
     def multiplier(self) -> Union[float, List[float], List[List[float]]]:
