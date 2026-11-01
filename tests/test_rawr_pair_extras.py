@@ -140,7 +140,7 @@ class _Stop(Exception):
     pass
 
 
-def hook_restore(tmp_path, monkeypatch, step, generation=None, paired=None, start_step=None):
+def hook_restore(tmp_path, monkeypatch, step, generation=None, paired=None, start_step=None, config=EDM):
     """Runs SDTrainer.hook_before_train_loop up to the extras restore, then stops."""
     base = importlib.import_module('jobs.process.BaseSDTrainProcess').BaseSDTrainProcess
     from extensions_built_in.sd_trainer.SDTrainer import SDTrainer
@@ -152,7 +152,7 @@ def hook_restore(tmp_path, monkeypatch, step, generation=None, paired=None, star
 
     monkeypatch.setattr(base, 'hook_before_train_loop', lambda self: None)
     t = Probe.__new__(Probe)
-    t.train_config = SimpleNamespace(training_extras=EDM, loss_type='mse', t0_loss_target=False, train_turbo=False,
+    t.train_config = SimpleNamespace(training_extras=config, loss_type='mse', t0_loss_target=False, train_turbo=False,
                                      dtype='bf16', steps=10, start_step=start_step)
     t.do_guided_loss = False
     t.sd = SimpleNamespace(noise_scheduler=_sched(with_alphas=False), is_flow_matching=True, prediction_type='epsilon')
@@ -181,6 +181,38 @@ def test_trainer_restores_the_paired_extras_with_step_check(tmp_path, monkeypatc
     hook_restore(tmp_path, monkeypatch, step + 1, selected['generation'], selected['training_extras'], start_step=step + 1)
     with pytest.raises(ValueError, match='has no training_extras state'):
         hook_restore(tmp_path, monkeypatch, step, selected['generation'], None)
+
+
+def test_pair_with_extras_refuses_resume_without_extras_config(tmp_path, monkeypatch):
+    # DeepSeek review A2: removing training_extras from the config silently dropped the pair's EDM2 state
+    f, _, _ = paired_trainer(tmp_path)
+    f.training_extras = extras()
+    save_steps(f, [0, 1])
+    selected = pair.select(str(tmp_path), 'tiny')
+    step = f.meta['training_info']['completed_steps']
+    with pytest.raises(ValueError, match='carries training_extras state but training_extras is not configured'):
+        hook_restore(tmp_path, monkeypatch, step, selected['generation'], selected['training_extras'], config=None)
+    # a pair without extras resumed without extras is the plain path
+    assert hook_restore(tmp_path, monkeypatch, step, selected['generation'], None, config=None) is None
+
+
+def test_latest_save_path_wires_the_pair_into_the_extras_restore(tmp_path, monkeypatch):
+    # DeepSeek review A5: the real get_latest_save_path -> _rawr_paired_* -> hook_before_train_loop chain
+    f, _, _ = paired_trainer(tmp_path)
+    f.training_extras = extras()
+    save_steps(f, [0, 1])
+    selected = pair.select(str(tmp_path), 'tiny')
+    base = importlib.import_module('jobs.process.BaseSDTrainProcess').BaseSDTrainProcess
+    probe = SimpleNamespace(job=SimpleNamespace(name='tiny'), save_root=str(tmp_path),
+                            network_config=SimpleNamespace(pretrained_lora_path=None),
+                            train_config=SimpleNamespace(lr_scheduler='easy:RAWR', merge_network_on_save=False))
+    assert base.get_latest_save_path(probe) == selected['model']
+    assert probe._rawr_paired_optimizer_path == selected['optimizer']
+    assert probe._rawr_paired_extras_path == selected['training_extras'] is not None
+    restored = hook_restore(tmp_path, monkeypatch, f.meta['training_info']['completed_steps'],
+                            probe._rawr_pair_generation, probe._rawr_paired_extras_path)
+    for a, b in zip(f.training_extras.parameters(), restored.parameters()):
+        assert torch.equal(a, b)
 
 
 def test_trainer_legacy_root_extras_step_checked(tmp_path, monkeypatch):

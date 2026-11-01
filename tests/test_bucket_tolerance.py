@@ -42,7 +42,10 @@ def _resolved_tolerance(div, **kwargs):
     try:
         AiToolkitDataset.__init__(ds, config, batch_size=4, sd=_Sd(div) if div else None)
     except Exception:
-        pass  # folder scan fails after the tolerance block; only the tolerance matters here
+        # the folder scan fails after the tolerance block; is_video is set right after that block, so a failure
+        # before it (which would leave the tolerance untouched) is re-raised instead of passing silently
+        if not hasattr(ds, 'is_video'):
+            raise
     return config.bucket_tolerance
 
 
