@@ -1022,7 +1022,8 @@ class DatasetConfig:
         self.resolution: int = kwargs.get('resolution', 512)
         self.scale: float = kwargs.get('scale', 1.0)
         self.buckets: bool = kwargs.get('buckets', True)
-        self.bucket_tolerance: int = kwargs.get('bucket_tolerance', 64)
+        # None = the model's bucket divisibility; a set value is rounded up to a multiple of it
+        self.bucket_tolerance: int = kwargs.get('bucket_tolerance', None)
         self.is_reg: bool = kwargs.get('is_reg', False)
         self.prior_reg: bool = kwargs.get('prior_reg', False)
         self.network_weight: float = float(kwargs.get('network_weight', 1.0))
