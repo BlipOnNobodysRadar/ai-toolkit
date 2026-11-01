@@ -343,4 +343,6 @@ class ExponentialMovingAverage:
         if not self._is_train_mode:
             with torch.no_grad():
                 self.restore()
+                # The stored raw weights are back in the params; don't keep a full clone alive for the whole run.
+                self.collected_params = None
                 self._is_train_mode = True
