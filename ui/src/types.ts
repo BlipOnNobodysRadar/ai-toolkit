@@ -161,6 +161,7 @@ export interface ValidationConfig {
 export interface TrainConfig {
   batch_size: number;
   bypass_guidance_embedding?: boolean;
+  allow_tf32?: boolean;
   steps: number;
   gradient_accumulation: number;
   train_unet: boolean;

@@ -1840,6 +1840,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # torch.autograd.set_detect_anomaly(True)
         # run base process run
         BaseTrainProcess.run(self)
+        # process-wide, so set it both ways: run.py runs several jobs in one process
+        torch.set_float32_matmul_precision('high' if self.train_config.allow_tf32 else 'highest')
+        if self.train_config.allow_tf32:
+            print_acc("TF32 matmuls enabled (train.allow_tf32)")
         params = []
 
         ### HOOK ###
