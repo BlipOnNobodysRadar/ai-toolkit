@@ -370,7 +370,9 @@ class _BouncingLinearFn(torch.autograd.Function):
                 _materialize_linear_weight(weight_cpu, torch.device("cpu")),
                 bias_cpu,
             )
-            ctx.save_for_backward(x.to("cpu"), weight_cpu, bias_cpu)
+            # same frozen-base rule as the CUDA branch below: x is only read for grad_weight
+            need_w = getattr(weight_cpu, "requires_grad", False) and weight_cpu.dtype.is_floating_point
+            ctx.save_for_backward(x.to("cpu") if need_w else None, weight_cpu, bias_cpu)
             ctx.device = torch.device("cpu")
             return out.to(x.device)
 
@@ -412,7 +414,7 @@ class _BouncingLinearFn(torch.autograd.Function):
 
         if device.type != "cuda":
             go_cpu = grad_out.to("cpu")
-            x_cpu = x.to("cpu")
+            x_cpu = x.to("cpu") if x is not None else None
             w_mat = (
                 weight_cpu.dequantize()
                 if _is_quantized_tensor(weight_cpu)
@@ -537,7 +539,10 @@ class _BouncingConv2dFn(torch.autograd.Function):
                 dilation,
                 groups,
             )
-            ctx.save_for_backward(x.to("cpu"), weight_cpu, bias_cpu)
+            # frozen-base rule and x_shape as in the CUDA branch below
+            need_w = getattr(weight_cpu, "requires_grad", False) and weight_cpu.dtype.is_floating_point
+            ctx.x_shape = x.shape
+            ctx.save_for_backward(x.to("cpu") if need_w else None, weight_cpu, bias_cpu)
             ctx.meta = ("cpu", stride, padding, dilation, groups, target_dtype)
             return out.to(x.device)
 
@@ -573,7 +578,7 @@ class _BouncingConv2dFn(torch.autograd.Function):
             isinstance(device, torch.device) and device.type != "cuda"
         ) or device == "cpu":
             go = grad_out.to("cpu")
-            x_cpu = x.to("cpu")
+            x_cpu = x.to("cpu") if x is not None else None
             w_cpu = (
                 weight_cpu.dequantize()
                 if _is_quantized_tensor(weight_cpu)
@@ -589,7 +594,7 @@ class _BouncingConv2dFn(torch.autograd.Function):
 
             # explicit casts, see _BouncingLinearFn.backward (autocast does not cover convolution_backward)
             grad_input = conv2d_input(
-                x_cpu.shape,
+                ctx.x_shape,
                 w_cpu,
                 go.to(w_cpu.dtype),
                 stride=stride,

@@ -170,28 +170,32 @@ def _packed_ids(fn):
     return out, ids
 
 
+@pytest.mark.parametrize("kind", ["cuda-branch", "cpu"])  # the cpu branch too (DeepSeek review B5)
 @pytest.mark.parametrize("op", ["linear", "conv"])
 @pytest.mark.parametrize("trainable", [False, True])
-def test_frozen_base_does_not_save_input(op, trainable, fake_cuda):
+def test_frozen_base_does_not_save_input(op, trainable, kind, fake_cuda):
     g = torch.Generator().manual_seed(4)
+    dev = _device(kind, fake_cuda)
     if op == "linear":
         x = torch.randn(2, 5, 16, generator=g).requires_grad_(True)
         w = torch.randn(8, 16, generator=g).requires_grad_(trainable)
-        fn = lambda: _lin(x, w, fake_cuda)
+        fn = lambda: _lin(x, w, dev)
     else:
         x = torch.randn(1, 4, 5, 5, generator=g).requires_grad_(True)
         w = torch.randn(6, 4, 3, 3, generator=g).requires_grad_(trainable)
-        fn = lambda: _conv(x, w, fake_cuda, (1, 1))
+        fn = lambda: _conv(x, w, dev, (1, 1))
     out, ids = _packed_ids(fn)
     assert (id(x) in ids) == trainable
     out.pow(2).sum().backward()  # and the backward still works without it
     assert x.grad is not None and (w.grad is not None) == trainable
 
 
+@pytest.mark.parametrize("kind", ["cuda-branch", "cpu"])
 @pytest.mark.parametrize("op", ["linear", "conv"])
-def test_frozen_base_grads_under_nonreentrant_checkpoint(op, fake_cuda):
+def test_frozen_base_grads_under_nonreentrant_checkpoint(op, kind, fake_cuda):
     from torch.utils.checkpoint import checkpoint
 
+    fake_cuda = _device(kind, fake_cuda)
     g = torch.Generator().manual_seed(5)
     if op == "linear":
         x0 = torch.randn(2, 5, 16, generator=g)
