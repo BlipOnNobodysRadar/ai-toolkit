@@ -411,7 +411,8 @@ class TrainConfig:
         self.xformers = kwargs.get('xformers', False)
         self.sdp = kwargs.get('sdp', False)
         # let fp32 matmuls (the fp32 LoRA network, Newton-Schulz in Muon-style optimizers) run on TF32 tensor cores.
-        # Matmul inputs are rounded to a 10-bit mantissa; weights, grads and optimizer state stay fp32.
+        # Matmul inputs are rounded to a 10-bit mantissa; weights, grads and optimizer state stay fp32. Applies to the
+        # whole job, sampling included. bilatmuon / bilatmuonns turn TF32 on in their own step whatever this says.
         self.allow_tf32: bool = kwargs.get('allow_tf32', False)
         # see https://huggingface.co/docs/diffusers/main/optimization/attention_backends#available-backends for options
         self.attention_backend: str = kwargs.get('attention_backend', 'native')  # native, flash, _flash_3_hub, _flash_3, 

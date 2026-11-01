@@ -1840,6 +1840,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # torch.autograd.set_detect_anomaly(True)
         # run base process run
         BaseTrainProcess.run(self)
+        # process-wide, so set it both ways: run.py runs several jobs in one process
+        torch.set_float32_matmul_precision('high' if self.train_config.allow_tf32 else 'highest')
+        if self.train_config.allow_tf32:
+            print_acc("TF32 matmuls enabled (train.allow_tf32)")
         params = []
 
         ### HOOK ###
@@ -1936,10 +1940,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
             torch.backends.cuda.enable_math_sdp(True)
             torch.backends.cuda.enable_flash_sdp(True)
             torch.backends.cuda.enable_mem_efficient_sdp(True)
-        if self.train_config.allow_tf32:
-            # process-wide; also covers sampling
-            torch.set_float32_matmul_precision('high')
-            print_acc("TF32 matmuls enabled (train.allow_tf32)")
         
         # # check if we have sage and is flux
         # if self.sd.is_flux:
