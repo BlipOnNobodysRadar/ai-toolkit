@@ -1394,16 +1394,20 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
                     compute_cuda_devices.add(compute_device)
 
                 # 1. Queue Host-to-Device copy
+                # Move first, then cast on the compute device: a combined
+                # device+dtype .to() converts on the CPU into a pageable temp,
+                # which makes the H2D host-synchronous and doubles bf16 bytes.
+                # bf16/fp16 -> fp32 is exact, so results are unchanged.
                 exp_avg = state["exp_avg"].to(
-                    compute_device, non_blocking=True, dtype=torch.float32
-                )
+                    compute_device, non_blocking=True
+                ).to(torch.float32)
                 exp_avg_sq = state["exp_avg_sq"].to(
-                    compute_device, non_blocking=True, dtype=torch.float32
-                )
+                    compute_device, non_blocking=True
+                ).to(torch.float32)
 
-                grad = grad.to(torch.float32).to(compute_device, non_blocking=True)
+                grad = grad.to(compute_device, non_blocking=True).to(torch.float32)
                 p_fp32 = (
-                    p.to(compute_device, dtype=torch.float32, non_blocking=True)
+                    p.to(compute_device, non_blocking=True).to(torch.float32)
                 )
 
                 if apply_ortho_to_group and use_orthograd:

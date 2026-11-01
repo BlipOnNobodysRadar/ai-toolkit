@@ -54,3 +54,27 @@ def test_cpu_param_write_back_is_non_blocking_when_pinned(monkeypatch):
 
     assert set(writes) == ptrs
     assert all(writes.values()), writes
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_h2d_moves_before_casting(monkeypatch, dtype):
+    # A single .to(device, dtype=...) from CPU converts on the CPU into a
+    # pageable temp (host-synchronous H2D). SAEM must move, then cast.
+    params = _params(dtype)
+    opt = SimplifiedAdEMAMixExM(params, lr=1e-3, torch_compile=False)
+    combined = []
+    real_to = torch.Tensor.to
+
+    def recording_to(self, *args, **kwargs):
+        has_device = any(isinstance(a, (torch.device, str)) for a in args) or "device" in kwargs
+        has_dtype = any(isinstance(a, torch.dtype) for a in args) or "dtype" in kwargs
+        if has_device and has_dtype:
+            combined.append((tuple(self.shape), args, kwargs))
+        return real_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", recording_to)
+    for step in range(2):
+        _set_grads(params, step)
+        opt.step()
+    assert combined == []
+
