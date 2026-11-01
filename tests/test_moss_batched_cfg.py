@@ -97,3 +97,18 @@ def test_pipeline_batched_cfg_matches_two_call_path(cond_len, uncond_len):
     (two, two_calls), (one, one_calls) = results[False], results[True]
     assert one_calls * 2 == two_calls
     torch.testing.assert_close(one, two, atol=1e-5, rtol=1e-5)
+
+
+def test_batched_cfg_is_off_by_default():
+    # DeepSeek review C3: previews keep the two-call path (and its memory) unless model_kwargs.batched_cfg opts in
+    import inspect
+    from extensions_built_in.diffusion_models.moss_image import moss_image
+    assert inspect.signature(MossImagePipeline.__call__).parameters["batched_cfg"].default is False
+    assert 'kw.get("batched_cfg", False)' in inspect.getsource(moss_image.MossImageModel.__init__)
+    m = _model()
+    cond = types.SimpleNamespace(text_embeds=[torch.randn(5, 32)])
+    uncond = types.SimpleNamespace(text_embeds=[torch.randn(3, 32)])
+    model = _StubModel(m)
+    MossImagePipeline(model)(cond, uncond, height=96, width=96, num_inference_steps=3,
+                             latents=torch.randn(1, 8, 6, 6), uncond_skip_layers=(SKIP,))
+    assert model.calls == 6  # cond + uncond per step
