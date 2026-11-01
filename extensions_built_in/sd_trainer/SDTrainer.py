@@ -345,6 +345,11 @@ class SDTrainer(BaseSDTrainProcess):
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
         self.training_extras = None
+        if self.train_config.training_extras is None and getattr(self, '_rawr_paired_extras_path', None) is not None:
+            # The mirror of the check below: dropping the config would discard the pair's EDM2/dynamic state and the
+            # next commit would write a manifest without it.
+            raise ValueError('The committed RAWR pair carries training_extras state but training_extras is not '
+                             'configured; resume with its original configuration or start a new output folder')
         if self.train_config.training_extras is not None:
             from training_extras.runtime import TrainingExtras
             if self.train_config.loss_type == 'mean_flow' or self.do_guided_loss or getattr(self.sd, 'is_llm', False):
