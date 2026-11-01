@@ -971,6 +971,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.start_step = self.step_num
             print_acc(f"Found step {self.step_num} in metadata, starting from there")
 
+    def _check_model_lora_ignores_on_resume(self, path, extra_weights):
+        # A run saved before its model declared lora_ignore_if_contains (H3 adaln_proj) holds LoRA weights, and
+        # optimizer/RAWR state, for modules the network now skips. The non-strict load drops those weights silently
+        # and the optimizer load then fails on the group size (RAWR: "refusing a partial resume"; otherwise a silent
+        # fresh optimizer). Say so up front. A pretrained_lora_path is a fresh start, so it only drops them.
+        from toolkit.network_mixins import saved_keys_for_model_ignores
+        hit = saved_keys_for_model_ignores(list(extra_weights or {}), getattr(self.network, 'model_lora_ignores', None))
+        if not hit:
+            return
+        if self.network_config.pretrained_lora_path is not None and path == self.network_config.pretrained_lora_path:
+            print_acc(f"Pretrained LoRA has {len(hit)} weights for modules this model skips "
+                      f"({self.network.model_lora_ignores}); they are not loaded")
+            return
+        raise ValueError(
+            f"{path} was trained with LoRA on modules this model now skips ({self.network.model_lora_ignores}, "
+            f"{len(hit)} saved weights, e.g. {hit[0]}). To resume it as trained, set network.network_kwargs."
+            f"use_model_lora_ignores: false; otherwise start a new output folder")
+
     def load_weights(self, path):
         if self.network is not None:
             extra_weights = self.network.load_weights(path)
@@ -2187,6 +2205,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     print_acc(f"#### IMPORTANT RESUMING FROM {latest_save_path} ####")
                     print_acc(f"Loading from {latest_save_path}")
                     extra_weights = self.load_weights(latest_save_path)
+                    self._check_model_lora_ignores_on_resume(latest_save_path, extra_weights)
                     self.network.multiplier = 1.0
                 elif self.train_config.merge_network_on_save and self.network_config.pretrained_lora_path is not None:
                     # with merge_network_on_save, saved checkpoints are full models that get loaded as the

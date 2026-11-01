@@ -86,3 +86,43 @@ def test_merge_keeps_config_ignores():
     stub = _StubModel('minimax_h3', ['adaln_proj'])
     names = _names(stub, ['blocks.1.'])
     assert names and all('blocks$$0$$attn' in n for n in names)
+
+
+def test_opt_out_keeps_adaln_for_legacy_resume():
+    # DeepSeek review C1: a run saved before the ignore holds adaln LoRA + optimizer state; the opt-out
+    # rebuilds the old network shape so it can resume as trained
+    stub = _StubModel('minimax_h3', ['adaln_proj'])
+    toy = ToyH3()
+    n = LoRASpecialNetwork(
+        None, toy, lora_dim=4, alpha=4, train_text_encoder=False,
+        target_lin_modules=['ToyH3'], is_transformer=True, transformer_only=True,
+        base_model=stub, network_config=NetworkConfig(type='lora', linear=4, linear_alpha=4),
+        use_model_lora_ignores=False)
+    names = [m.lora_name for m in n.unet_loras]
+    assert sum('adaln_proj' in x for x in names) == 2
+    assert n.model_lora_ignores == []
+
+
+def _resume_probe(model_lora_ignores, pretrained=None):
+    from types import SimpleNamespace
+    import importlib
+    base = importlib.import_module('jobs.process.BaseSDTrainProcess').BaseSDTrainProcess
+    probe = SimpleNamespace(network=SimpleNamespace(model_lora_ignores=model_lora_ignores),
+                            network_config=SimpleNamespace(pretrained_lora_path=pretrained))
+    return lambda path, extra: base._check_model_lora_ignores_on_resume(probe, path, extra)
+
+
+def test_resume_of_pre_ignore_save_fails_early_and_explicitly():
+    import pytest
+    from toolkit.network_mixins import saved_keys_for_model_ignores
+    old_keys = {'transformer$$blocks$$0$$adaln_proj$$linear.lora_down.weight': 0,
+                'lora_transformer_blocks_1_adaln_proj_linear.lora_up.weight': 0, 'emb_extra': 0}
+    assert len(saved_keys_for_model_ignores(old_keys, ['adaln_proj'])) == 2
+    check = _resume_probe(['adaln_proj'])
+    with pytest.raises(ValueError, match='use_model_lora_ignores: false'):
+        check('run_000000300.safetensors', old_keys)
+    check('run_000000300.safetensors', {'emb_extra': 0})  # unrelated extras pass
+    check('run_000000300.safetensors', None)
+    _resume_probe([])('run_000000300.safetensors', old_keys)  # opted out: nothing is skipped
+    # a pretrained LoRA is a fresh start: its adaln weights are dropped with a note, not refused
+    _resume_probe(['adaln_proj'], pretrained='old.safetensors')('old.safetensors', old_keys)

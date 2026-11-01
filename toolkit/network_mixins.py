@@ -86,6 +86,33 @@ def _is_power_of_two(value: float) -> bool:
 _LORA_COMPUTE_DTYPES = {'bf16': torch.bfloat16, 'fp16': torch.float16}
 
 
+def merge_model_lora_ignores(ignore_if_contains, base_model, use_model_ignores=True):
+    """Config ignores plus the model's declared lora_ignore_if_contains (layers whose forward bypasses the lora hook).
+
+    Returns (merged list, the model-only entries actually added). Copies, never mutates the config list. Set
+    network_kwargs.use_model_lora_ignores: false to train them anyway, e.g. to resume a run saved before the model
+    declared them (its LoRA and optimizer state still hold those modules).
+    """
+    ignore_if_contains = list(ignore_if_contains or [])
+    model_ignores = getattr(base_model, 'lora_ignore_if_contains', None) if base_model is not None else None
+    if not model_ignores or not use_model_ignores:
+        if model_ignores:
+            print(f"LoRA: use_model_lora_ignores is off; training {list(model_ignores)} on {getattr(base_model, 'arch', '?')}")
+        return ignore_if_contains, []
+    added = [w for w in model_ignores if w not in ignore_if_contains]
+    print(f"LoRA: model {getattr(base_model, 'arch', '?')} also skips modules containing {list(model_ignores)} "
+          f"(network_kwargs.use_model_lora_ignores: false keeps them)")
+    return ignore_if_contains + added, added
+
+
+def saved_keys_for_model_ignores(keys, model_ignores):
+    """Saved LoRA keys that belong to modules skipped only because the model declares them (see above)."""
+    if not keys or not model_ignores:
+        return []
+    pats = {w for w in model_ignores} | {w.replace('.', '_') for w in model_ignores}
+    return [k for k in keys if any(w in k for w in pats)]
+
+
 def add_bias(tensor, bias):
     if bias is None:
         return tensor
