@@ -226,12 +226,16 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
         # dequantize quantized weights to full precision so the delta can be added (the original
         # quantized tensor is restored in the finally block below)
         base_weight = _dequantize_if_needed(orig_weight)
-        eff_weight = base_weight + (self.diff.to(base_weight.device) * mult).to(base_weight.dtype)
+        # under network layer offloading diff/diff_b are pinned CPU masters
+        # (_cpu_master_parameter_names). The copies can be async: the CPU writes the
+        # masters only in optimizer.step, after backward's blocking grad copy to the
+        # host has drained the stream. Any new in-place write must sync first.
+        eff_weight = base_weight + (self.diff.to(base_weight.device, non_blocking=True) * mult).to(base_weight.dtype)
 
         has_bias = self.diff_b is not None and om._parameters.get('bias', None) is not None
         if has_bias:
             orig_bias = om._parameters['bias']
-            eff_bias = orig_bias + (self.diff_b.to(orig_bias.device) * mult).to(orig_bias.dtype)
+            eff_bias = orig_bias + (self.diff_b.to(orig_bias.device, non_blocking=True) * mult).to(orig_bias.dtype)
 
         # temporarily swap in the effective weights so the original forward (norm/linear/etc) uses them.
         # this keeps autograd flowing into our delta while supporting any layer type.

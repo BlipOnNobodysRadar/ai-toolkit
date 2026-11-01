@@ -240,7 +240,11 @@ class ToolkitModuleMixin:
 
         # handle trainable scaler method locon does
         if hasattr(self, 'scalar'):
-            lx = lx * self.scalar.to(device=lx.device, dtype=lx.dtype)
+            # under network layer offloading the scalar is a pinned CPU master
+            # (_cpu_master_parameter_names). The copy can be async: the CPU writes the
+            # master only in optimizer.step, after backward's blocking grad copy to the
+            # host has drained the stream. Any new in-place write must sync first.
+            lx = lx * self.scalar.to(device=lx.device, dtype=lx.dtype, non_blocking=True)
         return lx * scale
 
     def _fast_forward(self: Module, network: Network, x, *args, **kwargs):
@@ -283,7 +287,11 @@ class ToolkitModuleMixin:
         lx = lora_up(lx)
         # handle trainable scaler method locon does
         if hasattr(self, 'scalar'):
-            lx = lx * self.scalar.to(device=lx.device, dtype=lx.dtype)
+            # under network layer offloading the scalar is a pinned CPU master
+            # (_cpu_master_parameter_names). The copy can be async: the CPU writes the
+            # master only in optimizer.step, after backward's blocking grad copy to the
+            # host has drained the stream. Any new in-place write must sync first.
+            lx = lx * self.scalar.to(device=lx.device, dtype=lx.dtype, non_blocking=True)
         return org_forwarded + lx.to(org_forwarded.dtype)
 
     def lorm_forward(self: Network, x, *args, **kwargs):
