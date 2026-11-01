@@ -9,7 +9,7 @@ import torch
 from pytorch_optimizer.base.exception import NoSparseGradientError
 from pytorch_optimizer.base.optimizer import BaseOptimizer
 from pytorch_optimizer.base.type import Betas, Closure, Defaults, Loss, ParamGroup
-from .utils import apply_weight_decay, copy_stochastic_, UPDATE_STRATEGY, NORM_TYPE, agc, _paper_orthograd, adaptive_eps, _get_compiled_stable_spam_clipping, _stable_spam_clipping_impl
+from .utils import apply_weight_decay, copy_stochastic_, UPDATE_STRATEGY, NORM_TYPE, agc, _paper_orthograd, adaptive_eps, _get_compiled_stable_spam_clipping, _stable_spam_clipping_impl, stable_spam_bias_terms, stable_spam_clipping_compiled
 import logging
 
 logger = logging.getLogger(__name__)
@@ -1266,6 +1266,13 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
 
         super().__init__(params, defaults)
 
+        if torch_compile:
+            # The compiled helpers use dynamic=False + fullgraph=True: one graph
+            # per LoRA shape. Past the default limit of 8 that is a hard failure.
+            torch._dynamo.config.recompile_limit = max(
+                torch._dynamo.config.recompile_limit, 64
+            )
+
     def __str__(self) -> str:
         return 'SimplifiedAdEMAMixExM'
 
@@ -1322,6 +1329,8 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
             # Per-step lr/wd tensors for the compiled weight decay, one pair per
             # compute device. Rebuilt every step so scheduler lr changes apply.
             wd_scalars = {}
+            # Per-step StableSPAM bias corrections for the compiled clip, per device.
+            spam_bias_terms = {}
             if 'step' in group:
                 group['step'] += 1
             else:
@@ -1418,9 +1427,11 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
 
                 if use_stable_spam_clipping:
                     if torch_compile:
-                        grad = _get_compiled_stable_spam_clipping()(state,
+                        if compute_device not in spam_bias_terms:
+                            spam_bias_terms[compute_device] = stable_spam_bias_terms(step, compute_device)
+                        grad = stable_spam_clipping_compiled(state,
                                             grad,
-                                            step=step,
+                                            spam_bias_terms[compute_device],
                                             eps=eps_floor)
                     else:
                         grad = _stable_spam_clipping_impl(state, 

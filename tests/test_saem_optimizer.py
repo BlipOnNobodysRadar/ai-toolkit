@@ -129,3 +129,104 @@ def test_compiled_weight_decay_scalars_built_once_per_step(monkeypatch):
     for chunk, lr in zip(per_step, lrs[1:]):
         assert all(t[0] is chunk[0][0] and t[1] is chunk[0][1] for t in chunk)
         assert chunk[0][0].item() == pytest.approx(lr) and chunk[0][1].item() == pytest.approx(0.05)
+
+
+MANY_SHAPES = [(4, 2 + i) for i in range(10)]
+
+
+@pytest.fixture
+def counting_compile(monkeypatch):
+    """Route torch.compile through dynamo with a counting eager backend (no
+    inductor/C++ toolchain needed) and start from a clean dynamo cache."""
+    import torch._dynamo
+    from torch._dynamo.testing import CompileCounter
+    from training_extras.vendor.LoraEasyCustomOptimizer import utils
+
+    counter = CompileCounter()
+    real_compile = torch.compile
+
+    def compile_with_counter(fn=None, **kwargs):
+        kwargs["backend"] = counter
+        return real_compile(fn, **kwargs)
+
+    torch._dynamo.reset()
+    monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 8)
+    monkeypatch.setattr(torch, "compile", compile_with_counter)
+    monkeypatch.setattr(utils, "_compiled_fns", {})
+    yield counter
+    torch._dynamo.reset()
+
+
+def _spam_run(params, torch_compile, steps, opt=None, start=0):
+    torch.manual_seed(1234 + start)  # stochastic rounding of bf16 moments draws RNG
+    if opt is None:
+        opt = SimplifiedAdEMAMixExM(
+            params, lr=1e-3, torch_compile=torch_compile, use_newton_schulz=False,
+        )
+    for step in range(start, start + steps):
+        _set_grads(params, step)
+        opt.step()
+    return opt
+
+
+def test_compiled_stable_spam_compiles_once_per_shape(counting_compile):
+    params = _params(shapes=MANY_SHAPES)
+    _spam_run(params, torch_compile=True, steps=12)
+    assert counting_compile.frame_count == len(MANY_SHAPES)
+
+
+def test_compiled_stable_spam_clip_matches_eager(counting_compile):
+    from training_extras.vendor.LoraEasyCustomOptimizer.utils import (
+        _stable_spam_clipping_impl, stable_spam_bias_terms, stable_spam_clipping_compiled,
+    )
+
+    eager_state, compiled_state = {}, {}
+    for step in range(1, 13):
+        g = torch.Generator().manual_seed(step)
+        grad = torch.randn(6, 5, generator=g) * (1 + step)
+        out_e = _stable_spam_clipping_impl(eager_state, grad.clone(), step=step, eps=1e-12)
+        out_c = stable_spam_clipping_compiled(
+            compiled_state, grad.clone(), stable_spam_bias_terms(step, grad.device), eps=1e-12
+        )
+        torch.testing.assert_close(out_c, out_e, rtol=1e-6, atol=0)
+    assert counting_compile.frame_count == 1
+
+
+def test_compiled_stable_spam_matches_eager(counting_compile):
+    compiled = _params(shapes=MANY_SHAPES)
+    eager = _params(shapes=MANY_SHAPES)
+    opt_c = _spam_run(compiled, torch_compile=True, steps=12)
+    opt_e = _spam_run(eager, torch_compile=False, steps=12)
+    for a, b in zip(compiled, eager):
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)
+    for a, b in zip(compiled, eager):
+        for key in ("ssc_m_max_t", "ssc_m_norm_t", "ssc_v_norm_t"):
+            sa, sb = opt_c.state[a][key], opt_e.state[b][key]
+            assert sa.dtype == torch.float32 and sa.ndim == 0
+            torch.testing.assert_close(sa, sb, rtol=1e-5, atol=0)
+
+
+def test_stable_spam_bias_terms_use_double_precision():
+    from training_extras.vendor.LoraEasyCustomOptimizer.utils import stable_spam_bias_terms
+
+    for step in (1, 10, 1200):
+        bc3, bc1, bc2 = stable_spam_bias_terms(step, torch.device("cpu"))
+        assert bc2.item() == pytest.approx(1.0 - 0.99999 ** step, rel=1e-6)
+        assert bc3.item() == pytest.approx(1.0 - 0.999 ** step, rel=1e-6)
+        assert bc1.item() == pytest.approx(1.0 - 0.85 ** step, rel=1e-6)
+
+
+def test_compiled_state_dict_round_trip(counting_compile):
+    params = _params(shapes=SHAPES)
+    opt = _spam_run(params, torch_compile=True, steps=1)
+    saved = {k: v for k, v in opt.state_dict().items()}
+    resumed_params = [torch.nn.Parameter(p.detach().clone()) for p in params]
+    resumed = SimplifiedAdEMAMixExM(
+        resumed_params, lr=1e-3, torch_compile=True, use_newton_schulz=False,
+    )
+    resumed.load_state_dict(saved)
+    _spam_run(params, torch_compile=True, steps=2, opt=opt, start=1)
+    _spam_run(resumed_params, torch_compile=True, steps=2, opt=resumed, start=1)
+    for a, b in zip(params, resumed_params):
+        assert torch.equal(a, b)
+    assert counting_compile.frame_count == len(SHAPES)
