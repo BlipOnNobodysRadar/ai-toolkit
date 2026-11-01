@@ -1066,6 +1066,11 @@ def apply_weight_decay(
         cautious_weight_decay (bool): If True, applies cautious weight decay.
         torch_compile (bool): If True, route through torch.compile'd wrapper.
     """
+    # Zero decay is an identity in every branch below (p.mul_(1.0) or a
+    # skipped add); return before paying a full-tensor kernel per param.
+    if (not cautious_weight_decay and not isinstance(weight_decay, torch.Tensor)
+            and weight_decay == 0.0):
+        return
     if torch_compile:
         lr_t = torch.tensor(lr, device=p.device, dtype=p.dtype) if not isinstance(lr, torch.Tensor) else lr
         wd_t = torch.tensor(weight_decay, device=p.device, dtype=p.dtype) if not isinstance(weight_decay, torch.Tensor) else weight_decay

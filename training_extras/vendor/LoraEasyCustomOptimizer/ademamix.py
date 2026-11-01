@@ -1319,6 +1319,9 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
         cuda_available = torch.cuda.is_available()
         for group in self.param_groups:
             compute_cuda_devices = set()
+            # Per-step lr/wd tensors for the compiled weight decay, one pair per
+            # compute device. Rebuilt every step so scheduler lr changes apply.
+            wd_scalars = {}
             if 'step' in group:
                 group['step'] += 1
             else:
@@ -1496,11 +1499,23 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
 
                     update.clamp_(-adopt_clip, adopt_clip)
 
+                    wd_lr, wd = group['lr'], group['weight_decay']
+                    if torch_compile and wd != 0.0:
+                        # Same values apply_weight_decay would build per param
+                        # (fp32 on p_fp32's device), but one blocking H2D per
+                        # step instead of two per parameter.
+                        if compute_device not in wd_scalars:
+                            wd_scalars[compute_device] = tuple(
+                                v if isinstance(v, torch.Tensor)
+                                else torch.tensor(v, device=compute_device, dtype=torch.float32)
+                                for v in (wd_lr, wd)
+                            )
+                        wd_lr, wd = wd_scalars[compute_device]
                     apply_weight_decay(
                         p=p_fp32,
                         grad=grad_normed,
-                        lr=group['lr'],
-                        weight_decay=group['weight_decay'],
+                        lr=wd_lr,
+                        weight_decay=wd,
                         weight_decouple=group['weight_decouple'],
                         fixed_decay=False,
                         torch_compile=group.get('torch_compile', False),

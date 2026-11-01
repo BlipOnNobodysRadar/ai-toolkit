@@ -78,3 +78,54 @@ def test_h2d_moves_before_casting(monkeypatch, dtype):
         opt.step()
     assert combined == []
 
+
+
+def test_zero_weight_decay_skips_kernel(monkeypatch):
+    from training_extras.vendor.LoraEasyCustomOptimizer.utils import apply_weight_decay
+
+    calls = []
+    real_mul = torch.Tensor.mul_
+    monkeypatch.setattr(torch.Tensor, "mul_", lambda self, *a, **k: calls.append(a) or real_mul(self, *a, **k))
+    p = torch.randn(4)
+    before = p.clone()
+    apply_weight_decay(p, None, lr=1e-3, weight_decay=0.0, weight_decouple=True, fixed_decay=False)
+    assert calls == [] and torch.equal(p, before)
+    apply_weight_decay(p, None, lr=1e-3, weight_decay=0.1, weight_decouple=True, fixed_decay=False)
+    assert len(calls) == 1 and not torch.equal(p, before)
+
+
+def test_compiled_weight_decay_scalars_built_once_per_step(monkeypatch):
+    from training_extras.vendor.LoraEasyCustomOptimizer import utils
+
+    seen = []
+
+    def fake_compiled(p, grad, lr_t, wd_t, *rest):
+        seen.append((lr_t, wd_t))
+        return utils._apply_weight_decay_compile(p, grad, lr_t, wd_t, *rest)
+
+    monkeypatch.setattr(utils, "_get_compiled_apply_weight_decay", lambda: fake_compiled)
+
+    def run(torch_compile, lrs):
+        params = _params()
+        opt = SimplifiedAdEMAMixExM(
+            params, lr=lrs[0], weight_decay=0.05, torch_compile=torch_compile,
+            use_stable_spam_clipping=False, use_newton_schulz=False,
+        )
+        for step, lr in enumerate(lrs):
+            opt.param_groups[0]["lr"] = lr
+            _set_grads(params, step)
+            opt.step()
+        return params
+
+    lrs = [1e-3, 1e-3, 5e-4, 2e-4]
+    compiled = run(True, lrs)
+    eager = run(False, lrs)
+    for a, b in zip(compiled, eager):
+        torch.testing.assert_close(a, b, rtol=1e-6, atol=1e-7)
+
+    # Step 1 skips the update; steps 2-4 each decay every param.
+    assert len(seen) == 3 * len(SHAPES)
+    per_step = [seen[i * len(SHAPES):(i + 1) * len(SHAPES)] for i in range(3)]
+    for chunk, lr in zip(per_step, lrs[1:]):
+        assert all(t[0] is chunk[0][0] and t[1] is chunk[0][1] for t in chunk)
+        assert chunk[0][0].item() == pytest.approx(lr) and chunk[0][1].item() == pytest.approx(0.05)
