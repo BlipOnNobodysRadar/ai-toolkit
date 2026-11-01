@@ -152,3 +152,64 @@ def test_fp32_without_autocast_is_exact(kind, fake_cuda):
     assert torch.allclose(xg.grad, xr.grad, rtol=1e-6, atol=1e-6)
     assert torch.allclose(w.grad, ref_w, rtol=1e-6, atol=1e-6)
     _check_branch(kind, fake_cuda)
+
+
+# offload-3: a frozen (or quantized) base never reads its input in backward, so the CUDA branch must not save it
+# (native linear/conv don't either); under non-reentrant checkpointing it otherwise stayed alive from the recompute
+# until that block's backward. A trainable offloaded weight (H3's LoRA) still saves x for its grad_weight.
+
+def _packed_ids(fn):
+    ids = []
+
+    def pack(t):
+        ids.append(id(t))
+        return t
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+        out = fn()
+    return out, ids
+
+
+@pytest.mark.parametrize("op", ["linear", "conv"])
+@pytest.mark.parametrize("trainable", [False, True])
+def test_frozen_base_does_not_save_input(op, trainable, fake_cuda):
+    g = torch.Generator().manual_seed(4)
+    if op == "linear":
+        x = torch.randn(2, 5, 16, generator=g).requires_grad_(True)
+        w = torch.randn(8, 16, generator=g).requires_grad_(trainable)
+        fn = lambda: _lin(x, w, fake_cuda)
+    else:
+        x = torch.randn(1, 4, 5, 5, generator=g).requires_grad_(True)
+        w = torch.randn(6, 4, 3, 3, generator=g).requires_grad_(trainable)
+        fn = lambda: _conv(x, w, fake_cuda, (1, 1))
+    out, ids = _packed_ids(fn)
+    assert (id(x) in ids) == trainable
+    out.pow(2).sum().backward()  # and the backward still works without it
+    assert x.grad is not None and (w.grad is not None) == trainable
+
+
+@pytest.mark.parametrize("op", ["linear", "conv"])
+def test_frozen_base_grads_under_nonreentrant_checkpoint(op, fake_cuda):
+    from torch.utils.checkpoint import checkpoint
+
+    g = torch.Generator().manual_seed(5)
+    if op == "linear":
+        x0 = torch.randn(2, 5, 16, generator=g)
+        w1, w2 = torch.randn(16, 16, generator=g) * 0.3, torch.randn(16, 16, generator=g) * 0.3
+        lora = torch.randn(16, 16, generator=g).mul_(0.1).requires_grad_(True)
+        ref_blk = lambda x: F.linear(F.gelu(F.linear(x, w1) + F.linear(x, lora)), w2)
+        blk = lambda x: _lin(F.gelu(_lin(x, w1, fake_cuda) + _lin(x, lora, fake_cuda)), w2, fake_cuda)
+    else:
+        x0 = torch.randn(1, 4, 5, 5, generator=g)
+        w1, w2 = torch.randn(4, 4, 3, 3, generator=g) * 0.3, torch.randn(4, 4, 1, 1, generator=g) * 0.3
+        lora = torch.randn(4, 4, 3, 3, generator=g).mul_(0.1).requires_grad_(True)
+        ref_blk = lambda x: F.conv2d(F.gelu(F.conv2d(x, w1, padding=1) + F.conv2d(x, lora, padding=1)), w2)
+        blk = lambda x: _conv(F.gelu(_conv(x, w1, fake_cuda, (1, 1)) + _conv(x, lora, fake_cuda, (1, 1))), w2,
+                              fake_cuda, (0, 0))
+    xr, xg = x0.clone().requires_grad_(True), x0.clone().requires_grad_(True)
+    ref_blk(xr).pow(2).sum().backward()
+    ref = (xr.grad.clone(), lora.grad.clone())
+    lora.grad = None
+    checkpoint(blk, xg, use_reentrant=False).pow(2).sum().backward()
+    assert torch.allclose(xg.grad, ref[0], rtol=1e-5, atol=1e-6)
+    assert torch.allclose(lora.grad, ref[1], rtol=1e-5, atol=1e-6)

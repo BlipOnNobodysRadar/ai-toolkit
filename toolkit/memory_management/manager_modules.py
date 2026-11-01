@@ -392,7 +392,11 @@ class _BouncingLinearFn(torch.autograd.Function):
             out = F.linear(x, w_gpu, b_gpu)
             _release_forward_slot(state, idx)
 
-        ctx.save_for_backward(x, weight_cpu, bias_cpu)
+        # x is read in backward only for grad_weight, which a frozen or quantized base skips (backward's need_w);
+        # saving it anyway kept every frozen base input alive until its backward, as native linear does not.
+        # Same predicate in the forward and the checkpoint recompute, so the saved-tensor count stays consistent.
+        need_w = getattr(weight_cpu, "requires_grad", False) and weight_cpu.dtype.is_floating_point
+        ctx.save_for_backward(x if need_w else None, weight_cpu, bias_cpu)
         # the Parameters themselves, for the .grad check in _stage_grads_to_cpu
         # (saved_tensors may be checkpoint-recomputed aliases)
         ctx.params = (weight_cpu, bias_cpu)
@@ -551,7 +555,11 @@ class _BouncingConv2dFn(torch.autograd.Function):
             out = F.conv2d(x, w_gpu, b_gpu, stride, padding, dilation, groups)
             _release_forward_slot(state, idx)
 
-        ctx.save_for_backward(x, weight_cpu, bias_cpu)
+        # frozen/quantized bases never read x in backward: see _BouncingLinearFn.forward (conv2d_input needs only
+        # its shape)
+        need_w = getattr(weight_cpu, "requires_grad", False) and weight_cpu.dtype.is_floating_point
+        ctx.x_shape = x.shape
+        ctx.save_for_backward(x if need_w else None, weight_cpu, bias_cpu)
         ctx.params = (weight_cpu, bias_cpu)  # see _BouncingLinearFn.forward
         ctx.meta = (device, stride, padding, dilation, groups, target_dtype)
         return out
@@ -645,7 +653,7 @@ class _BouncingConv2dFn(torch.autograd.Function):
         # explicit casts, see _BouncingLinearFn.backward (autocast does not cover convolution_backward)
         go = grad_out.to(dtype=target_dtype)
         grad_input = conv2d_input(
-            x.shape,
+            ctx.x_shape,
             w_bwd.to(go.dtype),
             go,
             stride=stride,
