@@ -826,7 +826,9 @@ class SimplifiedAdEMAMix(BaseOptimizer):
                     if p.dtype == torch.bfloat16:
                         copy_stochastic_(p.data, p_fp32, scratch=srng)
                     else:
-                        p.data.copy_(p_fp32)
+                        # Async D2H into pinned memory; the torch.cuda.synchronize after
+                        # _foreach_step returns makes this safe. Do not read p on the host before it.
+                        p.data.copy_(p_fp32, non_blocking=p.data.is_pinned())
                 else:
                     if p.dtype == torch.bfloat16:
                         copy_stochastic_(p, p_fp32, scratch=srng)
@@ -1113,7 +1115,9 @@ class SimplifiedAdEMAMix(BaseOptimizer):
                         if p.dtype == torch.bfloat16:
                             copy_stochastic_(p.data, p_fp32, scratch=srng)
                         else:
-                            p.data.copy_(p_fp32)
+                            # Async D2H into pinned memory; the group-end torch.cuda.synchronize
+                            # below is what makes this safe. Do not read p on the host before it.
+                            p.data.copy_(p_fp32, non_blocking=p.data.is_pinned())
                     else:
                         if p.dtype == torch.bfloat16:
                             copy_stochastic_(p, p_fp32, scratch=srng)
@@ -1506,7 +1510,9 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
                     if p.dtype == torch.bfloat16:
                         copy_stochastic_(p.data, p_fp32)
                     else:
-                        p.data.copy_(p_fp32)
+                        # Async D2H into pinned memory; the group-end torch.cuda.synchronize
+                        # below is what makes this safe. Do not read p on the host before it.
+                        p.data.copy_(p_fp32, non_blocking=p.data.is_pinned())
                 else:
                     # Original GPU path
                     if p.dtype == torch.bfloat16:
