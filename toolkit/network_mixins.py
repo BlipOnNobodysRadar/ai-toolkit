@@ -83,6 +83,9 @@ def _is_power_of_two(value: float) -> bool:
     return value != 0.0 and math.isfinite(value) and abs(math.frexp(value)[0]) == 0.5
 
 
+_LORA_COMPUTE_DTYPES = {'bf16': torch.bfloat16, 'fp16': torch.float16}
+
+
 def add_bias(tensor, bias):
     if bias is None:
         return tensor
@@ -200,13 +203,47 @@ class ToolkitModuleMixin:
             with torch.no_grad():
                 runtime_scale.fill_(self.scale)
 
-    def _call_forward(self: Module, x):
+    def _lora_compute_dtype(self: Module, network: Network, x):
+        # network.compute_dtype (opt-in): low precision compute for plain linear LoRA with fp32
+        # masters. Offloaded networks stay fp32: the offload backward never casts float weights.
+        cfg = getattr(network, 'network_config', None)
+        name = getattr(cfg, 'compute_dtype', None)
+        if name is None or self.__class__.__name__ != 'LoRAModule':
+            return None
+        if not (isinstance(self.lora_down, nn.Linear) and isinstance(self.lora_up, nn.Linear)):
+            return None
+        if getattr(self, 'lora_mid', None) is not None:
+            return None
+        if hasattr(network, '_memory_manager') or getattr(cfg, 'layer_offloading', False):
+            return None
+        if hasattr(self.lora_down, '_layer_memory_manager') or hasattr(self.lora_up, '_layer_memory_manager'):
+            return None
+        if x.dtype in (torch.bfloat16, torch.float16):
+            return x.dtype
+        return _LORA_COMPUTE_DTYPES[name]
+
+    def _lora_down_in(self: Module, x, compute_dtype):
+        if compute_dtype is None:
+            return self.lora_down(x)
+        return torch.nn.functional.linear(x, self.lora_down.weight.to(compute_dtype))
+
+    def _lora_up_in(self: Module, lx, compute_dtype):
+        if compute_dtype is None:
+            return self.lora_up(lx)
+        bias = self.lora_up.bias
+        return torch.nn.functional.linear(
+            lx, self.lora_up.weight.to(compute_dtype), None if bias is None else bias.to(compute_dtype)
+        )
+
+    def _call_forward(self: Module, x, compute_dtype=None):
         # module dropout
         if self.module_dropout is not None and self.training:
             if torch.rand(1) < self.module_dropout:
                 return 0.0  # added to original forward
 
-        if hasattr(self, 'lora_mid') and self.lora_mid is not None:
+        if compute_dtype is not None:
+            lx = self._lora_down_in(x, compute_dtype)  # lora_mid is excluded by _lora_compute_dtype
+        elif hasattr(self, 'lora_mid') and self.lora_mid is not None:
             lx = self.lora_mid(self.lora_down(x))
         else:
             try:
@@ -236,7 +273,7 @@ class ToolkitModuleMixin:
         else:
             scale = self._runtime_scale
 
-        lx = self.lora_up(lx)
+        lx = self._lora_up_in(lx, compute_dtype)
 
         # handle trainable scaler method locon does
         if hasattr(self, 'scalar'):
@@ -247,7 +284,7 @@ class ToolkitModuleMixin:
             lx = lx * self.scalar.to(device=lx.device, dtype=lx.dtype, non_blocking=True)
         return lx * scale
 
-    def _fast_forward(self: Module, network: Network, x, *args, **kwargs):
+    def _fast_forward(self: Module, network: Network, x, *args, compute_dtype=None, **kwargs):
         # Plain LoRA with a uniform multiplier: apply alpha/rank * multiplier to the rank-size
         # down output instead of the output-size result, which saves two full-size fp32
         # multiplies per module per pass (and their backward). Only taken when the scale and the
@@ -258,8 +295,7 @@ class ToolkitModuleMixin:
             return None
         if self.__class__.__name__ != 'LoRAModule':
             return None  # DoRA, LoKr, LyCORIS and full-weight modules keep their own math
-        lora_up = self.lora_up
-        if getattr(lora_up, 'bias', None) is not None:
+        if getattr(self.lora_up, 'bias', None) is not None:
             return None  # a lora_up bias must stay inside the scaled output
         if self.training and (self.module_dropout is not None
                               or (self.rank_dropout is not None and self.rank_dropout > 0)):
@@ -271,9 +307,11 @@ class ToolkitModuleMixin:
         org_forwarded = self.org_forward(x, *args, **kwargs)
         if isinstance(x, QTensor):
             x = x.dequantize()
-        # always cast to float32
-        lora_input = x.to(self.lora_down.weight.dtype)
-        if hasattr(self, 'lora_mid') and self.lora_mid is not None:
+        # always cast to float32 (unless network.compute_dtype opts into low precision)
+        lora_input = x.to(compute_dtype if compute_dtype is not None else self.lora_down.weight.dtype)
+        if compute_dtype is not None:
+            lx = self._lora_down_in(lora_input, compute_dtype)
+        elif hasattr(self, 'lora_mid') and self.lora_mid is not None:
             lx = self.lora_mid(self.lora_down(lora_input))
         else:
             lx = self.lora_down(lora_input)
@@ -284,7 +322,7 @@ class ToolkitModuleMixin:
         if factor != 1.0:
             scale = self._runtime_scale if m == 1.0 else self._runtime_scale * m
             lx = lx * scale
-        lx = lora_up(lx)
+        lx = self._lora_up_in(lx, compute_dtype)
         # handle trainable scaler method locon does
         if hasattr(self, 'scalar'):
             # under network layer offloading the scalar is a pinned CPU master
@@ -357,7 +395,8 @@ class ToolkitModuleMixin:
         if self.__class__.__name__ == "LokrModule":
             return self._call_forward(x)
 
-        fast = self._fast_forward(network, x, *args, **kwargs)
+        compute_dtype = self._lora_compute_dtype(network, x)
+        fast = self._fast_forward(network, x, *args, compute_dtype=compute_dtype, **kwargs)
         if fast is not None:
             return fast
 
@@ -365,10 +404,16 @@ class ToolkitModuleMixin:
 
         if isinstance(x, QTensor):
             x = x.dequantize()
-        # always cast to float32
-        lora_input = x.to(self.lora_down.weight.dtype)
-        lora_output = self._call_forward(lora_input)
+        # always cast to float32 (unless network.compute_dtype opts into low precision)
+        lora_input = x.to(compute_dtype if compute_dtype is not None else self.lora_down.weight.dtype)
+        if compute_dtype is None:
+            lora_output = self._call_forward(lora_input)
+        else:
+            lora_output = self._call_forward(lora_input, compute_dtype=compute_dtype)
         multiplier = self.network_ref().torch_multiplier.to(device=lora_output.device)
+        if compute_dtype is not None:
+            # the fp32 multiplier would otherwise promote the output back to fp32
+            multiplier = multiplier.to(dtype=lora_output.dtype)
 
         lora_output_batch_size = lora_output.size(0)
         multiplier_batch_size = multiplier.size(0)

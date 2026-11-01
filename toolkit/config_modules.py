@@ -237,6 +237,13 @@ class NetworkConfig:
         # only useful in very special cases. 
         self.all_layers = kwargs.get('all_layers', False)
 
+        # opt-in (numeric change): run plain linear LoRA GEMMs in bf16/fp16 with fp32 masters and grads. None keeps fp32 compute. Ignored for conv, DoRA, LoKr and offloaded networks.
+        self.compute_dtype = kwargs.get('compute_dtype', None)
+        if self.compute_dtype is not None:
+            self.compute_dtype = {'bf16': 'bf16', 'bfloat16': 'bf16', 'fp16': 'fp16', 'float16': 'fp16'}.get(str(self.compute_dtype).lower())
+            if self.compute_dtype is None:
+                raise ValueError("network.compute_dtype must be bf16 or fp16")
+
 
 AdapterTypes = Literal['t2i', 'ip', 'ip+', 'clip', 'ilora', 'photo_maker', 'control_net', 'control_lora', 'i2v']
 
