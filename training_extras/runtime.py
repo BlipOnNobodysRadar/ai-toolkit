@@ -1,5 +1,6 @@
 """Opt-in loss composition with independent, resumable weighting state."""
 import os
+import warnings
 import torch
 from .loss_bridge import LossBridge
 from .edm import EDMWeighting
@@ -36,8 +37,10 @@ class TrainingExtras(torch.nn.Module):
 
     def step(self): self.edm.step()
 
-    def checkpoint(self, path):
+    def checkpoint(self, path, curve_dir=None, step=None):
         payload = {'config':self.config, 'module':self.state_dict(), 'dynamic':self.dynamic.state_dict()}
+        # Completed-step stamp: restore refuses state from another checkpoint (a stale or mismatched resume).
+        if step is not None: payload['completed_steps'] = int(step)
         if self.edm.enabled:
             payload.update(optimizer=self.edm.aux_optimizer.state_dict(), scheduler=self.edm.aux_scheduler.state_dict())
         torch.save(payload, str(path)+'.tmp')
@@ -51,16 +54,23 @@ class TrainingExtras(torch.nn.Module):
                     t=torch.arange(model.num_train_timesteps,device=self.edm.device)
                     logvar=model._forward(t).detach()
                     weight=model.lambda_weights/torch.exp(logvar)
-                curve=os.path.join(os.path.dirname(path),'edm2-weighting.csv')
+                # The curve is a report for the save folder, even when the state lives in a RAWR pair slot.
+                curve=os.path.join(curve_dir if curve_dir is not None else os.path.dirname(path),'edm2-weighting.csv')
                 with open(curve+'.tmp','w',newline='',encoding='utf-8') as f:
                     writer=csv.writer(f);writer.writerow(['timestep','sigma','log_variance','prediction_weight'])
                     writer.writerows(zip(t.cpu().tolist(),(t/model.num_train_timesteps).cpu().tolist(),logvar.cpu().tolist(),weight.cpu().tolist()))
                 os.replace(curve+'.tmp',curve)
             finally:model.train(training)
 
-    def restore(self, path):
+    def restore(self, path, expected_step=None):
         data = torch.load(path, map_location='cpu', weights_only=True)
         if data['config'] != self.config: raise ValueError('Loss configuration differs from saved training extras state')
+        saved_step = data.get('completed_steps')
+        if saved_step is None:
+            if expected_step is not None:
+                warnings.warn(f'{path} has no step stamp (legacy file); cannot certify it matches resume step {expected_step}', RuntimeWarning)
+        elif expected_step is not None and int(saved_step) != int(expected_step):
+            raise ValueError(f'training_extras state step {saved_step} does not match resume step {expected_step}')
         self.load_state_dict(data['module'])
         self.dynamic.load_state_dict(data['dynamic'])
         if self.edm.enabled:

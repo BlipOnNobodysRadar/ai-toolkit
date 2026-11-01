@@ -322,8 +322,18 @@ class SDTrainer(BaseSDTrainProcess):
                 self.device_torch, self.train_config.steps)
             if self.training_extras.edm.enabled and self.train_config.dtype not in ('bf16','bfloat16','float32','fp32'):
                 raise ValueError('EDM2 currently requires BF16 or FP32 in this host; FP16 AMP is unsupported')
-            state = os.path.join(self.save_root, 'training_extras.pt')
-            if os.path.exists(state): self.training_extras.restore(state)
+            if getattr(self, '_rawr_pair_generation', None) is not None:
+                # Resuming a committed RAWR pair: only the extras state hashed into that pair belongs to its step.
+                state = getattr(self, '_rawr_paired_extras_path', None)
+                if state is None and self.step_num > 0:
+                    raise ValueError('The committed RAWR pair has no training_extras state; resume with its original '
+                                     'configuration or start a new output folder')
+            else:
+                state = os.path.join(self.save_root, 'training_extras.pt')
+            if state is not None and os.path.exists(state):
+                # An explicit start_step override is the user's call; otherwise the stamp must match the resume step.
+                self.training_extras.restore(
+                    state, expected_step=self.step_num if self.train_config.start_step is None else None)
         if self.is_caching_text_embeddings:
             # make sure model is on cpu for this part so we don't oom.
             self.sd.unet.to('cpu')
