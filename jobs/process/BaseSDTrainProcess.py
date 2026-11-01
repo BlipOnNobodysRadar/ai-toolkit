@@ -499,6 +499,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
     
     def done_hook(self):
         pass
+
+    def release_accelerator_state(self):
+        # toolkit/accelerator.py shares one Accelerator per process, and prepare() keeps every model, optimizer and
+        # scheduler in its own lists. Without this, a later job in the same run.py process (several configs, or -r
+        # after a failure) starts with this job's network, optimizer state and base model still referenced.
+        self.modules_being_trained.clear()
+        self.optimizer = None
+        self.lr_scheduler = None
+        self.params = []
+        self.accelerator.free_memory()
+        flush()
     
     def end_step_hook(self):
         pass
@@ -3103,6 +3114,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         flush()
         self.done_hook()
+        # after done_hook, so UI status/async work has finished with the job's objects
+        self.release_accelerator_state()
 
     def push_to_hub(
     self,
