@@ -1,5 +1,6 @@
 import copy
 import json
+import math
 import os
 import random
 import traceback
@@ -397,9 +398,12 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         self.source_configs: List['DatasetConfig'] = list(source_configs) if source_configs else [dataset_config]
         self.is_pooled = len(self.source_configs) > 1
         self.dataset_config = dataset_config
-        # update bucket divisibility
+        # update bucket divisibility. An unset bucket_tolerance uses the model's divisibility;
+        # a set one is rounded up to a multiple of it so latents and packing stay valid.
+        div = sd.get_bucket_divisibility() if sd is not None else 8
         for config in self.source_configs:
-            config.bucket_tolerance = sd.get_bucket_divisibility()
+            tol = config.bucket_tolerance or div
+            config.bucket_tolerance = int(math.ceil(int(tol) / div) * div)
         self.is_video = any(c.num_frames > 1 or c.auto_frame_count for c in self.source_configs)
         self.is_audio_model = hasattr(sd, 'is_audio_model') and sd.is_audio_model if sd is not None else False
         # text-generating multimodal models take audio, image and video files in one dataset
