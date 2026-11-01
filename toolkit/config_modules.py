@@ -524,6 +524,8 @@ class TrainConfig:
         # unmasked reign. It is unmasked regularization basically
         self.inverted_mask_prior = kwargs.get('inverted_mask_prior', False)
         self.inverted_mask_prior_multiplier = kwargs.get('inverted_mask_prior_multiplier', 0.5)
+        # how a pixel mask is downsampled to latent size for masked loss: 'nearest' (legacy, one pixel per cell) or 'area' (cell average)
+        self.mask_resize_mode: str = kwargs.get('mask_resize_mode', 'nearest')
         
         # DOP will will run the same image and prompt through the network without the trigger word blank and use it as a target
         self.diff_output_preservation = kwargs.get('diff_output_preservation', False)

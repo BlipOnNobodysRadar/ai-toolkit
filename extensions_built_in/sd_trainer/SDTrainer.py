@@ -49,6 +49,26 @@ adapter_transforms = transforms.Compose([
 ])
 
 
+def latent_mask_multiplier(mask: torch.Tensor, latent_shape, mode: str = 'nearest') -> torch.Tensor:
+    """Pixel mask (B,1,H,W) -> mean-1 loss multiplier (B,C,h,w) at latent size, in float32.
+
+    'nearest' (legacy) samples one pixel per latent cell; 'area' averages each cell, so partial and thin
+    subject parts keep their share of weight and the mask is not shifted by half a cell.
+    """
+    # latents are B,C,H,W or video B,C,T,H,W
+    h, w = latent_shape[-2], latent_shape[-1]
+    mask = mask.to(dtype=torch.float32).detach()
+    if mode == 'area':
+        mask = torch.nn.functional.interpolate(mask, size=(h, w), mode='area')
+    elif mode == 'nearest':
+        mask = torch.nn.functional.interpolate(mask, size=(h, w))
+    else:
+        raise ValueError(f"mask_resize_mode must be 'nearest' or 'area', got {mode!r}")
+    mask = mask.expand(-1, latent_shape[1], -1, -1)
+    # make avg 1.0 (float32: bf16 normalisation rounds each weight by up to ~0.4%)
+    return (mask / mask.mean()).detach()
+
+
 class SDTrainer(BaseSDTrainProcess):
 
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
@@ -1597,24 +1617,9 @@ class SDTrainer(BaseSDTrainProcess):
             mask_multiplier = torch.ones((noisy_latents.shape[0], 1, 1, 1), device=self.device_torch, dtype=dtype)
             if batch.mask_tensor is not None and self.sd.do_masked_loss:
                 with self.timer('get_mask_multiplier'):
-                    # upsampling no supported for bfloat16
-                    mask_multiplier = batch.mask_tensor.to(self.device_torch, dtype=torch.float16).detach()
-                    # scale down to the size of the latents, mask multiplier shape(bs, 1, width, height), noisy_latents shape(bs, channels, width, height)
-                    if len(noisy_latents.shape) == 5:
-                        # video B,C,T,H,W
-                        h = noisy_latents.shape[3]
-                        w = noisy_latents.shape[4]
-                    else:
-                        h = noisy_latents.shape[2]
-                        w = noisy_latents.shape[3]
-                    mask_multiplier = torch.nn.functional.interpolate(
-                        mask_multiplier, size=(h, w)
-                    )
-                    # expand to match latents
-                    mask_multiplier = mask_multiplier.expand(-1, noisy_latents.shape[1], -1, -1)
-                    mask_multiplier = mask_multiplier.to(self.device_torch, dtype=dtype).detach()
-                    # make avg 1.0
-                    mask_multiplier = mask_multiplier / mask_multiplier.mean()
+                    mask_multiplier = latent_mask_multiplier(
+                        batch.mask_tensor.to(self.device_torch), noisy_latents.shape,
+                        getattr(self.train_config, 'mask_resize_mode', 'nearest'))
 
         def get_adapter_multiplier():
             if self.adapter and isinstance(self.adapter, T2IAdapter):
