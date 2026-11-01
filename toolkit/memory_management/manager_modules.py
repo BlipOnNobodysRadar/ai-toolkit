@@ -392,7 +392,11 @@ class _BouncingLinearFn(torch.autograd.Function):
             out = F.linear(x, w_gpu, b_gpu)
             _release_forward_slot(state, idx)
 
-        ctx.save_for_backward(x, weight_cpu, bias_cpu)
+        # x is read in backward only for grad_weight, which a frozen or quantized base skips (backward's need_w);
+        # saving it anyway kept every frozen base input alive until its backward, as native linear does not.
+        # Same predicate in the forward and the checkpoint recompute, so the saved-tensor count stays consistent.
+        need_w = getattr(weight_cpu, "requires_grad", False) and weight_cpu.dtype.is_floating_point
+        ctx.save_for_backward(x if need_w else None, weight_cpu, bias_cpu)
         # the Parameters themselves, for the .grad check in _stage_grads_to_cpu
         # (saved_tensors may be checkpoint-recomputed aliases)
         ctx.params = (weight_cpu, bias_cpu)
@@ -420,9 +424,11 @@ class _BouncingLinearFn(torch.autograd.Function):
                 torch.float32,
             ):
                 w_mat = w_mat.to(target_dtype)
-            grad_input = go_cpu @ w_mat
+            # explicit casts: under autocast the forward ran in bf16 but backward runs without it, so grad_out,
+            # x and the float weight can differ in dtype (no-ops when nothing is autocast)
+            grad_input = go_cpu.to(w_mat.dtype) @ w_mat
             grad_weight = (
-                go_cpu.flatten(0, -2).T @ x_cpu.flatten(0, -2)
+                go_cpu.flatten(0, -2).T @ x_cpu.to(go_cpu.dtype).flatten(0, -2)
                 if getattr(weight_cpu, "requires_grad", False)
                 and weight_cpu.dtype.is_floating_point
                 else None
@@ -455,8 +461,11 @@ class _BouncingLinearFn(torch.autograd.Function):
             state, device, _materialize_for_bwd, weight_cpu
         )
 
-        # grad wrt input (GPU)
-        grad_input = grad_out.to(dtype=target_dtype) @ w_bwd
+        # grad wrt input (GPU). Explicit casts: under autocast the forward computed in bf16 (grad_out is bf16) while
+        # backward runs without autocast and the float path stages the weight uncast, so grad_out, w_bwd and x can
+        # differ in dtype. Every cast is a no-op when nothing is autocast.
+        go = grad_out.to(dtype=target_dtype)
+        grad_input = go @ w_bwd.to(go.dtype)
         _release_backward_weight_slot(state, idx)
 
         # compute grads if float masters exist (frozen/quantized bases skip this)
@@ -472,7 +481,7 @@ class _BouncingLinearFn(torch.autograd.Function):
             torch.cuda.current_stream().wait_event(state["grad_xfer_done"][idx])
             w_grad_gpu = b_grad_gpu = None
             if need_w:
-                w_grad_gpu = grad_out.flatten(0, -2).T @ x.flatten(0, -2)
+                w_grad_gpu = grad_out.flatten(0, -2).T @ x.flatten(0, -2).to(grad_out.dtype)
                 state["w_grad_buffers"][idx] = w_grad_gpu
             if need_b:
                 b_grad_gpu = grad_out.sum(dim=tuple(range(grad_out.ndim - 1)))
@@ -546,7 +555,11 @@ class _BouncingConv2dFn(torch.autograd.Function):
             out = F.conv2d(x, w_gpu, b_gpu, stride, padding, dilation, groups)
             _release_forward_slot(state, idx)
 
-        ctx.save_for_backward(x, weight_cpu, bias_cpu)
+        # frozen/quantized bases never read x in backward: see _BouncingLinearFn.forward (conv2d_input needs only
+        # its shape)
+        need_w = getattr(weight_cpu, "requires_grad", False) and weight_cpu.dtype.is_floating_point
+        ctx.x_shape = x.shape
+        ctx.save_for_backward(x if need_w else None, weight_cpu, bias_cpu)
         ctx.params = (weight_cpu, bias_cpu)  # see _BouncingLinearFn.forward
         ctx.meta = (device, stride, padding, dilation, groups, target_dtype)
         return out
@@ -574,10 +587,11 @@ class _BouncingConv2dFn(torch.autograd.Function):
                 w_cpu = w_cpu.to(target_dtype)
             from torch.nn.grad import conv2d_input, conv2d_weight  # type: ignore
 
+            # explicit casts, see _BouncingLinearFn.backward (autocast does not cover convolution_backward)
             grad_input = conv2d_input(
                 x_cpu.shape,
                 w_cpu,
-                go,
+                go.to(w_cpu.dtype),
                 stride=stride,
                 padding=padding,
                 dilation=dilation,
@@ -585,7 +599,7 @@ class _BouncingConv2dFn(torch.autograd.Function):
             )
             grad_weight = (
                 conv2d_weight(
-                    x_cpu,
+                    x_cpu.to(go.dtype),
                     w_cpu.shape,
                     go,
                     stride=stride,
@@ -636,10 +650,12 @@ class _BouncingConv2dFn(torch.autograd.Function):
 
         from torch.nn.grad import conv2d_input, conv2d_weight  # type: ignore
 
+        # explicit casts, see _BouncingLinearFn.backward (autocast does not cover convolution_backward)
+        go = grad_out.to(dtype=target_dtype)
         grad_input = conv2d_input(
-            x.shape,
-            w_bwd,
-            grad_out.to(dtype=target_dtype),
+            ctx.x_shape,
+            w_bwd.to(go.dtype),
+            go,
             stride=stride,
             padding=padding,
             dilation=dilation,
@@ -660,7 +676,7 @@ class _BouncingConv2dFn(torch.autograd.Function):
             w_grad_gpu = b_grad_gpu = None
             if need_w:
                 w_grad_gpu = conv2d_weight(
-                    x,
+                    x.to(grad_out.dtype),
                     weight_cpu.shape,
                     grad_out,
                     stride=stride,

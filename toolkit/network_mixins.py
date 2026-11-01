@@ -234,7 +234,11 @@ class ToolkitModuleMixin:
 
         # handle trainable scaler method locon does
         if hasattr(self, 'scalar'):
-            lx = lx * self.scalar.to(device=lx.device, dtype=lx.dtype)
+            # non_blocking: under network offload the scalar is a pinned CPU master (_cpu_master_parameter_names), and a
+            # blocking H2D syncs the stream, idling the GPU before the next offloaded weight copy. Safe because the
+            # master is only written in optimizer.step, after backward's synchronous copy back to the CPU and SAEM's
+            # final cuda.synchronize, so no in-flight copy can see a half-written value.
+            lx = lx * self.scalar.to(device=lx.device, dtype=lx.dtype, non_blocking=True)
         return lx * scale
 
     def lorm_forward(self: Network, x, *args, **kwargs):
