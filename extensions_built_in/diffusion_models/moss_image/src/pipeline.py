@@ -97,6 +97,7 @@ class MossImagePipeline:
         uncond_skip_layers: Sequence[int] = DEFAULT_UNCOND_SKIP_LAYERS,
         ref_latents: Optional[List[List[torch.Tensor]]] = None,
         isolate_refs: bool = False,
+        batched_cfg: bool = False,
         **kwargs,
     ):
         model = self.model
@@ -129,16 +130,45 @@ class MossImagePipeline:
             if isolate_refs:
                 cond_cache, uncond_cache = {}, {}
 
+        # batched_cfg: cond + uncond as one B=2 forward (the skipped blocks run
+        # on the cond item only), so offloaded weights stream once per step.
+        # Same math, but bf16 numerics differ slightly from the two-call path
+        batched = (
+            batched_cfg
+            and do_cfg
+            and not has_refs
+            and latents.shape[0] == 1
+            and len(conditional_embeds.text_embeds) == 1
+            and len(unconditional_embeds.text_embeds) == 1
+        )
+        if batched:
+            both, both_mask = stack_text_embeds(
+                list(conditional_embeds.text_embeds) + list(unconditional_embeds.text_embeds),
+                device,
+                dtype,
+            )
+
         sigmas = moss_sigmas(num_inference_steps, shift=shift).to(device)
         num_steps = len(sigmas) - 1
         for step_index in range(num_steps):
             sigma, sigma_next = sigmas[step_index], sigmas[step_index + 1]
             timestep = (sigma * NUM_TRAIN_TIMESTEPS).reshape(1)
             # CFG combines fp32 predictions even though the DiT runs in bf16
-            pred = transformer(
-                latents, timestep, cond, cond_mask, ref_kv_cache=cond_cache, **ref_kwargs
-            ).float()
-            if do_cfg:
+            if batched:
+                out = transformer(
+                    latents.expand(2, -1, -1, -1),
+                    timestep,
+                    both,
+                    both_mask,
+                    skip_layers=uncond_skip_layers,
+                    skip_layers_items=[1],
+                ).float()
+                pred = out[1:] + guidance_scale * (out[:1] - out[1:])
+            else:
+                pred = transformer(
+                    latents, timestep, cond, cond_mask, ref_kv_cache=cond_cache, **ref_kwargs
+                ).float()
+            if do_cfg and not batched:
                 pred_uncond = transformer(
                     latents,
                     timestep,
