@@ -226,9 +226,10 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
         # dequantize quantized weights to full precision so the delta can be added (the original
         # quantized tensor is restored in the finally block below)
         base_weight = _dequantize_if_needed(orig_weight)
-        # non_blocking: diff/diff_b are pinned CPU masters under network offload; see the scalar note in
-        # ToolkitModuleMixin._call_forward (written only in optimizer.step, after backward's synchronous copy back and
-        # SAEM's final cuda.synchronize), so the async H2D cannot race a write
+        # under network layer offloading diff/diff_b are pinned CPU masters
+        # (_cpu_master_parameter_names). The copies can be async: the CPU writes the
+        # masters only in optimizer.step, after backward's blocking grad copy to the
+        # host has drained the stream. Any new in-place write must sync first.
         eff_weight = base_weight + (self.diff.to(base_weight.device, non_blocking=True) * mult).to(base_weight.dtype)
 
         has_bias = self.diff_b is not None and om._parameters.get('bias', None) is not None
