@@ -218,8 +218,7 @@ class ToolkitModuleMixin:
             return None
         if hasattr(self.lora_down, '_layer_memory_manager') or hasattr(self.lora_up, '_layer_memory_manager'):
             return None
-        if x.dtype in (torch.bfloat16, torch.float16):
-            return x.dtype
+        # The configured dtype wins over the activation dtype: fp16 on a bf16 model must not run as bf16.
         return _LORA_COMPUTE_DTYPES[name]
 
     def _lora_down_in(self: Module, x, compute_dtype):

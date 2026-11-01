@@ -169,6 +169,17 @@ def test_conv_and_offloaded_stay_fp32():
     assert all(m._lora_compute_dtype(off, x) is None for m in off.get_all_modules())
 
 
+def test_configured_dtype_wins_over_activation_dtype():
+    # DeepSeek review B3: compute_dtype fp16 used to follow bf16 activations and run as bf16.
+    _, net = build("fp16")
+    for dtype in (torch.bfloat16, torch.float16, torch.float32):
+        x = torch.zeros(1, 4, D, dtype=dtype)
+        assert all(m._lora_compute_dtype(net, x) is torch.float16 for m in lora_linears(net))
+    _, net = build("bf16")
+    x = torch.zeros(1, 4, D, dtype=torch.float16)
+    assert all(m._lora_compute_dtype(net, x) is torch.bfloat16 for m in lora_linears(net))
+
+
 def test_rank_dropout_still_applies():
     model, net = build("bf16")
     base_out, _ = run(model, net)
