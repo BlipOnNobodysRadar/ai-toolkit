@@ -842,7 +842,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.modules_being_trained.append(self.adapter)
         
         # prepare other things
-        self.optimizer = self.accelerator.prepare(self.optimizer)
+        # no device placement: the optimizer state is already where its optimizer keeps it (torch's load_state_dict
+        # casts to the param device). Placement copied a restored state wholesale onto the GPU (4.6 GiB on H3 resume)
+        # before CPU-offloading optimizers moved it back.
+        self.optimizer = self.accelerator.prepare(self.optimizer, device_placement=[False])
         if self.lr_scheduler is not None:
             self.lr_scheduler = self.accelerator.prepare(self.lr_scheduler)
         # self.data_loader = self.accelerator.prepare(self.data_loader)
