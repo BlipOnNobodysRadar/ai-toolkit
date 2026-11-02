@@ -69,6 +69,8 @@ from diffusers import FluxTransformer2DModel
 from toolkit.accelerator import get_accelerator, unwrap_model
 from toolkit.print import print_acc
 from accelerate import Accelerator
+from accelerate.optimizer import move_to_device
+from accelerate.utils import DistributedType
 import transformers
 import diffusers
 import hashlib
@@ -811,6 +813,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def sample_step_hook(self, img_num, total_imgs):
         pass
     
+    def prepare_optimizer_without_state_placement(self, optimizer):
+        # accelerate's device placement round-trips the whole optimizer state through the accelerator device: on an
+        # H3 resume that copied 4.6 GiB of restored moments onto the GPU before CPU-offloading optimizers moved them
+        # back. Per-param state needs no help (torch's load_state_dict casts tensors, and dicts of them, to each
+        # param's device; optimizers with custom state objects place them in their own load_state_dict). Tensor
+        # hyperparameters in param_groups (compass, schedulefree) are not cast by torch, so they still move here
+        # as before. DeepSpeed and Megatron-LM refuse a custom placement and keep accelerate's.
+        if self.accelerator.distributed_type in (DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM):
+            return self.accelerator.prepare(optimizer)
+        for group in optimizer.param_groups:
+            for key, value in group.items():
+                if key != 'params':
+                    group[key] = move_to_device(value, self.accelerator.device)
+        return self.accelerator.prepare(optimizer, device_placement=[False])
+
     def prepare_accelerator(self):
         # set some config
         self.accelerator.even_batches=False
@@ -842,10 +859,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.modules_being_trained.append(self.adapter)
         
         # prepare other things
-        # no device placement: the optimizer state is already where its optimizer keeps it (torch's load_state_dict
-        # casts to the param device). Placement copied a restored state wholesale onto the GPU (4.6 GiB on H3 resume)
-        # before CPU-offloading optimizers moved it back.
-        self.optimizer = self.accelerator.prepare(self.optimizer, device_placement=[False])
+        self.optimizer = self.prepare_optimizer_without_state_placement(self.optimizer)
         if self.lr_scheduler is not None:
             self.lr_scheduler = self.accelerator.prepare(self.lr_scheduler)
         # self.data_loader = self.accelerator.prepare(self.data_loader)
