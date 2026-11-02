@@ -118,12 +118,13 @@ class _RMSNorm(nn.Module):
 
 
 def _call_is_weight_math(norm):
-    """True when norm(x) is exactly _rms_norm(x, norm.weight): no wrapped or
-    overridden forward (a network's FullModule swaps a trained delta in for the
-    call) and no module or global hooks (per-op casting, backward hooks)."""
+    """True when norm(x) is exactly _rms_norm(x, norm.weight): a plain _RMSNorm
+    (no subclass: it may override forward or __call__), no wrapped forward (a
+    network's FullModule swaps a trained delta in for the call) and no module or
+    global hooks (per-op casting, backward hooks)."""
     hooks = nn.modules.module
     return (
-        type(norm).forward is _RMSNorm.forward
+        type(norm) is _RMSNorm
         and "forward" not in norm.__dict__
         and not (norm._forward_pre_hooks or norm._forward_hooks or norm._backward_pre_hooks or norm._backward_hooks)
         and not (

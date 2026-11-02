@@ -125,7 +125,7 @@ def _exact_pair(a, b):
         torch.testing.assert_close(a[1][name], b[1][name], rtol=0, atol=0, msg=name)
 
 
-@pytest.mark.parametrize("kind", ["pre", "post", "backward", "subclass"])
+@pytest.mark.parametrize("kind", ["pre", "post", "backward", "subclass", "subclass_call"])
 def test_norm_module_customizations_are_preserved(identity_compile, kind):
     results, events = [], []
     for fused in (False, True):
@@ -156,7 +156,12 @@ def test_norm_module_customizations_are_preserved(identity_compile, kind):
                     seen.append("subclass")
                     return super().forward(x) * 1.3
 
-            replacement = ScaledNorm(32)
+            class CustomCallNorm(moss._RMSNorm):  # Astra's probe_subclass_call.py: forward inherited
+                def __call__(self, x):
+                    seen.append("call")
+                    return super().__call__(x) * 1.3
+
+            replacement = (ScaledNorm if kind == "subclass" else CustomCallNorm)(32)
             replacement.load_state_dict(b.norm1.state_dict())
             replacement.fused_pointwise = fused
             b.norm1 = replacement
