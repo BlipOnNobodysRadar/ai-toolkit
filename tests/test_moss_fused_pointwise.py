@@ -91,32 +91,183 @@ def test_reference_modulation_path_is_bit_identical(identity_compile):
     torch.testing.assert_close(fused, eager, atol=0, rtol=0)
 
 
-def _wrap_like_full_module(norm, delta):
-    """What toolkit.lora_special.FullModule.apply_to does: an instance forward that swaps weight + delta in."""
-    org_forward = norm.forward
-
-    def forward(x):
-        weight = norm._parameters["weight"]
-        norm._parameters["weight"] = weight + delta
-        try:
-            return org_forward(x)
-        finally:
-            norm._parameters["weight"] = weight
-
-    norm.forward = forward
+# Module-behaviour contracts below are Astra's (internal review of 0cfcde1, 2 Nov 2026, task/fusion-review/
+# test_fusion_independent.py), adopted: the first fused norm + affine read norm.weight and skipped every one of these.
+def _astra_block(fused):
+    torch.manual_seed(814)
+    b = moss._Block(32, 80, 4)
+    b.sdpa_priority = None
+    for part in b.modules():
+        if isinstance(part, (moss._Block, moss._RMSNorm)):
+            part.fused_pointwise = fused
+    return b
 
 
-def test_wrapped_norm_keeps_its_forward(identity_compile):
-    x, rope, mod, _ = _block_inputs()
-    plain = _block(True)(x, rope, mod, None)
-    outs = []
+def _run_block(b, reference=False, dtype=torch.float32):
+    torch.manual_seed(919)
+    x = torch.randn(2, 7, 32, dtype=dtype, requires_grad=True)
+    rope = torch.randn(2, 7, 8)
+    mod = torch.randn(2, 6, 32, dtype=dtype, requires_grad=True)
+    ref = torch.randn(2, 6, 32, dtype=dtype, requires_grad=True)
+    out = b(x, rope, (mod, ref, 4) if reference else mod, None)
+    out.float().square().mean().backward()
+    grads = {n: p.grad.detach().clone() for n, p in b.named_parameters() if p.grad is not None}
+    grads.update(x=x.grad, mod=mod.grad)
+    if reference:
+        grads["reference_modulation"] = ref.grad
+    return out.detach(), grads
+
+
+def _exact_pair(a, b):
+    torch.testing.assert_close(a[0], b[0], rtol=0, atol=0)
+    assert a[1].keys() == b[1].keys()
+    for name in a[1]:
+        torch.testing.assert_close(a[1][name], b[1][name], rtol=0, atol=0, msg=name)
+
+
+@pytest.mark.parametrize("kind", ["pre", "post", "backward", "subclass"])
+def test_norm_module_customizations_are_preserved(identity_compile, kind):
+    results, events = [], []
     for fused in (False, True):
-        block = _block(fused)
-        for norm in (block.norm1, block.norm2, block.q_norm):
-            _wrap_like_full_module(norm, torch.full_like(norm.weight, 0.5))
-        outs.append(block(x, rope, mod, None))
-    torch.testing.assert_close(outs[1], outs[0], atol=0, rtol=0)
-    assert not torch.allclose(outs[1], plain)
+        b = _astra_block(fused)
+        seen = []
+
+        def pre(norm, args):
+            seen.append("pre")
+            return (args[0] + 0.3,)
+
+        def post(norm, args, out):
+            seen.append("post")
+            return out * 1.3
+
+        def backward(norm, gin, gout):
+            seen.append("backward")
+            return tuple(g * 1.3 if g is not None else None for g in gin)
+
+        if kind == "pre":
+            b.norm1.register_forward_pre_hook(pre)
+        elif kind == "post":
+            b.norm1.register_forward_hook(post)
+        elif kind == "backward":
+            b.norm1.register_full_backward_hook(backward)
+        else:
+            class ScaledNorm(moss._RMSNorm):
+                def forward(self, x):
+                    seen.append("subclass")
+                    return super().forward(x) * 1.3
+
+            replacement = ScaledNorm(32)
+            replacement.load_state_dict(b.norm1.state_dict())
+            replacement.fused_pointwise = fused
+            b.norm1 = replacement
+        results.append(_run_block(b))
+        events.append(seen)
+    assert events[0] == events[1], "fused norm bypassed module behavior"
+    _exact_pair(*results)
+
+
+@pytest.mark.parametrize("reference", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_outputs_inputs_modulation_and_parameter_grads(identity_compile, reference, dtype):
+    _exact_pair(_run_block(_astra_block(False).to(dtype), reference, dtype),
+                _run_block(_astra_block(True).to(dtype), reference, dtype))
+
+
+def test_wrapped_delta_keeps_gradient_and_restores_weight(identity_compile):
+    """What toolkit.lora_special.FullModule.apply_to does: an instance forward that swaps weight + delta in."""
+    results = []
+    for fused in (False, True):
+        b = _astra_block(fused)
+        base = b.norm1.weight
+        delta = torch.nn.Parameter(torch.full_like(base, 0.2))
+        original = b.norm1.forward
+
+        def wrapped(x):
+            b.norm1._parameters["weight"] = base + delta
+            try:
+                return original(x)
+            finally:
+                b.norm1._parameters["weight"] = base
+
+        b.norm1.forward = wrapped
+        result = _run_block(b)
+        assert b.norm1.weight is base
+        assert delta.grad is not None and delta.grad.abs().sum() > 0
+        result[1]["trained_delta"] = delta.grad
+        results.append(result)
+    _exact_pair(*results)
+
+
+def test_existing_per_op_casting_hook_preserved(identity_compile):
+    from toolkit.util.mixed_precision import attach_per_op_casting
+    results = []
+    for fused in (False, True):
+        b = _astra_block(fused).to(torch.bfloat16)
+        b.norm1.float()
+        b.norm2.float()
+        assert attach_per_op_casting(b) > 0
+        results.append(_run_block(b, dtype=torch.bfloat16))
+    _exact_pair(*results)
+
+
+def test_global_module_hook_preserved(identity_compile):
+    seen = []
+    handle = torch.nn.modules.module.register_module_forward_hook(
+        lambda mod, args, out: seen.append(type(mod).__name__) or None)
+    try:
+        counts = []
+        for fused in (False, True):
+            seen.clear()
+            _run_block(_astra_block(fused))
+            counts.append(seen.count("_RMSNorm"))
+    finally:
+        handle.remove()
+    assert counts[0] == counts[1] > 0
+
+
+def test_aot_capture_block_forward_backward(monkeypatch):
+    original_compile = torch.compile
+    torch._dynamo.reset()
+    monkeypatch.setattr(moss, "_COMPILED", {})
+    monkeypatch.setattr(torch, "compile", lambda fn, **kw: original_compile(fn, backend="aot_eager", **kw))
+    eager, compiled = _run_block(_astra_block(False)), _run_block(_astra_block(True))
+    torch.testing.assert_close(eager[0], compiled[0], rtol=1e-6, atol=1e-6)
+    assert eager[1].keys() == compiled[1].keys()
+    for name in eager[1]:
+        torch.testing.assert_close(eager[1][name], compiled[1][name], rtol=1e-5, atol=1e-6, msg=name)
+    torch._dynamo.reset()
+
+
+def test_dynamo_previews_stay_eager_and_recompile_limit_falls_back(monkeypatch):
+    """Astra's probe (task/fusion-review/probe_dynamo.py): two checkpointed training batches made 5 _rms_norm graphs
+    and a no_grad batch-1 preview then hit the recompile limit, a hard error under fullgraph=True. Now previews run
+    eager, and going past the limit (forced low here) falls back to eager instead of raising."""
+    original_compile = torch.compile
+    counts = {}
+
+    def counting(fn, **kw):
+        def backend(gm, inputs):
+            counts[fn.__name__] = counts.get(fn.__name__, 0) + 1
+            return gm.forward
+        return original_compile(fn, backend=backend, **kw)
+
+    torch._dynamo.reset()
+    monkeypatch.setattr(moss, "_COMPILED", {})
+    monkeypatch.setattr(torch, "compile", counting)
+    from torch._dynamo.utils import counters
+    counters.clear()
+    model = _model(checkpointing=True, fused=True)
+    _step(model, (9, 3, 3, 6))
+    _step(model, (5, 13, 2, 5))
+    trained = dict(counts)
+    assert trained and not counters["graph_break"]
+    with torch.no_grad():
+        model(*_batch((7,)))
+    assert counts == trained
+    monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 1)
+    _step(model, (8,))  # batch 1 specializes: new variants, over the forced limit
+    _step(model, (9, 3, 3, 6))
+    torch._dynamo.reset()
 
 
 def test_set_fused_pointwise_reaches_every_block_and_norm():

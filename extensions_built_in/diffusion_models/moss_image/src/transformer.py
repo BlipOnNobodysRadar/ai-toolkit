@@ -80,12 +80,16 @@ _COMPILED = {}
 
 
 def _pick(fused, fn):
-    if not fused:
+    # training passes only: a no_grad pass (previews, inference) adds graph
+    # variants on top of the training ones and ran into Dynamo's recompile limit
+    # (Astra review). Not fullgraph, so hitting the limit falls back to eager
+    # instead of raising; the helpers themselves have no graph breaks
+    if not fused or not torch.is_grad_enabled():
         return fn
     compiled = _COMPILED.get(fn)
     if compiled is None:
         # dynamic: the sequence length changes with the text length every batch
-        compiled = _COMPILED[fn] = torch.compile(fn, dynamic=True, fullgraph=True)
+        compiled = _COMPILED[fn] = torch.compile(fn, dynamic=True)
     return compiled
 
 
@@ -111,6 +115,22 @@ class _RMSNorm(nn.Module):
 
     def forward(self, x):
         return _pick(self.fused_pointwise, _rms_norm)(x, self.weight)
+
+
+def _call_is_weight_math(norm):
+    """True when norm(x) is exactly _rms_norm(x, norm.weight): no wrapped or
+    overridden forward (a network's FullModule swaps a trained delta in for the
+    call) and no module or global hooks (per-op casting, backward hooks)."""
+    hooks = nn.modules.module
+    return (
+        type(norm).forward is _RMSNorm.forward
+        and "forward" not in norm.__dict__
+        and not (norm._forward_pre_hooks or norm._forward_hooks or norm._backward_pre_hooks or norm._backward_hooks)
+        and not (
+            hooks._global_forward_pre_hooks or hooks._global_forward_hooks
+            or hooks._global_backward_pre_hooks or hooks._global_backward_hooks
+        )
+    )
 
 
 def _situ(hidden, gate):
@@ -254,13 +274,13 @@ class _Block(nn.Module):
 
         if fused and not isinstance(modulation, tuple):
             # norm + modulation and gate + residual as one compiled kernel each.
-            # A norm whose forward a network wraps (FullModule: a trained norm
-            # delta swapped in for the call) runs its own forward instead
+            # A norm whose call is more than its weight math (wrapped forward,
+            # hooks) runs as a module instead
             fused_norm_affine = _pick(True, _norm_affine)
             fused_gate_residual = _pick(True, _gate_residual)
 
             def norm_affine(h, norm, scale, shift):
-                if "forward" in norm.__dict__:
+                if not _call_is_weight_math(norm):
                     return affine(norm(h), scale, shift)
                 return fused_norm_affine(h, norm.weight, m[scale], m[shift])
 
