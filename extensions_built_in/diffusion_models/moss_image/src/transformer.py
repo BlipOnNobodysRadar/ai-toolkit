@@ -23,9 +23,28 @@ from typing import Iterable, List, Optional, Sequence
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils.checkpoint import checkpoint
 
 from toolkit.models.v2._mixin import OstrisModelMixin
+
+# SDPA backends in priority order for every attention call here (None = torch's
+# default). cuDNN first: Windows builds of torch ship no flash attention, so the
+# text padding mask of a batch-4 training step (captions differ in length) ran
+# on the mem-efficient kernel, about a fifth of the step. cuDNN takes the mask,
+# runs fwd+bwd 2.2-2.4x faster on the 4090 and is as close to an fp32 reference
+# (1-2 Nov 2026). model_kwargs.sdpa_cudnn: false restores the default.
+CUDNN_FIRST = [
+    SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH
+]
+SDPA_PRIORITY = CUDNN_FIRST
+
+
+def _sdpa(q, k, v, attn_mask=None):
+    if SDPA_PRIORITY is None:
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    with sdpa_kernel(SDPA_PRIORITY, set_priority=True):
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
 
 @dataclass
@@ -89,13 +108,11 @@ def _attention(
         # reference isolation without a mask (a boolean mask forces SDPA off
         # flash attention; its backward is ~4x slower): live queries attend
         # every key, reference queries only reference keys
-        live = F.scaled_dot_product_attention(q[:, :, :isolate_split], k, v)
-        ref = F.scaled_dot_product_attention(
-            q[:, :, isolate_split:], k[:, :, isolate_split:], v[:, :, isolate_split:]
-        )
+        live = _sdpa(q[:, :, :isolate_split], k, v)
+        ref = _sdpa(q[:, :, isolate_split:], k[:, :, isolate_split:], v[:, :, isolate_split:])
         out = torch.cat((live, ref), 2)
     else:
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        out = _sdpa(q, k, v, attn_mask=mask)
     return out.transpose(1, 2).flatten(2)
 
 

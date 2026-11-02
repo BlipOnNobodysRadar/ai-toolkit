@@ -61,6 +61,7 @@ from .src.pipeline import (
     MossImagePipeline,
     stack_text_embeds,
 )
+from .src import transformer as moss_transformer
 from .src.transformer import MossImageTransformer
 
 if TYPE_CHECKING:
@@ -188,6 +189,11 @@ class MossImageModel(BaseModel):
         # opt-in: preview CFG as one B=2 forward (offloaded weights stream once
         # per step instead of twice); bf16 previews differ slightly, default off
         self.batched_cfg = bool(kw.get("batched_cfg", False))
+        # attention backend order (src/transformer.py SDPA_PRIORITY): cuDNN
+        # first by default; false = torch's default order
+        moss_transformer.SDPA_PRIORITY = (
+            moss_transformer.CUDNN_FIRST if kw.get("sdpa_cudnn", True) else None
+        )
 
         # model_kwargs.edit: krea2-style reference conditioning for edit LoRAs
         # (the vendor model is t2i only). References ride in the prompt through
