@@ -47,12 +47,15 @@ _BACKEND_ENABLED = {
 
 
 def _sdpa(q, k, v, attn_mask=None, priority=None):
-    # reorders only the backends enabled right now, so a global disable or an
-    # enclosing sdpa_kernel scope still holds
-    enabled = [b for b in priority or () if _BACKEND_ENABLED[b]()]
-    if not enabled:
+    # Reorders only when every listed backend is enabled. Under a restricting
+    # scope (a global disable, an enclosing sdpa_kernel) the caller's policy is
+    # used as is: torch's sdpa_kernel exit restores only the enabled backends'
+    # order, so reordering there would leak into the scope (Astra review P2).
+    # Scope: the four standard backends. OVERRIDEABLE, which serves custom
+    # PrivateUse1 devices only (never CUDA or CPU), is off during a reordered call.
+    if not priority or not all(_BACKEND_ENABLED[b]() for b in priority):
         return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-    with sdpa_kernel(enabled, set_priority=True):
+    with sdpa_kernel(list(priority), set_priority=True):
         return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
 
