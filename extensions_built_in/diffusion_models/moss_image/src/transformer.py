@@ -71,14 +71,46 @@ class MossImageParams:
     rope_base: float = 10000.0
 
 
+# Pointwise helpers are pure functions so MossImageTransformer.set_fused_pointwise
+# can compile them (deep dive models-3, 2 Nov 2026): eager, a block pass is ~40
+# separate elementwise kernels, about a fifth of a training step. Same math either
+# way; compiled, Inductor keeps fp32 intermediates instead of rounding each op to
+# the compute dtype. Linears (and their LoRA) stay outside the compiled graphs.
+_COMPILED = {}
+
+
+def _pick(fused, fn):
+    if not fused:
+        return fn
+    compiled = _COMPILED.get(fn)
+    if compiled is None:
+        # dynamic: the sequence length changes with the text length every batch
+        compiled = _COMPILED[fn] = torch.compile(fn, dynamic=True, fullgraph=True)
+    return compiled
+
+
+def _rms_norm(x, weight):
+    y = F.rms_norm(x.float(), (x.shape[-1],), eps=1e-6)
+    return y.to(x.dtype) * weight
+
+
+def _norm_affine(x, weight, scale, shift):
+    return _rms_norm(x, weight) * (1 + scale[:, None]) + shift[:, None]
+
+
+def _gate_residual(x, h, gate):
+    return x + h * gate[:, None]
+
+
 class _RMSNorm(nn.Module):
+    fused_pointwise = False
+
     def __init__(self, dim):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        y = F.rms_norm(x.float(), (x.shape[-1],), eps=1e-6)
-        return y.to(x.dtype) * self.weight
+        return _pick(self.fused_pointwise, _rms_norm)(x, self.weight)
 
 
 def _situ(hidden, gate):
@@ -97,11 +129,11 @@ def _rotate(x, rope):
 
 def _attention(
     q, k, v, rope, heads, mask, ref_span=None, kv_capture=None, kv_cache=None, isolate_split=None,
-    sdpa_priority=None,
+    sdpa_priority=None, rotate=_rotate,
 ):
     shape = (*q.shape[:2], heads, q.shape[-1] // heads)
-    q = _rotate(q.reshape(shape), rope).transpose(1, 2)
-    k = _rotate(k.reshape(shape), rope).transpose(1, 2)
+    q = rotate(q.reshape(shape), rope).transpose(1, 2)
+    k = rotate(k.reshape(shape), rope).transpose(1, 2)
     v = v.reshape(shape).transpose(1, 2)
     if kv_capture is not None:
         # post-RoPE reference K/V, reused as extra keys on later steps. Copies:
@@ -133,6 +165,7 @@ def _attention(
 
 class _TextBlock(nn.Module):
     sdpa_priority = CUDNN_FIRST
+    fused_pointwise = False
 
     def __init__(self, dim, ffn_dim, heads):
         super().__init__()
@@ -148,9 +181,14 @@ class _TextBlock(nn.Module):
         q, k, v = self.qkv(self.norm1(x)).chunk(3, -1)
         q = self.q_norm(q.unflatten(-1, (self.heads, -1))).flatten(2)
         k = self.k_norm(k.unflatten(-1, (self.heads, -1))).flatten(2)
-        x = x + self.proj(_attention(q, k, v, rope, self.heads, mask, sdpa_priority=self.sdpa_priority))
+        fused = self.fused_pointwise
+        x = x + self.proj(
+            _attention(
+                q, k, v, rope, self.heads, mask, sdpa_priority=self.sdpa_priority, rotate=_pick(fused, _rotate)
+            )
+        )
         y = self.norm2(x)
-        return x + self.ffn_down(_situ(self.ffn_up(y), self.ffn_gate(y)))
+        return x + self.ffn_down(_pick(fused, _situ)(self.ffn_up(y), self.ffn_gate(y)))
 
 
 class _TextProjection(nn.Module):
@@ -162,6 +200,7 @@ class _TextProjection(nn.Module):
 
 class _Block(nn.Module):
     sdpa_priority = CUDNN_FIRST
+    fused_pointwise = False
 
     def __init__(self, dim, ffn_dim, heads):
         super().__init__()
@@ -185,6 +224,7 @@ class _Block(nn.Module):
         # modulation (B, 6, D) [shift_a, scale_a, gate_a, shift_f, scale_f,
         # gate_f], or (mod, ref_mod, split): tokens [split:] are clean
         # references modulated at t=0
+        fused = self.fused_pointwise
         if isinstance(modulation, tuple):
             mod, ref_mod, split = modulation
             m, r = mod.unbind(1), ref_mod.unbind(1)
@@ -212,18 +252,41 @@ class _Block(nn.Module):
             def gate(h, g):
                 return h * m[g][:, None]
 
-        y = affine(self.norm1(x), 1, 0)
+        if fused and not isinstance(modulation, tuple):
+            # norm + modulation and gate + residual as one compiled kernel each.
+            # A norm whose forward a network wraps (FullModule: a trained norm
+            # delta swapped in for the call) runs its own forward instead
+            fused_norm_affine = _pick(True, _norm_affine)
+            fused_gate_residual = _pick(True, _gate_residual)
+
+            def norm_affine(h, norm, scale, shift):
+                if "forward" in norm.__dict__:
+                    return affine(norm(h), scale, shift)
+                return fused_norm_affine(h, norm.weight, m[scale], m[shift])
+
+            def gate_residual(h, out, g):
+                return fused_gate_residual(h, out, m[g])
+
+        else:
+
+            def norm_affine(h, norm, scale, shift):
+                return affine(norm(h), scale, shift)
+
+            def gate_residual(h, out, g):
+                return h + gate(out, g)
+
+        y = norm_affine(x, self.norm1, 1, 0)
         q, k, v = self.proj["qkv"](y).chunk(3, -1)
         q = self.q_norm(q.unflatten(-1, (self.heads, -1))).flatten(2)
         k = self.k_norm(k.unflatten(-1, (self.heads, -1))).flatten(2)
         attn = _attention(
             q, k, v, rope, self.heads, mask, ref_span, kv_capture, kv_cache, isolate_split,
-            self.sdpa_priority,
+            self.sdpa_priority, _pick(fused, _rotate),
         )
-        x = x + gate(self.proj["o"](attn), 2)
-        y = affine(self.norm2(x), 4, 3)
+        x = gate_residual(x, self.proj["o"](attn), 2)
+        y = norm_affine(x, self.norm2, 4, 3)
         hidden, ffn_gate = self.proj["ffn_up_gate"](y).chunk(2, -1)
-        return x + gate(self.proj["ffn_down"](_situ(hidden, ffn_gate)), 5)
+        return gate_residual(x, self.proj["ffn_down"](_pick(fused, _situ)(hidden, ffn_gate)), 5)
 
 
 class MossImageTransformer(nn.Module, OstrisModelMixin):
@@ -313,6 +376,13 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
         """SDPA backend order for this model's attention (None = torch's default)."""
         for block in (*self.text_embedder.blocks, *self.layers):
             block.sdpa_priority = None if priority is None else tuple(priority)
+
+    def set_fused_pointwise(self, enable):
+        """Run the pointwise helpers (norms, modulation, gates, RoPE, situ) compiled
+        with torch.compile (Triton on CUDA); False = eager. Set per model."""
+        for module in self.modules():
+            if isinstance(module, (_TextBlock, _Block, _RMSNorm)):
+                module.fused_pointwise = bool(enable)
 
     def enable_gradient_checkpointing(self, enable: bool = True):
         self.gradient_checkpointing = enable
