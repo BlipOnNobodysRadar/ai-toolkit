@@ -28,22 +28,31 @@ from torch.utils.checkpoint import checkpoint
 
 from toolkit.models.v2._mixin import OstrisModelMixin
 
-# SDPA backends in priority order for every attention call here (None = torch's
-# default). cuDNN first: Windows builds of torch ship no flash attention, so the
-# text padding mask of a batch-4 training step (captions differ in length) ran
-# on the mem-efficient kernel, about a fifth of the step. cuDNN takes the mask,
-# runs fwd+bwd 2.2-2.4x faster on the 4090 and is as close to an fp32 reference
-# (1-2 Nov 2026). model_kwargs.sdpa_cudnn: false restores the default.
-CUDNN_FIRST = [
+# Default SDPA backend order of every block (set per model with
+# MossImageTransformer.set_sdpa_priority; None = torch's order). cuDNN first:
+# Windows builds of torch ship no flash attention, so the text padding mask of a
+# batch-4 training step (captions differ in length) ran on the mem-efficient
+# kernel, about a fifth of the step. cuDNN takes the mask, runs fwd+bwd 2.2-2.4x
+# faster on the 4090 and is as close to an fp32 reference (1-2 Nov 2026). It is
+# not deterministic; deterministic mode makes SDPA skip it.
+CUDNN_FIRST = (
     SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH
-]
-SDPA_PRIORITY = CUDNN_FIRST
+)
+_BACKEND_ENABLED = {
+    SDPBackend.CUDNN_ATTENTION: torch.backends.cuda.cudnn_sdp_enabled,
+    SDPBackend.FLASH_ATTENTION: torch.backends.cuda.flash_sdp_enabled,
+    SDPBackend.EFFICIENT_ATTENTION: torch.backends.cuda.mem_efficient_sdp_enabled,
+    SDPBackend.MATH: torch.backends.cuda.math_sdp_enabled,
+}
 
 
-def _sdpa(q, k, v, attn_mask=None):
-    if SDPA_PRIORITY is None:
+def _sdpa(q, k, v, attn_mask=None, priority=None):
+    # reorders only the backends enabled right now, so a global disable or an
+    # enclosing sdpa_kernel scope still holds
+    enabled = [b for b in priority or () if _BACKEND_ENABLED[b]()]
+    if not enabled:
         return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-    with sdpa_kernel(SDPA_PRIORITY, set_priority=True):
+    with sdpa_kernel(enabled, set_priority=True):
         return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
 
@@ -84,7 +93,8 @@ def _rotate(x, rope):
 
 
 def _attention(
-    q, k, v, rope, heads, mask, ref_span=None, kv_capture=None, kv_cache=None, isolate_split=None
+    q, k, v, rope, heads, mask, ref_span=None, kv_capture=None, kv_cache=None, isolate_split=None,
+    sdpa_priority=None,
 ):
     shape = (*q.shape[:2], heads, q.shape[-1] // heads)
     q = _rotate(q.reshape(shape), rope).transpose(1, 2)
@@ -108,15 +118,19 @@ def _attention(
         # reference isolation without a mask (a boolean mask forces SDPA off
         # flash attention; its backward is ~4x slower): live queries attend
         # every key, reference queries only reference keys
-        live = _sdpa(q[:, :, :isolate_split], k, v)
-        ref = _sdpa(q[:, :, isolate_split:], k[:, :, isolate_split:], v[:, :, isolate_split:])
+        live = _sdpa(q[:, :, :isolate_split], k, v, priority=sdpa_priority)
+        ref = _sdpa(
+            q[:, :, isolate_split:], k[:, :, isolate_split:], v[:, :, isolate_split:], priority=sdpa_priority
+        )
         out = torch.cat((live, ref), 2)
     else:
-        out = _sdpa(q, k, v, attn_mask=mask)
+        out = _sdpa(q, k, v, attn_mask=mask, priority=sdpa_priority)
     return out.transpose(1, 2).flatten(2)
 
 
 class _TextBlock(nn.Module):
+    sdpa_priority = CUDNN_FIRST
+
     def __init__(self, dim, ffn_dim, heads):
         super().__init__()
         self.heads = heads
@@ -131,7 +145,7 @@ class _TextBlock(nn.Module):
         q, k, v = self.qkv(self.norm1(x)).chunk(3, -1)
         q = self.q_norm(q.unflatten(-1, (self.heads, -1))).flatten(2)
         k = self.k_norm(k.unflatten(-1, (self.heads, -1))).flatten(2)
-        x = x + self.proj(_attention(q, k, v, rope, self.heads, mask))
+        x = x + self.proj(_attention(q, k, v, rope, self.heads, mask, sdpa_priority=self.sdpa_priority))
         y = self.norm2(x)
         return x + self.ffn_down(_situ(self.ffn_up(y), self.ffn_gate(y)))
 
@@ -144,6 +158,8 @@ class _TextProjection(nn.Module):
 
 
 class _Block(nn.Module):
+    sdpa_priority = CUDNN_FIRST
+
     def __init__(self, dim, ffn_dim, heads):
         super().__init__()
         self.heads = heads
@@ -198,7 +214,8 @@ class _Block(nn.Module):
         q = self.q_norm(q.unflatten(-1, (self.heads, -1))).flatten(2)
         k = self.k_norm(k.unflatten(-1, (self.heads, -1))).flatten(2)
         attn = _attention(
-            q, k, v, rope, self.heads, mask, ref_span, kv_capture, kv_cache, isolate_split
+            q, k, v, rope, self.heads, mask, ref_span, kv_capture, kv_cache, isolate_split,
+            self.sdpa_priority,
         )
         x = x + gate(self.proj["o"](attn), 2)
         y = affine(self.norm2(x), 4, 3)
@@ -288,6 +305,11 @@ class MossImageTransformer(nn.Module, OstrisModelMixin):
     def dtype(self):
         # norms are never quantized; the block linears may be
         return self.final_norm_video.weight.dtype
+
+    def set_sdpa_priority(self, priority):
+        """SDPA backend order for this model's attention (None = torch's default)."""
+        for block in (*self.text_embedder.blocks, *self.layers):
+            block.sdpa_priority = None if priority is None else tuple(priority)
 
     def enable_gradient_checkpointing(self, enable: bool = True):
         self.gradient_checkpointing = enable

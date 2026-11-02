@@ -61,8 +61,7 @@ from .src.pipeline import (
     MossImagePipeline,
     stack_text_embeds,
 )
-from .src import transformer as moss_transformer
-from .src.transformer import MossImageTransformer
+from .src.transformer import CUDNN_FIRST, MossImageTransformer
 
 if TYPE_CHECKING:
     from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
@@ -189,11 +188,9 @@ class MossImageModel(BaseModel):
         # opt-in: preview CFG as one B=2 forward (offloaded weights stream once
         # per step instead of twice); bf16 previews differ slightly, default off
         self.batched_cfg = bool(kw.get("batched_cfg", False))
-        # attention backend order (src/transformer.py SDPA_PRIORITY): cuDNN
-        # first by default; false = torch's default order
-        moss_transformer.SDPA_PRIORITY = (
-            moss_transformer.CUDNN_FIRST if kw.get("sdpa_cudnn", True) else None
-        )
+        # attention backend order (src/transformer.py CUDNN_FIRST): cuDNN first
+        # by default; false = torch's default order. Set on this model's blocks
+        self.sdpa_cudnn = bool(kw.get("sdpa_cudnn", True))
 
         # model_kwargs.edit: krea2-style reference conditioning for edit LoRAs
         # (the vendor model is t2i only). References ride in the prompt through
@@ -338,6 +335,7 @@ class MossImageModel(BaseModel):
         self.print_and_status_update("Loading MOSS-Image model")
 
         transformer = self._load_transformer()
+        transformer.set_sdpa_priority(CUDNN_FIRST if self.sdpa_cudnn else None)
         # quantize + offload + placement, all driven by model_config
         transformer.aitk_post_load(**self.component_load_kwargs("transformer"))
         flush()
