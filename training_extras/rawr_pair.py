@@ -54,8 +54,9 @@ def begin(trainer):
     if (trainer.network is None or trainer.is_fine_tuning
             or trainer.train_config.merge_network_on_save
             or not snr_capturable(trainer)
+            # training_extras state (EDM2 etc.) travels in the pair as a third, hashed file (commit extras=).
             or any(getattr(trainer, attr, None) is not None for attr in
-                   ('embedding', 'adapter', 'decorator', 'ema', 'training_extras'))):
+                   ('embedding', 'adapter', 'decorator', 'ema'))):
         if previous is not None:
             raise ValueError('Cannot replace a committed RAWR pair with an unsupported save mode; use a new output folder')
         return None
@@ -129,12 +130,17 @@ def _publish(source, target, writer=None, link=False):
             os.unlink(temp)
 
 
-def commit(root, pair, state, model_alias, name, step, export_model=None):
+def extras_path(pair):
+    return os.path.join(os.path.dirname(pair['model']), 'training_extras.pt')
+
+
+def commit(root, pair, state, model_alias, name, step, export_model=None, extras=None):
     # Model serializers close their file before returning. Explicitly flush it
     # before publishing a pointer that promises both files are complete.
     # Windows fsync requires a writable descriptor, even though no bytes change.
-    with open(pair['model'], 'r+b') as f:
-        os.fsync(f.fileno())
+    for path in (pair['model'],) + ((extras,) if extras is not None else ()):
+        with open(path, 'r+b') as f:
+            os.fsync(f.fileno())
     model_hash = _hash(pair['model'])
     state[rc.KEY]['generation'] = pair['generation']
     state[rc.KEY]['model_sha256'] = model_hash
@@ -142,13 +148,19 @@ def commit(root, pair, state, model_alias, name, step, export_model=None):
     manifest = {'version': 1, 'slot': pair['slot'], 'generation': pair['generation'],
                 'name': name, 'step': int(step), 'model_sha256': model_hash,
                 'optimizer_sha256': _hash(pair['optimizer'])}
+    if extras is not None:
+        manifest['training_extras_sha256'] = _hash(extras)
     _write_manifest(manifest, os.path.join(root, MANIFEST))
     # The transaction is committed. Alias errors must not turn a committed save
     # into a reported failed transaction; native resume uses the manifest.
     # The optimizer alias is a hard link to its slot where the volume allows it (the model alias is a separate
     # export at the save dtype, and the slot model is written in place, so it is never linked).
-    for source, target, writer, link in ((pair['model'], model_alias, export_model, False),
-                                        (pair['optimizer'], os.path.join(root, 'optimizer.pt'), None, True)):
+    # training_extras.pt is likewise replaced by name, never rewritten in place, so its legacy alias can be a link too.
+    aliases = [(pair['model'], model_alias, export_model, False),
+               (pair['optimizer'], os.path.join(root, 'optimizer.pt'), None, True)]
+    if extras is not None:
+        aliases.append((extras, os.path.join(root, 'training_extras.pt'), None, True))
+    for source, target, writer, link in aliases:
         try:
             _publish(source, target, writer, link)
         except Exception as exc:
@@ -162,4 +174,9 @@ def select(root, name):
     model, optimizer = _paths(root, manifest['slot'])
     if _hash(model) != manifest['model_sha256'] or _hash(optimizer) != manifest['optimizer_sha256']:
         raise ValueError('RAWR committed model/optimizer pair is missing or corrupt; refusing mixed resume')
-    return {**manifest, 'model': model, 'optimizer': optimizer}
+    extras = None
+    if 'training_extras_sha256' in manifest:  # older manifests carry no extras state
+        extras = extras_path({'model': model})
+        if not os.path.exists(extras) or _hash(extras) != manifest['training_extras_sha256']:
+            raise ValueError('RAWR committed training_extras state is missing or corrupt; refusing mixed resume')
+    return {**manifest, 'model': model, 'optimizer': optimizer, 'training_extras': extras}

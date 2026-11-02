@@ -69,6 +69,8 @@ from diffusers import FluxTransformer2DModel
 from toolkit.accelerator import get_accelerator, unwrap_model
 from toolkit.print import print_acc
 from accelerate import Accelerator
+from accelerate.optimizer import move_to_device
+from accelerate.utils import DistributedType
 import transformers
 import diffusers
 import hashlib
@@ -499,6 +501,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
     
     def done_hook(self):
         pass
+
+    def release_accelerator_state(self):
+        # toolkit/accelerator.py shares one Accelerator per process, and prepare() keeps every model, optimizer and
+        # scheduler in its own lists. Without this, a later job in the same run.py process (several configs, or -r
+        # after a failure) starts with this job's network, optimizer state and base model still referenced.
+        self.modules_being_trained.clear()
+        self.optimizer = None
+        self.lr_scheduler = None
+        self.params = []
+        self.accelerator.free_memory()
+        flush()
     
     def end_step_hook(self):
         pass
@@ -746,8 +759,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     training_state=(rawr_checkpoint.training_state(self, checkpoint_step)
                                     if getattr(self, '_rawr_checkpoint_config', None) is not None else None))
                 if rawr_pair_save is not None:
+                    rawr_extras = None
+                    if getattr(self, 'training_extras', None) is not None:
+                        # The auxiliary loss state (EDM2 etc.) belongs to the same step as the pair; commit hashes it.
+                        rawr_extras = rawr_pair.extras_path(rawr_pair_save)
+                        self.training_extras.checkpoint(rawr_extras, curve_dir=self.save_root,
+                                                        step=self.meta['training_info']['completed_steps'])
                     rawr_pair.commit(self.save_root, rawr_pair_save, state_dict,
-                                     rawr_model_alias, lora_name, checkpoint_step, rawr_model_export)
+                                     rawr_model_alias, lora_name, checkpoint_step, rawr_model_export,
+                                     extras=rawr_extras)
                 else:
                     # Write a new file and swap the name, never rewrite in place: an interrupted save keeps the
                     # previous optimizer.pt, and in a folder that once held RAWR pairs optimizer.pt may be a hard
@@ -760,8 +780,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc(e)
                 print_acc("Could not save optimizer")
 
-        if getattr(self, 'training_extras', None) is not None:
-            self.training_extras.checkpoint(os.path.join(self.save_root, 'training_extras.pt'))
+        if getattr(self, 'training_extras', None) is not None and (rawr_pair_save is None or self.optimizer is None):
+            # A committed pair already wrote (and aliased) its own copy above.
+            # Stamped with completed_steps: the value a resume restores into step_num (checked on restore).
+            self.training_extras.checkpoint(os.path.join(self.save_root, 'training_extras.pt'),
+                                            step=self.meta['training_info']['completed_steps'])
         self.clean_up_saves()
         self.post_save_hook(file_path)
 
@@ -790,6 +813,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def sample_step_hook(self, img_num, total_imgs):
         pass
     
+    def prepare_optimizer_without_state_placement(self, optimizer):
+        # accelerate's device placement round-trips the whole optimizer state through the accelerator device: on an
+        # H3 resume that copied 4.6 GiB of restored moments onto the GPU before CPU-offloading optimizers moved them
+        # back. Per-param state needs no help (torch's load_state_dict casts tensors, and dicts of them, to each
+        # param's device; optimizers with custom state objects place them in their own load_state_dict). Tensor
+        # hyperparameters in param_groups (compass, schedulefree) are not cast by torch, so they still move here
+        # as before. DeepSpeed and Megatron-LM refuse a custom placement and keep accelerate's.
+        if self.accelerator.distributed_type in (DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM):
+            return self.accelerator.prepare(optimizer)
+        for group in optimizer.param_groups:
+            for key, value in group.items():
+                if key != 'params':
+                    group[key] = move_to_device(value, self.accelerator.device)
+        return self.accelerator.prepare(optimizer, device_placement=[False])
+
     def prepare_accelerator(self):
         # set some config
         self.accelerator.even_batches=False
@@ -821,7 +859,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.modules_being_trained.append(self.adapter)
         
         # prepare other things
-        self.optimizer = self.accelerator.prepare(self.optimizer)
+        self.optimizer = self.prepare_optimizer_without_state_placement(self.optimizer)
         if self.lr_scheduler is not None:
             self.lr_scheduler = self.accelerator.prepare(self.lr_scheduler)
         # self.data_loader = self.accelerator.prepare(self.data_loader)
@@ -881,11 +919,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.network_config is None or self.train_config.merge_network_on_save:
                     raise ValueError('Committed RAWR pair is a LoRA; use its original training configuration')
                 self._rawr_paired_optimizer_path = selected['optimizer']
+                self._rawr_paired_extras_path = selected.get('training_extras')
                 self._rawr_pair_generation = selected['generation']
                 return selected['model']
         # get latest saved step
         latest_path = None
         if os.path.exists(self.save_root):
+            # Only {name}, {name}_<9-digit step>, plus post and an optional extension (none for a diffusers folder)
+            # are this run's saves. A bare prefix glob also took derived exports such as {name}_000000300-comfy,
+            # whose folded weights and copied metadata resume silently wrong.
+            save_name = re.compile(rf'{re.escape(name)}(_\d{{9}})?{re.escape(post)}(\.safetensors|\.pt)?',
+                                   re.IGNORECASE if os.name == 'nt' else 0)
             # Define patterns for both files and directories
             patterns = [
                 f"{name}*{post}.safetensors",
@@ -899,16 +943,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
             # Filter out non-existent paths and sort by creation time
             if paths:
-                paths = [p for p in paths if os.path.exists(p)]
-                # remove false positives
-                if '_LoRA' not in name:
-                    paths = [p for p in paths if '_LoRA' not in p]
-                if '_refiner' not in name:
-                    paths = [p for p in paths if '_refiner' not in p]
-                if '_t2i' not in name:
-                    paths = [p for p in paths if '_t2i' not in p]
-                if '_cn' not in name:
-                    paths = [p for p in paths if '_cn' not in p]
+                # the exact-name match also drops the _LoRA/_refiner/_t2i/_cn siblings the old substring filters
+                # removed, without misfiring when those strings appear in the folder path
+                paths = [p for p in paths if os.path.exists(p) and save_name.fullmatch(os.path.basename(p))]
 
                 if len(paths) > 0:
                     latest_path = max(paths, key=os.path.getctime)
@@ -950,6 +987,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.epoch_num = meta['training_info']['epoch']
             self.start_step = self.step_num
             print_acc(f"Found step {self.step_num} in metadata, starting from there")
+
+    def _check_model_lora_ignores_on_resume(self, path, extra_weights):
+        # A run saved before its model declared lora_ignore_if_contains (H3 adaln_proj) holds LoRA weights, and
+        # optimizer/RAWR state, for modules the network now skips. The non-strict load drops those weights silently
+        # and the optimizer load then fails on the group size (RAWR: "refusing a partial resume"; otherwise a silent
+        # fresh optimizer). Say so up front. A pretrained_lora_path is a fresh start, so it only drops them.
+        from toolkit.network_mixins import saved_keys_for_model_ignores
+        hit = saved_keys_for_model_ignores(list(extra_weights or {}), getattr(self.network, 'model_lora_ignores', None))
+        if not hit:
+            return
+        if self.network_config.pretrained_lora_path is not None and path == self.network_config.pretrained_lora_path:
+            print_acc(f"Pretrained LoRA has {len(hit)} weights for modules this model skips "
+                      f"({self.network.model_lora_ignores}); they are not loaded")
+            return
+        raise ValueError(
+            f"{path} was trained with LoRA on modules this model now skips ({self.network.model_lora_ignores}, "
+            f"{len(hit)} saved weights, e.g. {hit[0]}). To resume it as trained, set network.network_kwargs."
+            f"use_model_lora_ignores: false; otherwise start a new output folder")
 
     def load_weights(self, path):
         if self.network is not None:
@@ -2167,6 +2222,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     print_acc(f"#### IMPORTANT RESUMING FROM {latest_save_path} ####")
                     print_acc(f"Loading from {latest_save_path}")
                     extra_weights = self.load_weights(latest_save_path)
+                    self._check_model_lora_ignores_on_resume(latest_save_path, extra_weights)
                     self.network.multiplier = 1.0
                 elif self.train_config.merge_network_on_save and self.network_config.pretrained_lora_path is not None:
                     # with merge_network_on_save, saved checkpoints are full models that get loaded as the
@@ -3094,6 +3150,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         flush()
         self.done_hook()
+        # after done_hook, so UI status/async work has finished with the job's objects
+        self.release_accelerator_state()
 
     def push_to_hub(
     self,

@@ -134,6 +134,13 @@ def main():
             if not args.recover:
                 print_end_message(jobs_completed, jobs_failed)
                 raise e
+            # Recovering: the failed job never reached its teardown, so drop it and everything the shared
+            # Accelerator still holds from it before the next config loads its model.
+            job = None
+            try:
+                accelerator.free_memory()
+            except Exception as e2:
+                print_acc(f"Error freeing the failed job's memory: {e2}")
         except KeyboardInterrupt as e:
             try:
                 job.process[0].on_error(e)

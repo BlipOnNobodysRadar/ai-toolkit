@@ -13,7 +13,7 @@ from toolkit.models.lokr import LokrModule
 
 from .config_modules import NetworkConfig
 from .lorm import count_parameters
-from .network_mixins import ToolkitNetworkMixin, ToolkitModuleMixin, ExtractableModuleMixin
+from .network_mixins import ToolkitNetworkMixin, ToolkitModuleMixin, ExtractableModuleMixin, merge_model_lora_ignores
 
 from toolkit.kohya_lora import LoRANetwork
 from toolkit.models.DoRA import DoRAModule
@@ -226,12 +226,16 @@ class FullModule(ToolkitModuleMixin, torch.nn.Module):
         # dequantize quantized weights to full precision so the delta can be added (the original
         # quantized tensor is restored in the finally block below)
         base_weight = _dequantize_if_needed(orig_weight)
-        eff_weight = base_weight + (self.diff.to(base_weight.device) * mult).to(base_weight.dtype)
+        # under network layer offloading diff/diff_b are pinned CPU masters
+        # (_cpu_master_parameter_names). The copies can be async: the CPU writes the
+        # masters only in optimizer.step, after backward's blocking grad copy to the
+        # host has drained the stream. Any new in-place write must sync first.
+        eff_weight = base_weight + (self.diff.to(base_weight.device, non_blocking=True) * mult).to(base_weight.dtype)
 
         has_bias = self.diff_b is not None and om._parameters.get('bias', None) is not None
         if has_bias:
             orig_bias = om._parameters['bias']
-            eff_bias = orig_bias + (self.diff_b.to(orig_bias.device) * mult).to(orig_bias.dtype)
+            eff_bias = orig_bias + (self.diff_b.to(orig_bias.device, non_blocking=True) * mult).to(orig_bias.dtype)
 
         # temporarily swap in the effective weights so the original forward (norm/linear/etc) uses them.
         # this keeps autograd flowing into our delta while supporting any layer type.
@@ -363,6 +367,7 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
         4. block_dims、block_alphas、conv_block_dims、conv_block_alphasを指定 : Conv2d3x3にも適用する
         5. modules_dimとmodules_alphaを指定 (推論用)
         """
+        use_model_lora_ignores = kwargs.pop('use_model_lora_ignores', True)
         # call the parent of the parent we are replacing (LoRANetwork) init
         torch.nn.Module.__init__(self)
         ToolkitNetworkMixin.__init__(
@@ -374,8 +379,10 @@ class LoRASpecialNetwork(ToolkitNetworkMixin, LoRANetwork):
             is_lorm=is_lorm,
             **kwargs
         )
-        if ignore_if_contains is None:
-            ignore_if_contains = []
+        # merge (never replace) model-declared ignores, e.g. layers whose forward
+        # bypasses the lora hook; copy so the config's list is not mutated
+        ignore_if_contains, self.model_lora_ignores = merge_model_lora_ignores(
+            ignore_if_contains, base_model, use_model_lora_ignores)
         self.ignore_if_contains = ignore_if_contains
         # full_if_contains: any layer (even linear/conv) whose name matches becomes a full weight
         # module instead of a normal lora module

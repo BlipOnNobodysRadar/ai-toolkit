@@ -49,6 +49,40 @@ adapter_transforms = transforms.Compose([
 ])
 
 
+def latent_mask_multiplier(mask: torch.Tensor, latent_shape, mode: str = 'nearest') -> torch.Tensor:
+    """Pixel mask (B,1,H,W) -> mean-1 loss multiplier (B,C,h,w) at latent size, in float32.
+
+    'nearest' (legacy) samples one pixel per latent cell; 'area' averages each cell, so partial and thin
+    subject parts keep their share of weight and the mask is not shifted by half a cell.
+    """
+    # latents are B,C,H,W or video B,C,T,H,W
+    h, w = latent_shape[-2], latent_shape[-1]
+    mask = mask.to(dtype=torch.float32).detach()
+    if mode == 'area':
+        mask = torch.nn.functional.interpolate(mask, size=(h, w), mode='area')
+    elif mode == 'nearest':
+        mask = torch.nn.functional.interpolate(mask, size=(h, w))
+    else:
+        raise ValueError(f"mask_resize_mode must be 'nearest' or 'area', got {mode!r}")
+    mask = mask.expand(-1, latent_shape[1], -1, -1)
+    # make avg 1.0 (float32: bf16 normalisation rounds each weight by up to ~0.4%)
+    return (mask / mask.mean()).detach()
+
+
+def inverted_prior_mask_multiplier(mask: torch.Tensor, latent_shape, pred_shape) -> torch.Tensor:
+    """Pixel mask (B,1,H,W) -> mean-1 prior-preservation weight (1 - mask), per sample, shaped like pred."""
+    # resize to size of noise_pred (latents are B,C,H,W or video B,C,T,H,W)
+    prior_mask = torch.nn.functional.interpolate(mask, size=(latent_shape[-2], latent_shape[-1]), mode='bicubic')
+    # stack the mask channel to match channels of noise_pred; keep every batch item's own mask
+    prior_mask = prior_mask[:, :1].expand(-1, pred_shape[1], -1, -1)
+    if len(pred_shape) == 5:
+        prior_mask = prior_mask.unsqueeze(2)  # add time dimension back for video
+        prior_mask = prior_mask.repeat(1, 1, pred_shape[2], 1, 1)
+    prior_mask_multiplier = 1.0 - prior_mask
+    # scale so it is a mean of 1
+    return prior_mask_multiplier / prior_mask_multiplier.mean()
+
+
 class SDTrainer(BaseSDTrainProcess):
 
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
@@ -311,6 +345,11 @@ class SDTrainer(BaseSDTrainProcess):
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
         self.training_extras = None
+        if self.train_config.training_extras is None and getattr(self, '_rawr_paired_extras_path', None) is not None:
+            # The mirror of the check below: dropping the config would discard the pair's EDM2/dynamic state and the
+            # next commit would write a manifest without it.
+            raise ValueError('The committed RAWR pair carries training_extras state but training_extras is not '
+                             'configured; resume with its original configuration or start a new output folder')
         if self.train_config.training_extras is not None:
             from training_extras.runtime import TrainingExtras
             if self.train_config.loss_type == 'mean_flow' or self.do_guided_loss or getattr(self.sd, 'is_llm', False):
@@ -322,8 +361,22 @@ class SDTrainer(BaseSDTrainProcess):
                 self.device_torch, self.train_config.steps)
             if self.training_extras.edm.enabled and self.train_config.dtype not in ('bf16','bfloat16','float32','fp32'):
                 raise ValueError('EDM2 currently requires BF16 or FP32 in this host; FP16 AMP is unsupported')
-            state = os.path.join(self.save_root, 'training_extras.pt')
-            if os.path.exists(state): self.training_extras.restore(state)
+            if getattr(self, '_rawr_pair_generation', None) is not None:
+                # Resuming a committed RAWR pair: only the extras state hashed into that pair belongs to its step.
+                state = getattr(self, '_rawr_paired_extras_path', None)
+                if state is None and self.step_num > 0:
+                    raise ValueError('The committed RAWR pair has no training_extras state; resume with its original '
+                                     'configuration or start a new output folder')
+                if state is not None:
+                    # An explicit start_step override is the user's call; otherwise the stamp must match the resume step.
+                    self.training_extras.restore(
+                        state, expected_step=self.step_num if self.train_config.start_step is None else None)
+            else:
+                state = os.path.join(self.save_root, 'training_extras.pt')
+                if os.path.exists(state):
+                    # A fresh start moves a leftover file aside; a stamp from another step raises unless start_step overrides.
+                    self.training_extras.restore_for_step(state, self.step_num,
+                                                          strict=self.train_config.start_step is None, log=print_acc)
         if self.is_caching_text_embeddings:
             # make sure model is on cpu for this part so we don't oom.
             self.sd.unet.to('cpu')
@@ -630,27 +683,8 @@ class SDTrainer(BaseSDTrainProcess):
             if self.train_config.inverted_mask_prior and prior_pred is not None and has_mask:
                 assert not self.train_config.train_turbo
                 with torch.no_grad():
-                    prior_mask = batch.mask_tensor.to(self.device_torch, dtype=dtype)
-                    if len(noise_pred.shape) == 5:
-                        # video B,C,T,H,W
-                        lat_height = batch.latents.shape[3]
-                        lat_width = batch.latents.shape[4]
-                    else: 
-                        lat_height = batch.latents.shape[2]
-                        lat_width = batch.latents.shape[3]
-                    # resize to size of noise_pred
-                    prior_mask = torch.nn.functional.interpolate(prior_mask, size=(lat_height, lat_width), mode='bicubic')
-                    # stack first channel to match channels of noise_pred
-                    prior_mask = torch.cat([prior_mask[:1]] * noise_pred.shape[1], dim=1)
-                    
-                    if len(noise_pred.shape) == 5:
-                        prior_mask = prior_mask.unsqueeze(2)  # add time dimension back for video
-                        prior_mask = prior_mask.repeat(1, 1, noise_pred.shape[2], 1, 1) 
-
-                    prior_mask_multiplier = 1.0 - prior_mask
-                    
-                    # scale so it is a mean of 1
-                    prior_mask_multiplier = prior_mask_multiplier / prior_mask_multiplier.mean()
+                    prior_mask_multiplier = inverted_prior_mask_multiplier(
+                        batch.mask_tensor.to(self.device_torch, dtype=dtype), batch.latents.shape, noise_pred.shape)
                 if hasattr(self.sd, 'get_loss_target'):
                     target = self.sd.get_loss_target(
                         noise=noise, 
@@ -1597,24 +1631,9 @@ class SDTrainer(BaseSDTrainProcess):
             mask_multiplier = torch.ones((noisy_latents.shape[0], 1, 1, 1), device=self.device_torch, dtype=dtype)
             if batch.mask_tensor is not None and self.sd.do_masked_loss:
                 with self.timer('get_mask_multiplier'):
-                    # upsampling no supported for bfloat16
-                    mask_multiplier = batch.mask_tensor.to(self.device_torch, dtype=torch.float16).detach()
-                    # scale down to the size of the latents, mask multiplier shape(bs, 1, width, height), noisy_latents shape(bs, channels, width, height)
-                    if len(noisy_latents.shape) == 5:
-                        # video B,C,T,H,W
-                        h = noisy_latents.shape[3]
-                        w = noisy_latents.shape[4]
-                    else:
-                        h = noisy_latents.shape[2]
-                        w = noisy_latents.shape[3]
-                    mask_multiplier = torch.nn.functional.interpolate(
-                        mask_multiplier, size=(h, w)
-                    )
-                    # expand to match latents
-                    mask_multiplier = mask_multiplier.expand(-1, noisy_latents.shape[1], -1, -1)
-                    mask_multiplier = mask_multiplier.to(self.device_torch, dtype=dtype).detach()
-                    # make avg 1.0
-                    mask_multiplier = mask_multiplier / mask_multiplier.mean()
+                    mask_multiplier = latent_mask_multiplier(
+                        batch.mask_tensor.to(self.device_torch), noisy_latents.shape,
+                        getattr(self.train_config, 'mask_resize_mode', 'nearest'))
 
         def get_adapter_multiplier():
             if self.adapter and isinstance(self.adapter, T2IAdapter):

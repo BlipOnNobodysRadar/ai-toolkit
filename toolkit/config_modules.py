@@ -237,6 +237,13 @@ class NetworkConfig:
         # only useful in very special cases. 
         self.all_layers = kwargs.get('all_layers', False)
 
+        # opt-in (numeric change): run plain linear LoRA GEMMs in bf16/fp16 with fp32 masters and grads. None keeps fp32 compute. Ignored for conv, DoRA, LoKr and offloaded networks.
+        self.compute_dtype = kwargs.get('compute_dtype', None)
+        if self.compute_dtype is not None:
+            self.compute_dtype = {'bf16': 'bf16', 'bfloat16': 'bf16', 'fp16': 'fp16', 'float16': 'fp16'}.get(str(self.compute_dtype).lower())
+            if self.compute_dtype is None:
+                raise ValueError("network.compute_dtype must be bf16 or fp16")
+
 
 AdapterTypes = Literal['t2i', 'ip', 'ip+', 'clip', 'ilora', 'photo_maker', 'control_net', 'control_lora', 'i2v']
 
@@ -524,6 +531,8 @@ class TrainConfig:
         # unmasked reign. It is unmasked regularization basically
         self.inverted_mask_prior = kwargs.get('inverted_mask_prior', False)
         self.inverted_mask_prior_multiplier = kwargs.get('inverted_mask_prior_multiplier', 0.5)
+        # how a pixel mask is downsampled to latent size for masked loss: 'nearest' (legacy, one pixel per cell) or 'area' (cell average)
+        self.mask_resize_mode: str = kwargs.get('mask_resize_mode', 'nearest')
         
         # DOP will will run the same image and prompt through the network without the trigger word blank and use it as a target
         self.diff_output_preservation = kwargs.get('diff_output_preservation', False)
@@ -1020,7 +1029,8 @@ class DatasetConfig:
         self.resolution: int = kwargs.get('resolution', 512)
         self.scale: float = kwargs.get('scale', 1.0)
         self.buckets: bool = kwargs.get('buckets', True)
-        self.bucket_tolerance: int = kwargs.get('bucket_tolerance', 64)
+        # None = the model's bucket divisibility; a set value is rounded up to a multiple of it
+        self.bucket_tolerance: int = kwargs.get('bucket_tolerance', None)
         self.is_reg: bool = kwargs.get('is_reg', False)
         self.prior_reg: bool = kwargs.get('prior_reg', False)
         self.network_weight: float = float(kwargs.get('network_weight', 1.0))
