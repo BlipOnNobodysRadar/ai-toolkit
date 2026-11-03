@@ -57,6 +57,7 @@ from jobs.process import BaseTrainProcess
 from toolkit.metadata import get_meta_for_safetensors, load_metadata_from_safetensors, add_base_model_info_to_meta, \
     parse_metadata_from_safetensors
 from toolkit.train_tools import get_torch_dtype, LearnableSNRGamma, apply_learnable_snr_gos, apply_snr_weight
+from toolkit.timestep_indices import balanced_timestep_indices
 import gc
 
 from tqdm import tqdm
@@ -1409,22 +1410,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     )
                     
                 elif content_or_style == 'balanced':
-                    if min_noise_steps == max_noise_steps:
-                        timestep_indices = torch.ones((batch_size,), device=self.device_torch) * min_noise_steps
-                    else:
-                        # todo, some schedulers use indices, otheres use timesteps. Not sure what to do here
-                        min_idx = min_noise_steps + 1
-                        max_idx = max_noise_steps - 1
-                        if self.train_config.noise_scheduler == 'flowmatch':
-                            # flowmatch uses indices, so we need to use indices
-                            min_idx = min_noise_steps
-                            max_idx = max_noise_steps
-                        timestep_indices = torch.randint(
-                            min_idx,
-                            max_idx,
-                            (batch_size,),
-                            device=self.device_torch
-                        )
+                    # flowmatch: [min, max] inclusive, so the grid's last (lowest-sigma) index can be drawn
+                    timestep_indices = balanced_timestep_indices(
+                        min_noise_steps,
+                        max_noise_steps,
+                        batch_size,
+                        flowmatch=self.train_config.noise_scheduler == 'flowmatch',
+                        device=self.device_torch
+                    )
                     timestep_indices = timestep_indices.long()
                 else:
                     raise ValueError(f"Unknown content_or_style {content_or_style}")
