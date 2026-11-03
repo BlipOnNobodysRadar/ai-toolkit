@@ -1,10 +1,16 @@
 # Training review workflow
 
 For training configuration, tuning, optimizer/scheduler, and trainer changes,
-obtain a second opinion from the latest DeepSeek Flash through the installed
-DeepSeek Harness. Verify the exact model ID against the live provider catalog.
-Use focused reviews with recommended Harness settings and independently verify
-the result. Truncated or empty responses do not count as reviews.
+obtain a second opinion before merging. Standing rule (Ryan, 2 Nov 2026): the
+second opinion is an internal review by another agent working in
+`C:/Users/someb/AI/agent-shared` (Astra, the Codex peer, for Claude's changes),
+coordinated on that folder's project board. Ryan still approves every merge.
+
+A DeepSeek Flash review through the installed DeepSeek Harness is optional, as
+an extra opinion. If you use it, verify the exact model ID against the live
+provider catalog, use focused reviews with recommended Harness settings and
+independently verify the result. Truncated or empty responses do not count as
+reviews.
 
 The installed SDK is `C:/Users/someb/AI/envs/dsh`. A source-review caller and
 evidence are under `C:/Users/someb/AI/training/rawr-resume-review-20261019`.
