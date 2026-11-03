@@ -79,3 +79,35 @@ def test_shift_once_equals_legacy_when_dynamic(legacy_type):
     torch.testing.assert_close(t_once, t_legacy, atol=1e-4, rtol=0)
     shift = math.exp(calculate_shift(256))
     torch.testing.assert_close(t_once.double() / N, _once(shift, N), atol=2e-7, rtol=2e-6)
+
+
+# lookups the trainer does on the grid (Astra's review nit, 2 Nov): get_sigmas finds a drawn timestep by exact value,
+# index_for_timestep (diffusers) likewise; both need unique timesteps and sigmas that agree with them
+
+@pytest.mark.parametrize("n", [1000, 30])
+def test_shift_once_lookups(n):
+    scheduler = CustomFlowMatchEulerDiscreteScheduler(num_train_timesteps=N, shift=12)
+    t = scheduler.set_train_timesteps(n, "cpu", timestep_type="shift_once")
+    assert torch.unique(t).numel() == n
+    idx = [0, n // 2, n - 2, n - 1]
+    for i in idx:
+        assert scheduler.index_for_timestep(t[i]) == i
+    sigma = scheduler.get_sigmas(t[idx], n_dim=4, dtype=torch.bfloat16, device="cpu")
+    assert sigma.shape == (len(idx), 1, 1, 1) and sigma.dtype == torch.bfloat16
+    torch.testing.assert_close(sigma.flatten().float(), (t[idx] / N).float(), atol=0, rtol=8e-3)
+
+
+def test_shift_once_dynamic_non_base_sequence_length():
+    latents = torch.zeros(1, 4, 48, 40)  # 1920 tokens, between the base (256) and max (4096) lengths
+    a = CustomFlowMatchEulerDiscreteScheduler(num_train_timesteps=N, use_dynamic_shifting=True)
+    b = CustomFlowMatchEulerDiscreteScheduler(num_train_timesteps=N, use_dynamic_shifting=True)
+    t_once = a.set_train_timesteps(N, "cpu", timestep_type="shift_once", latents=latents)
+    t_legacy = b.set_train_timesteps(N, "cpu", timestep_type="flux_shift", latents=latents)
+    torch.testing.assert_close(t_once, t_legacy, atol=1e-4, rtol=0)
+    # the scheduler takes the shift range from its config (diffusers: max_shift 1.15, not calculate_shift's 1.16)
+    c = a.config
+    mu = calculate_shift(48 * 40, c.get("base_image_seq_len", 256), c.get("max_image_seq_len", 4096),
+                         c.get("base_shift", 0.5), c.get("max_shift", 1.16))
+    torch.testing.assert_close(t_once.double() / N, _once(math.exp(mu), N), atol=2e-7, rtol=2e-6)
+    sigma = a.get_sigmas(t_once[[0, 999]], n_dim=2, dtype=torch.bfloat16, device="cpu")
+    torch.testing.assert_close(sigma.flatten().float(), (t_once[[0, 999]] / N).float(), atol=0, rtol=8e-3)
