@@ -191,6 +191,10 @@ class MossImageModel(BaseModel):
         # attention backend order (src/transformer.py CUDNN_FIRST): cuDNN first
         # by default; false = torch's default order. Set on this model's blocks
         self.sdpa_cudnn = bool(kw.get("sdpa_cudnn", True))
+        # opt-in: compile the blocks' pointwise helpers (src/transformer.py
+        # set_fused_pointwise; needs Triton). Numerics differ slightly: fp32
+        # intermediates instead of rounding each op. Default off
+        self.fused_pointwise = bool(kw.get("fused_pointwise", False))
 
         # model_kwargs.edit: krea2-style reference conditioning for edit LoRAs
         # (the vendor model is t2i only). References ride in the prompt through
@@ -336,6 +340,7 @@ class MossImageModel(BaseModel):
 
         transformer = self._load_transformer()
         transformer.set_sdpa_priority(CUDNN_FIRST if self.sdpa_cudnn else None)
+        transformer.set_fused_pointwise(self.fused_pointwise)
         # quantize + offload + placement, all driven by model_config
         transformer.aitk_post_load(**self.component_load_kwargs("transformer"))
         flush()
