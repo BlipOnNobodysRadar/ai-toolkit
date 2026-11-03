@@ -60,6 +60,9 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         # Get the indices of the timesteps
         step_indices = [(self.timesteps == t).nonzero().item()
                         for t in timesteps]
+        # the weighting tables have 1000 entries; a longer grid reuses the last weight for its tail
+        table_len = len(self.linear_timesteps_weights)
+        step_indices = [min(i, table_len - 1) for i in step_indices]
 
         # Get the weights for the timesteps
         if timestep_type == "weighted":
