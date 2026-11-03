@@ -156,12 +156,20 @@ class CustomFlowMatchEulerDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
             self.timesteps = timesteps.to(device=device)
 
             return timesteps
-        elif timestep_type in ['flux_shift', 'lumina2_shift', 'shift']:
+        elif timestep_type in ['flux_shift', 'lumina2_shift', 'shift', 'shift_once']:
             # matches inference dynamic shifting
-            timesteps = np.linspace(
-                self._sigma_to_t(self.sigma_max), self._sigma_to_t(
-                    self.sigma_min), num_timesteps
-            )
+            if timestep_type == 'shift_once':
+                # raw grid from sigma 1 down to 1/N, shifted once below. The other types start from the scheduler's
+                # sigma_min, which diffusers has already shifted when shifting is static, so the endpoint gets the
+                # shift twice (shift 12, N 1000: lowest sigma 0.126 instead of 0.0119). Same as 'shift' when dynamic.
+                timesteps = np.linspace(
+                    self.config.num_train_timesteps, 1, num_timesteps
+                )
+            else:
+                timesteps = np.linspace(
+                    self._sigma_to_t(self.sigma_max), self._sigma_to_t(
+                        self.sigma_min), num_timesteps
+                )
 
             sigmas = timesteps / self.config.num_train_timesteps
 
