@@ -603,7 +603,7 @@ class TrainConfig:
         # adds an additional loss to the network to encourage it output a normalized standard deviation
         self.target_norm_std = kwargs.get('target_norm_std', None)
         self.target_norm_std_value = kwargs.get('target_norm_std_value', 1.0)
-        self.timestep_type = kwargs.get('timestep_type', 'sigmoid')  # sigmoid, linear, lognorm_blend, next_sample, weighted, one_step, logit_normal
+        self.timestep_type = kwargs.get('timestep_type', 'sigmoid')  # sigmoid, linear, lognorm_blend, next_sample, weighted, one_step, logit_normal, shift, shift_once
         # timestep_type 'logit_normal' (flowmatch): sigma = sigmoid(N(mean, std)), a `uniform` share drawn uniformly;
         # cutoff < 1 truncates at sigma = cutoff and stretches back over (0, 1). MOSS-Image pre-training used
         # mean 1.09, std 0.95, cutoff 0.95, uniform 0.01 on the unshifted grid
