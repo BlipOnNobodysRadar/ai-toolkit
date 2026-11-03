@@ -6,7 +6,7 @@ timestep_type shift_once at shift 12, training never saw sigma 0.0119, only down
 import pytest
 import torch
 
-from toolkit.timestep_indices import balanced_timestep_indices
+from toolkit.timestep_indices import balanced_timestep_indices, last_train_index
 from toolkit.samplers.custom_flowmatch_sampler import CustomFlowMatchEulerDiscreteScheduler
 
 
@@ -44,3 +44,35 @@ def test_lowest_sigma_reachable_with_shift_once():
     sigmas = timesteps[idx] / 1000
     assert sigmas.min().item() == pytest.approx(0.011869436, abs=1e-6)
     assert sigmas.max().item() == pytest.approx(1.0, abs=1e-6)
+
+
+# Astra's review (3 Nov): the inclusive bound must hold against the grid the scheduler actually built, and against the
+# fixed 1000-entry weighting tables.
+
+@pytest.mark.parametrize("timestep_type,n,last", [("lognorm_blend", 30, 28), ("lognorm_blend", 1001, 999),
+                                                  ("shift_once", 1000, 999), ("weighted", 1001, 1000), ("linear", 30, 29)])
+def test_draws_stay_on_the_built_grid(timestep_type, n, last):
+    scheduler = CustomFlowMatchEulerDiscreteScheduler(num_train_timesteps=1000, shift=3)
+    timesteps = scheduler.set_train_timesteps(n, "cpu", timestep_type=timestep_type)
+    # the trainer's clip: max_denoising_steps (default 999, or set higher) against the built grid
+    top = min(10_000, last_train_index(n, scheduler))
+    assert top == last == len(timesteps) - 1
+    idx = _draw(0, top, True, n=20_000)
+    assert idx.max().item() == last
+    timesteps[idx]  # in range for every draw
+
+
+def test_last_train_index_without_a_grid():
+    class NoGrid:
+        timesteps = None
+    assert last_train_index(1000, NoGrid()) == 999
+
+
+@pytest.mark.parametrize("kwargs", [{"timestep_type": "weighted"}, {"timestep_type": "weighted", "x0_pred": True},
+                                    {"timestep_type": "linear"}, {"timestep_type": "linear", "v2": True}])
+def test_weights_for_a_grid_longer_than_the_tables(kwargs):
+    scheduler = CustomFlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
+    timesteps = scheduler.set_train_timesteps(1001, "cpu", timestep_type="weighted")
+    w = scheduler.get_weights_for_timesteps(timesteps[[0, 998, 999, 1000]], **kwargs)
+    assert w.shape == (4,) and torch.isfinite(w).all()
+    assert w[3].item() == w[2].item()  # the tail past the 1000-entry table reuses its last weight

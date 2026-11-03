@@ -57,7 +57,7 @@ from jobs.process import BaseTrainProcess
 from toolkit.metadata import get_meta_for_safetensors, load_metadata_from_safetensors, add_base_model_info_to_meta, \
     parse_metadata_from_safetensors
 from toolkit.train_tools import get_torch_dtype, LearnableSNRGamma, apply_learnable_snr_gos, apply_snr_weight
-from toolkit.timestep_indices import balanced_timestep_indices
+from toolkit.timestep_indices import balanced_timestep_indices, last_train_index
 import gc
 
 from tqdm import tqdm
@@ -1353,7 +1353,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
             # clip min max indicies
             min_noise_steps = max(min_noise_steps, 0)
-            max_noise_steps = min(max_noise_steps, num_train_timesteps - 1)
+            max_noise_steps = min(max_noise_steps, last_train_index(num_train_timesteps, self.sd.noise_scheduler))
             
                     
             with self.timer('prepare_timesteps_indices'):
