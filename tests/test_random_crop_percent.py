@@ -119,3 +119,51 @@ def test_rolls_reach_persistent_workers():
     loader = DataLoader(WorkerDataset(fake), batch_size=None, num_workers=2, persistent_workers=True)
     epochs = [[tuple(int(v) for v in x) for x in loader] for _ in range(3)]
     assert epochs[0] != epochs[1] or epochs[1] != epochs[2]
+
+
+class BucketFake(BucketsMixin):
+    def __init__(self, cfg, sizes):
+        cfg.bucket_tolerance = 16  # the trainer sets this from the model's divisibility
+        self.dataset_config = cfg
+        self.batch_size = 1
+        self.file_list = [FakeItem(dataset_config=cfg, width=w, height=h, is_audio_model=False, num_frames=1,
+                                   path=f"{i}.png") for i, (w, h) in enumerate(sizes)]
+        self.epoch_num = 0
+        self.dataset_path = "fake"
+        self.is_video = False
+
+
+SIZES = [(1024, 1024), (1365, 1024), (1024, 1365), (1200, 900), (768, 1024)]
+
+
+@pytest.mark.parametrize("square", [False, True])
+def test_setup_buckets_plain_random_crop_matches_main(monkeypatch, square):
+    cfg = DatasetConfig(folder_path="x", random_crop=True, square_crop=square, resolution=1024)
+    calls = []
+    real = random.randint
+    monkeypatch.setattr(random, "randint", lambda a, b: calls.append((a, b)) or real(a, b))
+    ds = BucketFake(cfg, SIZES)
+    ds.setup_buckets(quiet=True)
+    if square:
+        # main centres square crops even with random_crop on
+        assert calls == []
+        for item in ds.file_list:
+            assert item.crop_x == max(0, int(item.scale_to_width / 2 - 1024 / 2))
+    else:
+        # main draws x and y for every item, zero slack included
+        assert len(calls) == 2 * len(SIZES)
+    assert all(not hasattr(i, "dataset_config") or i.dataset_config is cfg for i in ds.file_list)
+
+
+def test_setup_buckets_percent_crop_window():
+    cfg = DatasetConfig(folder_path="x", random_crop_percent=0.06, resolution=1024)
+    random.seed(3)
+    ds = BucketFake(cfg, SIZES)
+    ds.setup_buckets(quiet=True)
+    for item in ds.file_list:
+        # the zoom over the bucket-fitted scale is at most 1 / 0.94 (bucket slack comes on top)
+        assert 1.0 <= item.scale_to_width / item.base_scale_to_width <= 1 / 0.94 + 2e-3
+        assert 1.0 <= item.scale_to_height / item.base_scale_to_height <= 1 / 0.94 + 2e-3
+        assert 0 <= item.crop_x <= item.scale_to_width - item.crop_width
+        assert 0 <= item.crop_y <= item.scale_to_height - item.crop_height
+        assert (item.base_scale_to_width, item.base_scale_to_height) != (None, None)

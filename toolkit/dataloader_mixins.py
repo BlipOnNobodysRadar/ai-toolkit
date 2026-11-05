@@ -254,11 +254,10 @@ class BucketsMixin:
     def roll_random_crop(self: 'AiToolkitDataset', file_item: 'FileItemDTO'):
         """(Re)roll the random crop window for a single file item.
 
-        With dataset_config.random_crop_percent > 0, the pre-crop scale is
-        inflated by a random zoom so the bucket-sized crop window covers a
-        random (1 - percent)..100% of the image, then the window is placed at
-        a random position. With percent == 0 this preserves legacy behavior:
-        random position within whatever slack bucket-fitting left over.
+        The pre-crop scale is inflated by a random zoom so the bucket-sized
+        crop window covers a random (1 - random_crop_percent)..100% of the
+        image, then the window is placed at a random position. Only called
+        for random_crop_percent > 0; plain random_crop keeps main's setup code.
         """
         item_config = getattr(file_item, 'dataset_config', None) or self.dataset_config
         pct = getattr(item_config, 'random_crop_percent', 0.0) or 0.0
@@ -331,7 +330,7 @@ class BucketsMixin:
                 file_item.crop_height = resolution
                 file_item.base_scale_to_width = file_item.scale_to_width
                 file_item.base_scale_to_height = file_item.scale_to_height
-                if item_config.random_crop:
+                if getattr(item_config, 'random_crop_percent', 0) > 0:
                     self.roll_random_crop(file_item)
                 elif width > height:
                     file_item.crop_x = int(file_item.scale_to_width / 2 - resolution / 2)
@@ -367,8 +366,14 @@ class BucketsMixin:
                 file_item.base_scale_to_width = file_item.scale_to_width
                 file_item.base_scale_to_height = file_item.scale_to_height
 
-                if item_config.random_crop:
+                if getattr(item_config, 'random_crop_percent', 0) > 0:
                     self.roll_random_crop(file_item)
+                elif item_config.random_crop:
+                    # random crop
+                    crop_x = random.randint(0, file_item.scale_to_width - new_width)
+                    crop_y = random.randint(0, file_item.scale_to_height - new_height)
+                    file_item.crop_x = crop_x
+                    file_item.crop_y = crop_y
                 else:
                     # do central crop
                     file_item.crop_x = int((file_item.scale_to_width - new_width) / 2)
@@ -2561,6 +2566,17 @@ class TextEmbeddingCachingMixin:
                         if dop_blank_path not in [t[0] for t in encode_targets] + [text_embedding_path]:
                             encode_targets.append((dop_blank_path, file_item.get_dop_dropout_caption()))
                             dropout_target_paths.add(dop_blank_path)
+                # i2v first-frame embeddings come from the item's own crop, cache hits included; explicit
+                # control images take precedence (they are encoded instead of the first frame)
+                if (getattr(item_config, 'random_crop_percent', 0) > 0
+                        and getattr(self.sd, 'encode_first_frame_in_text_embeddings', False)
+                        and item_config.do_i2v and file_item.is_video
+                        and not (file_item.encode_control_in_text_embeddings and (
+                            file_item.control_path is not None
+                            or len(getattr(file_item, 'control_video_paths', None) or []) > 0))):
+                    raise ValueError("random_crop_percent re-rolls the crop on every access, so it can't be "
+                                     "combined with i2v first-frame text embeddings cached from the item's own "
+                                     f"crop. Offending item: {file_item.path}")
                 # only process if not saved to disk
                 encode_targets = [t for t in encode_targets if not os.path.exists(t[0])]
                 if len(encode_targets) > 0:
@@ -2631,10 +2647,6 @@ class TextEmbeddingCachingMixin:
                         and item_config.do_i2v
                         and file_item.is_video
                     ):
-                        if getattr(item_config, 'random_crop_percent', 0) > 0:
-                            raise ValueError("random_crop_percent re-rolls the crop on every access, so it can't be "
-                                             "combined with cached conditioning made from the item's own crop "
-                                             f"(i2v first frame in the text embeddings). Offending item: {file_item.path}")
                         # video item: encode the clip's FIRST FRAME into the text embeddings
                         # as a vision reference, matching sampling (where the ctrl image goes
                         # into the embeds and is held as the clean first frames)
