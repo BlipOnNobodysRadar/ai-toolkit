@@ -281,27 +281,6 @@ class BucketsMixin:
         file_item.crop_x = random.randint(0, max_x) if max_x > 0 else 0
         file_item.crop_y = random.randint(0, max_y) if max_y > 0 else 0
 
-    def reroll_random_crops(self: 'AiToolkitDataset'):
-        """Re-roll every file item's random crop. Called once per epoch from
-        setup_epoch so each epoch trains on a different crop of each image."""
-        if getattr(self, 'is_audio_model', False):
-            return
-        if not self.dataset_config.buckets:
-            return
-        if getattr(self, 'is_caching_latents', False):
-            # latents were encoded from the epoch-0 crop; re-rolling would
-            # change nothing (or mismatch). leave crops frozen.
-            return
-        for file_item in self.file_list:
-            if getattr(file_item, 'crop_width', None) is None:
-                continue
-            if getattr(file_item, 'scale_to_width', None) is None:
-                continue
-            item_config = getattr(file_item, 'dataset_config', None) or self.dataset_config
-            if not item_config.random_crop:
-                continue
-            self.roll_random_crop(file_item)
-
     def setup_buckets(self: 'AiToolkitDataset', quiet=False):
         if not hasattr(self, 'file_list'):
             raise Exception(f'file_list not found on class instance {self.__class__.__name__}')
@@ -310,7 +289,7 @@ class BucketsMixin:
 
         if self.epoch_num > 0:
             # bucket assignments don't change between epochs. random crops are
-            # re-rolled separately via reroll_random_crops() from setup_epoch().
+            # re-rolled per item access (AiToolkitDataset._roll_crop_on_access).
             return
         self.buckets = {}  # clear it
 

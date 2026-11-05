@@ -647,11 +647,6 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             if self.is_generating_controls:
                 # always do this last
                 self.setup_controls()
-        else:
-            # re-roll random crops so each epoch sees a different crop of each image
-            # per-item configs decide which items re-roll (pooled datasets mix them)
-            if self.dataset_config.buckets:
-                self.reroll_random_crops()
         self.epoch_num += 1
 
     def __getstate__(self):
@@ -679,8 +674,20 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     break
         return random.randint(0, len(self.file_list) - 1)
 
+    def _roll_crop_on_access(self, file_item: 'FileItemDTO'):
+        # Random crops are rolled per access, in whichever process loads the item: the copy gets a fresh window and
+        # file_list keeps the base scale. Per-epoch re-rolls in setup_epoch never reached persistent loader workers.
+        # Cached latents were encoded from the setup crop, so they keep it.
+        if self.is_caching_latents or not self.dataset_config.buckets:
+            return
+        item_config = getattr(file_item, 'dataset_config', None) or self.dataset_config
+        if not item_config.random_crop or getattr(file_item, 'crop_width', None) is None:
+            return
+        self.roll_random_crop(file_item)
+
     def _get_single_item(self, index, _attempts=0) -> 'FileItemDTO':
         file_item: 'FileItemDTO' = copy.deepcopy(self.file_list[index])
+        self._roll_crop_on_access(file_item)
         try:
             file_item.load_and_process_image(file_item.dataloader_transforms or self.transform)
         except Exception as e:
