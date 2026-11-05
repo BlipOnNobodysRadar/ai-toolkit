@@ -7,7 +7,7 @@ import pytest
 from torch.utils.data import DataLoader, Dataset
 
 from toolkit.config_modules import DatasetConfig
-from toolkit.data_loader import AiToolkitDataset
+from toolkit.data_loader import AiToolkitDataset, check_random_crop_caching
 from toolkit.dataloader_mixins import BucketsMixin
 
 
@@ -87,6 +87,18 @@ def test_no_roll_when_latents_are_cached_or_crop_off():
     assert all(cached._get_single_item(0).scale_to_width == 1024 for _ in range(20))
     off = FakeDataset(DatasetConfig(folder_path="x"))
     assert all(off._get_single_item(0).scale_to_width == 1024 for _ in range(20))
+    # plain random_crop keeps its one setup crop (legacy behaviour)
+    legacy = FakeDataset(DatasetConfig(folder_path="x", random_crop=True))
+    assert all((i.scale_to_width, i.crop_x) == (1024, 0) for i in (legacy._get_single_item(0) for _ in range(20)))
+
+
+def test_pool_that_caches_latents_rejects_percent_crop():
+    cropped = DatasetConfig(folder_path="a", random_crop_percent=0.06)
+    cached = DatasetConfig(folder_path="b", cache_latents_to_disk=True)
+    with pytest.raises(ValueError, match="random_crop_percent"):
+        check_random_crop_caching([cropped, cached], is_caching_latents=True)
+    check_random_crop_caching([cropped], is_caching_latents=False)
+    check_random_crop_caching([cached], is_caching_latents=True)
 
 
 class WorkerDataset(Dataset):

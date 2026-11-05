@@ -363,7 +363,7 @@ class BucketsMixin:
                 new_width = bucket_resolution["width"]
                 new_height = bucket_resolution["height"]
 
-                # remember pre-jitter scale so crops can be re-rolled each epoch
+                # remember pre-jitter scale so random_crop_percent can re-roll the crop on each access
                 file_item.base_scale_to_width = file_item.scale_to_width
                 file_item.base_scale_to_height = file_item.scale_to_height
 
@@ -2631,6 +2631,10 @@ class TextEmbeddingCachingMixin:
                         and item_config.do_i2v
                         and file_item.is_video
                     ):
+                        if getattr(item_config, 'random_crop_percent', 0) > 0:
+                            raise ValueError("random_crop_percent re-rolls the crop on every access, so it can't be "
+                                             "combined with cached conditioning made from the item's own crop "
+                                             f"(i2v first frame in the text embeddings). Offending item: {file_item.path}")
                         # video item: encode the clip's FIRST FRAME into the text embeddings
                         # as a vision reference, matching sampling (where the ctrl image goes
                         # into the embeds and is held as the clean first frames)
@@ -2665,6 +2669,10 @@ class TextEmbeddingCachingMixin:
                             del prompt_embeds
                 if getattr(file_item, 'dopsd_self_ref', False):
                     # D-OPSD teacher embeds encode with the item's own media as the reference
+                    if getattr(item_config, 'random_crop_percent', 0) > 0:
+                        raise ValueError("random_crop_percent re-rolls the crop on every access, so it can't be "
+                                         "combined with D-OPSD self-reference embeddings cached from the item's own "
+                                         f"crop. Offending item: {file_item.path}")
                     control_video_paths = getattr(file_item, 'control_video_paths', None) or []
                     if file_item.control_path is not None or len(control_video_paths) > 0:
                         raise ValueError(
