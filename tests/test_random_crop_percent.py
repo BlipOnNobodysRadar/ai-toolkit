@@ -167,3 +167,94 @@ def test_setup_buckets_percent_crop_window():
         assert 0 <= item.crop_x <= item.scale_to_width - item.crop_width
         assert 0 <= item.crop_y <= item.scale_to_height - item.crop_height
         assert (item.base_scale_to_width, item.base_scale_to_height) != (None, None)
+
+
+# --- text-embedding caching guards (Astra's nit): the first-frame guard must fire on cache hits and misses, and
+# explicit controls (encoded instead of the first frame) must stay accepted either way
+
+class FakeEmbeds:
+    def save(self, path):
+        open(path, "wb").close()
+
+
+class FakeSD:
+    device = device_torch = "cpu"
+    torch_dtype = None
+    encode_first_frame_in_text_embeddings = True
+    has_multiple_control_images = False
+
+    def __init__(self):
+        self.calls = []
+
+    def set_device_state_preset(self, preset):
+        pass
+
+    def encode_prompt(self, caption, control_images=None, target_size=None):
+        self.calls.append(control_images)
+        return FakeEmbeds()
+
+
+class TextItem(SimpleNamespace):
+    def get_text_embedding_path(self, recalculate=False):
+        return self.embed_path
+
+
+class TextCacheFake:
+    from toolkit.dataloader_mixins import TextEmbeddingCachingMixin
+    cache_text_embeddings = TextEmbeddingCachingMixin.cache_text_embeddings
+    del TextEmbeddingCachingMixin
+
+    def __init__(self, item):
+        self.dataset_path = "fake"
+        self.file_list = [item]
+        self.sd = FakeSD()
+        self.transform = None
+
+
+def text_item(tmp_path, pct=0.06, hit=False, control=None, control_videos=None, dopsd=False):
+    cfg = DatasetConfig(folder_path="x", random_crop_percent=pct, do_i2v=True)
+    embed = tmp_path / "item.safetensors"
+    if hit:
+        embed.write_bytes(b"")
+    return TextItem(dataset_config=cfg, caption="cap", is_video=True, path="clip.mp4", embed_path=str(embed),
+                    encode_control_in_text_embeddings=control is not None or control_videos is not None,
+                    control_path=control, control_video_paths=control_videos or [], dopsd_self_ref=dopsd,
+                    crop_width=None, crop_height=None, dataloader_transforms=None)
+
+
+@pytest.mark.parametrize("hit", [False, True])
+def test_first_frame_embeds_reject_percent_crop(tmp_path, hit):
+    ds = TextCacheFake(text_item(tmp_path, hit=hit))
+    with pytest.raises(ValueError, match="i2v first-frame"):
+        ds.cache_text_embeddings()
+    assert ds.sd.calls == []
+
+
+@pytest.mark.parametrize("hit", [False, True])
+def test_explicit_controls_still_accepted(tmp_path, hit):
+    from PIL import Image
+    png = tmp_path / "ctrl.png"
+    Image.new("RGB", (8, 8)).save(png)
+    for item in (text_item(tmp_path, hit=hit, control=str(png)),
+                 text_item(tmp_path, hit=hit, control_videos=["ref.mp4"])):
+        ds = TextCacheFake(item)
+        ds.cache_text_embeddings()
+        assert item.is_text_embedding_cached
+        # a hit encodes nothing; a miss encodes the explicit control, never the item's own first frame
+        assert len(ds.sd.calls) == (0 if hit else 1)
+        (tmp_path / "item.safetensors").unlink(missing_ok=True)
+        if hit:
+            (tmp_path / "item.safetensors").write_bytes(b"")
+
+
+def test_first_frame_embeds_fine_without_percent_crop(tmp_path):
+    ds = TextCacheFake(text_item(tmp_path, pct=0.0, hit=True))
+    ds.cache_text_embeddings()
+    assert ds.file_list[0].is_text_embedding_cached
+
+
+def test_dopsd_self_ref_rejects_percent_crop(tmp_path):
+    item = text_item(tmp_path, hit=True, control=None, dopsd=True)
+    item.is_video = False  # image item: the first-frame guard doesn't apply, the D-OPSD one must
+    with pytest.raises(ValueError, match="D-OPSD"):
+        TextCacheFake(item).cache_text_embeddings()
