@@ -384,6 +384,14 @@ class PairedImageDataset(Dataset):
         return img, prompt, (self.neg_weight, self.pos_weight)
 
 
+def check_random_crop_caching(source_configs, is_caching_latents):
+    # one source's latent cache makes the whole pool cache, which would freeze the re-rolled crops
+    if is_caching_latents and any(getattr(c, 'random_crop_percent', 0) > 0 for c in source_configs):
+        raise ValueError("random_crop_percent re-rolls crops on every access, but this pool caches latents "
+                         "because another source asks for it. Turn latent caching off in every source, or "
+                         "train the cropped source on its own.")
+
+
 class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin, TextEmbeddingCachingMixin, BucketsMixin, CaptionMixin, Dataset):
 
     def __init__(
@@ -423,6 +431,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         self.is_generating_controls = any(len(c.controls) > 0 for c in self.source_configs)
         # mixin init read this off dataset_config only
         self.is_caching_text_embeddings = any(c.cache_text_embeddings for c in self.source_configs)
+        check_random_crop_caching(self.source_configs, self.is_caching_latents)
         self.epoch_num = 0
 
         self.sd = sd
@@ -674,8 +683,20 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     break
         return random.randint(0, len(self.file_list) - 1)
 
+    def _roll_crop_on_access(self, file_item: 'FileItemDTO'):
+        # random_crop_percent crops are rolled per access, in whichever process loads the item: the copy gets a fresh
+        # window and file_list keeps the base scale. Per-epoch re-rolls in setup_epoch never reached persistent
+        # loader workers. Plain random_crop keeps its one crop from setup, as before.
+        if self.is_caching_latents or not self.dataset_config.buckets:
+            return
+        item_config = getattr(file_item, 'dataset_config', None) or self.dataset_config
+        if getattr(item_config, 'random_crop_percent', 0) <= 0 or getattr(file_item, 'crop_width', None) is None:
+            return
+        self.roll_random_crop(file_item)
+
     def _get_single_item(self, index, _attempts=0) -> 'FileItemDTO':
         file_item: 'FileItemDTO' = copy.deepcopy(self.file_list[index])
+        self._roll_crop_on_access(file_item)
         try:
             file_item.load_and_process_image(file_item.dataloader_transforms or self.transform)
         except Exception as e:
