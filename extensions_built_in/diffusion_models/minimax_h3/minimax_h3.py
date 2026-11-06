@@ -156,9 +156,12 @@ def blank_log_image_function(self, *args, **kwargs):
 class MiniMaxH3VaeBundle(torch.nn.Module):
     """Holds both frozen autoencoders behind the single ``self.vae`` handle."""
 
-    def __init__(self, video_vae: MiniMaxH3VideoVAE, audio_vae: MiniMaxH3AudioVAE):
+    def __init__(
+        self, video_vae: MiniMaxH3VideoVAE, audio_vae: Optional[MiniMaxH3AudioVAE]
+    ):
         super().__init__()
         self.video_vae = video_vae
+        # None for image-only derivatives (P-H3-Image)
         self.audio_vae = audio_vae
 
     @property
@@ -171,7 +174,8 @@ class MiniMaxH3VaeBundle(torch.nn.Module):
 
     def enable_gradient_checkpointing(self, enable: bool = True):
         self.video_vae.enable_gradient_checkpointing(enable)
-        self.audio_vae.enable_gradient_checkpointing(enable)
+        if self.audio_vae is not None:
+            self.audio_vae.enable_gradient_checkpointing(enable)
 
     def disable_gradient_checkpointing(self):
         self.enable_gradient_checkpointing(False)
@@ -179,8 +183,11 @@ class MiniMaxH3VaeBundle(torch.nn.Module):
 
 class MinimaxH3Model(BaseModel):
     arch = "minimax_h3"
-    # video flow shift; audio stays on AUDIO_SIGMA_SHIFT, remapped from this
+    # video flow shift; audio stays on audio_sigma_shift, remapped from this
     video_sigma_shift = packing.VIDEO_SIGMA_SHIFT
+    audio_sigma_shift = packing.AUDIO_SIGMA_SHIFT
+    # released keyframe recipe rounds the posterior sample through fp16
+    keyframe_fp16_round = True
     # hub repo for missing files when name_or_path isn't an org/repo id
     comfy_repo = COMFY_REPO
     use_old_lokr_format = False
@@ -236,6 +243,67 @@ class MinimaxH3Model(BaseModel):
     def get_frame_count_snapper(self):
         # auto_frame_count: snap dataset clips down to the VAE's 17n+5 grid
         return packing.align_num_frames_down
+
+    def build_sample_sigmas(self, num_inference_steps: int) -> torch.Tensor:
+        """Video sigma grid for sampling (steps + 1 entries ending at 0)."""
+        return packing.build_sigma_schedule(
+            num_inference_steps,
+            self.video_sigma_shift,
+            t1000_ladder=getattr(self, "t1000_sample_ladder", False),
+        )
+
+    def _stage_for_sampling(self):
+        """DiT onto the gpu (the pipeline calls this right before denoising,
+        after the reference encodes); under low_vram the text encoder (brought
+        up by get_prompt_embeds) is parked first so the two never share the card."""
+        te = self.text_encoder
+        if (
+            self.low_vram
+            and isinstance(te, torch.nn.Module)
+            and not type(te).__name__.startswith("Fake")
+            and not hasattr(te, "_memory_manager")
+            and next(te.parameters(), None) is not None
+            and next(te.parameters()).device.type == "cuda"
+        ):
+            te.to("cpu")
+            flush()
+        if self.model.device == torch.device("cpu"):
+            self.model.to(self.device_torch)
+            # the 900-tensor move leaves ~3GB of split cache blocks behind
+            flush()
+
+    def set_device_state_preset(self, device_state_preset):
+        if device_state_preset == "generate" and self.low_vram:
+            # the sampling path stages text encoder, DiT and VAE one at a time
+            # (never together); only the eval / no-grad side of the preset applies
+            self.save_device_state()
+            for mod in (self.model, self.vae, self.text_encoder):
+                if isinstance(mod, torch.nn.Module):
+                    mod.eval()
+            self.model.requires_grad_(False)
+            return
+        return super().set_device_state_preset(device_state_preset)
+
+    def _park_vae_for_denoise(self):
+        """low_vram: the VAE (brought up for reference encodes) leaves the gpu
+        before the DiT denoises."""
+        if self.low_vram and self.vae.device.type == "cuda":
+            self.vae.to("cpu")
+            flush()
+
+    def _stage_for_decode(self):
+        """low_vram: the DiT leaves the gpu before the VAE comes up to decode;
+        restore_device_state / _stage_for_sampling bring it back."""
+        if self.low_vram and self.model.device.type == "cuda":
+            self.model.to("cpu")
+            flush()
+        if self.vae.device.type == "cpu":
+            self.vae.to(self.vae_device_torch)
+
+    def _prompt_encoder_kwargs(self) -> dict:
+        """Extra kwargs for encode_minimax_h3_prompt (P-H3-Image taps several
+        hidden states through its text connector)."""
+        return {}
 
     def prepare_sample_prompt_context(self, gen_config):
         # sample prompts: video refs are treated at the sample's length, not
@@ -522,7 +590,8 @@ class MinimaxH3Model(BaseModel):
         flush()
 
         vae_bundle = self._load_vaes()
-        vae_bundle.to(self.vae_device_torch)
+        # low_vram: the VAE comes up only around encode / decode
+        vae_bundle.to("cpu" if self.model_config.low_vram else self.vae_device_torch)
 
         self.noise_scheduler = self.get_train_scheduler()
         self.vae = vae_bundle
@@ -601,6 +670,7 @@ class MinimaxH3Model(BaseModel):
                 device=self.device_torch,
                 dtype=self.torch_dtype,
                 max_length=self.max_text_length,
+                **self._prompt_encoder_kwargs(),
             )
             embeds_list.append(embeds)
             tags_list.append(tags)
@@ -662,7 +732,7 @@ class MinimaxH3Model(BaseModel):
             frames.to(self.vae_device_torch, self.video_vae.dtype),
             sample=True,
             generator=generator,
-            fp16_round=True,
+            fp16_round=self.keyframe_fp16_round,
         )
         return latents.float()
 
@@ -798,7 +868,7 @@ class MinimaxH3Model(BaseModel):
             if sigma_v.shape[0] != batch_size:
                 sigma_v = sigma_v.expand(batch_size)
             sigma_a = remap_sigma(
-                sigma_v, self.video_sigma_shift, packing.AUDIO_SIGMA_SHIFT
+                sigma_v, self.video_sigma_shift, self.audio_sigma_shift
             )
             t_v = 1.0 - sigma_v
             t_a = 1.0 - sigma_a
@@ -837,51 +907,33 @@ class MinimaxH3Model(BaseModel):
                 )
 
             sa = sigma_a.view(-1, 1, 1)
-            audio_target = None
-            noisy_audio_rows = None
+            expected_rows = a_lat * packing.AUDIO_CHANNELS
             if raw_audio is not None:
-                expected_rows = a_lat * packing.AUDIO_CHANNELS
                 if raw_audio.shape[1] > expected_rows:
                     raw_audio = raw_audio[:, :expected_rows]
                 elif raw_audio.shape[1] < expected_rows:
                     raw_audio = torch.nn.functional.pad(
                         raw_audio, (0, 0, 0, expected_rows - raw_audio.shape[1])
                     )
-                # the audio noise is drawn once per step and shared by every
-                # pass (prior, primary, cfg/guidance, preservation) so they all
-                # see the same soundtrack and every pass's target matches. It
-                # rides on the latents DTO along with the trimmed audio so
-                # on-the-fly encodes aren't repeated per pass.
-                audio_noise = (
-                    batch.latents.get("audio_noise")
-                    if isinstance(batch.latents, DTO)
-                    else None
-                )
-                if audio_noise is not None and audio_noise.shape == raw_audio.shape:
-                    audio_noise = audio_noise.to(device, torch.float32)
-                else:
-                    audio_noise = torch.randn_like(raw_audio)
-                    if batch.latents is not None:
-                        batch.latents = DTO(
-                            batch.latents, audio=raw_audio, audio_noise=audio_noise
-                        )
-                audio_rows = (1.0 - sa) * raw_audio + sa * audio_noise
-                # model predicts clean - noise; audio_pred is negated below so
-                # the target follows ai-toolkit's noise - clean convention
-                audio_target = (audio_noise - raw_audio).detach()
-                # what audio perceptual losses need to rebuild the clean
-                # estimate (x0 = noisy - sigma_a * pred); rides the pred DTO
-                noisy_audio_rows = audio_rows
-            else:
-                # no soundtrack: silence (zeros) noised at the audio sigma
-                # rides along without contributing to the loss
-                audio_rows = sa * torch.randn(
-                    batch_size,
-                    a_lat * packing.AUDIO_CHANNELS,
-                    32,
-                    device=device,
-                    dtype=torch.float32,
-                )
+            # no soundtrack: silence (zeros) noised at the audio sigma rides
+            # along without contributing to the loss
+            silence_rows = sa * torch.randn(
+                batch_size, expected_rows, 32, device=device, dtype=torch.float32
+            )
+            # audio_target follows ai-toolkit's noise - clean convention (the
+            # model's clean - noise audio pred is negated on return); audio_noisy
+            # is what audio perceptual losses need to rebuild the clean estimate
+            # image batches and datasets without do_audio never stream, even for a DTO caller
+            stream_input = latent_model_input
+            if not do_audio and isinstance(latent_model_input, DTO):
+                stream_input = latent_model_input.tensor
+            audio_rows, audio_target, noisy_audio_rows, audio_stream = self.audio_stream_input(
+                stream_input,
+                batch,
+                raw_audio,
+                sigma_a,
+                silence_rows,
+            )
 
             # embeds cached with a longer max_text_length: cap the caption
             # tail (vision blocks are never touched)
@@ -971,17 +1023,11 @@ class MinimaxH3Model(BaseModel):
 
         video_pred = video_pred[:, num_cond:]
         noise_pred = unpatchify_video_tokens(video_pred, t_lat, h_lat, w_lat)
-        if audio_target is not None:
-            # every pass's DTO carries its own audio stream; preds flipped to
-            # ai-toolkit's noise - clean convention
-            return DTO(
-                -noise_pred,
-                audio=-audio_pred,
-                audio_target=audio_target,
-                audio_noisy=noisy_audio_rows,
-                audio_sigma=sigma_a,
-            )
-        return -noise_pred
+        # every pass's DTO carries its own audio stream; preds flipped to
+        # ai-toolkit's noise - clean convention
+        return self.audio_stream_output(
+            -noise_pred, -audio_pred, audio_target, noisy_audio_rows, sigma_a, audio_stream
+        )
 
     def _pdd_weights(self, sigma_v, sigma_v_next=None):
         """Head weights for PDD checkpoints (None otherwise). Training passes a
@@ -993,6 +1039,7 @@ class MinimaxH3Model(BaseModel):
             sigma_v.flatten().tolist(),
             n,
             self.video_sigma_shift,
+            audio_shift=self.audio_sigma_shift,
             sigma_v_next=None if sigma_v_next is None else sigma_v_next.flatten().tolist(),
         )
 
@@ -1000,6 +1047,10 @@ class MinimaxH3Model(BaseModel):
         noise = kwargs.get("noise")
         batch = kwargs.get("batch")
         return (noise - batch.latents).detach()
+
+    def audio_sigma(self, sigma_v: torch.Tensor) -> torch.Tensor:
+        """Audio-stream sigma coupled to a video sigma (0..1)."""
+        return remap_sigma(sigma_v, self.video_sigma_shift, self.audio_sigma_shift)
 
     # ------------------------------------------------------------------
     # Sampling (training previews)
@@ -1016,9 +1067,6 @@ class MinimaxH3Model(BaseModel):
         generator: torch.Generator,
         extra: dict,
     ):
-        if self.model.device == torch.device("cpu"):
-            self.model.to(self.device_torch)
-
         sc = self.get_bucket_divisibility()
         gen_config.width = max(sc, int(gen_config.width // sc * sc))
         gen_config.height = max(sc, int(gen_config.height // sc * sc))
@@ -1047,6 +1095,7 @@ class MinimaxH3Model(BaseModel):
             width=gen_config.width,
             num_frames=gen_config.num_frames,
             num_inference_steps=gen_config.num_inference_steps,
+            sigmas=gen_config.sigmas,
             guidance_scale=gen_config.guidance_scale,
             latents=gen_config.latents,
             generator=generator,
@@ -1512,9 +1561,6 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
         generator: torch.Generator,
         extra: dict,
     ):
-        if self.model.device == torch.device("cpu"):
-            self.model.to(self.device_torch)
-
         sc = self.get_bucket_divisibility()
         gen_config.width = max(sc, int(gen_config.width // sc * sc))
         gen_config.height = max(sc, int(gen_config.height // sc * sc))
@@ -1565,6 +1611,7 @@ class MinimaxH3Ref2VAModel(MinimaxH3Model):
             width=gen_config.width,
             num_frames=gen_config.num_frames,
             num_inference_steps=gen_config.num_inference_steps,
+            sigmas=gen_config.sigmas,
             guidance_scale=gen_config.guidance_scale,
             latents=gen_config.latents,
             generator=generator,

@@ -28,6 +28,7 @@ from toolkit.sd_device_states_presets import empty_preset
 from toolkit.train_tools import get_torch_dtype, apply_noise_offset
 from toolkit.unloader import FakeTextEncoder
 import torch
+from toolkit.dto import DTO
 from toolkit.pipelines import CustomStableDiffusionXLPipeline
 from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline, T2IAdapter, DDPMScheduler, \
     LCMScheduler, Transformer2DModel, AutoencoderTiny, ControlNetModel
@@ -507,285 +508,291 @@ class BaseModel:
                 pass
 
         unwrap_step_hooks = self._install_sample_step_hooks(pipeline)
+        from toolkit.sample_sigmas import install_sample_sigma_override
+        unwrap_sigma_override = install_sample_sigma_override(self, pipeline, image_configs)
+        try:
 
-        start_multiplier = 1.0
-        if network is not None:
-            start_multiplier = network.multiplier
+            start_multiplier = 1.0
+            if network is not None:
+                start_multiplier = network.multiplier
 
-        # pipeline.to(self.device_torch)
+            # pipeline.to(self.device_torch)
 
-        with network:
-            with torch.no_grad():
-                if network is not None:
-                    assert network.is_active
-
-                for i in tqdm(range(len(image_configs)), desc=f"Generating Samples", leave=True, position=0):
-                    gen_config = image_configs[i]
-
-                    extra = {}
-                    validation_image = None
-                    if self.adapter is not None and gen_config.adapter_image_path is not None:
-                        validation_image = Image.open(gen_config.adapter_image_path)
-                        if ".inpaint." not in gen_config.adapter_image_path:
-                            validation_image = validation_image.convert("RGB")
-                        else:
-                            # make sure it has an alpha
-                            if validation_image.mode != "RGBA":
-                                raise ValueError("Inpainting images must have an alpha channel")
-                        if isinstance(self.adapter, T2IAdapter):
-                            # not sure why this is double??
-                            validation_image = validation_image.resize(
-                                (gen_config.width * 2, gen_config.height * 2))
-                            extra['image'] = validation_image
-                            extra['adapter_conditioning_scale'] = gen_config.adapter_conditioning_scale
-                        if isinstance(self.adapter, ControlNetModel):
-                            validation_image = validation_image.resize(
-                                (gen_config.width, gen_config.height))
-                            extra['image'] = validation_image
-                            extra['controlnet_conditioning_scale'] = gen_config.adapter_conditioning_scale
-                        if isinstance(self.adapter, CustomAdapter) and self.adapter.control_lora is not None:
-                            validation_image = validation_image.resize((gen_config.width, gen_config.height))
-                            extra['control_image'] = validation_image
-                            extra['control_image_idx'] = gen_config.ctrl_idx
-                        if isinstance(self.adapter, IPAdapter) or isinstance(self.adapter, ClipVisionAdapter):
-                            transform = transforms.Compose([
-                                transforms.ToTensor(),
-                            ])
-                            validation_image = transform(validation_image)
-                        if isinstance(self.adapter, CustomAdapter):
-                            # todo allow loading multiple
-                            transform = transforms.Compose([
-                                transforms.ToTensor(),
-                            ])
-                            validation_image = transform(validation_image)
-                            self.adapter.num_images = 1
-                        if isinstance(self.adapter, ReferenceAdapter):
-                            # need -1 to 1
-                            validation_image = transforms.ToTensor()(validation_image)
-                            validation_image = validation_image * 2.0 - 1.0
-                            validation_image = validation_image.unsqueeze(0)
-                            self.adapter.set_reference_images(validation_image)
-
+            with network:
+                with torch.no_grad():
                     if network is not None:
-                        network.multiplier = gen_config.network_multiplier
-                    self._sample_step_index = 0
-                    torch.manual_seed(gen_config.seed)
-                    torch.cuda.manual_seed(gen_config.seed)
+                        assert network.is_active
 
-                    generator = torch.manual_seed(gen_config.seed)
+                    for i in tqdm(range(len(image_configs)), desc=f"Generating Samples", leave=True, position=0):
+                        gen_config = image_configs[i]
+                        self.sample_sigmas = gen_config.sigmas
 
-                    if self.adapter is not None and isinstance(self.adapter, ClipVisionAdapter) \
-                            and gen_config.adapter_image_path is not None:
-                        # run through the adapter to saturate the embeds
-                        conditional_clip_embeds = self.adapter.get_clip_image_embeds_from_tensors(
-                            validation_image)
-                        self.adapter(conditional_clip_embeds)
-
-                    if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
-                        # handle condition the prompts
-                        gen_config.prompt = self.adapter.condition_prompt(
-                            gen_config.prompt,
-                            is_unconditional=False,
-                        )
-                        gen_config.prompt_2 = gen_config.prompt
-                        gen_config.negative_prompt = self.adapter.condition_prompt(
-                            gen_config.negative_prompt,
-                            is_unconditional=True,
-                        )
-                        gen_config.negative_prompt_2 = gen_config.negative_prompt
-
-                    if self.adapter is not None and isinstance(self.adapter, CustomAdapter) and validation_image is not None:
-                        self.adapter.trigger_pre_te(
-                            tensors_0_1=validation_image,
-                            is_training=False,
-                            has_been_preprocessed=False,
-                            quad_count=4
-                        )
-
-                    if self.is_llm:
-                        # text-generating models take the prompt and media directly
-                        conditional_embeds = None
-                        unconditional_embeds = None
-                    elif self.sample_prompts_cache is not None:
-                        conditional_embeds = self.sample_prompts_cache[i]['conditional'].to(self.device_torch, dtype=self.torch_dtype)
-                        unconditional_embeds = self.sample_prompts_cache[i]['unconditional'].to(self.device_torch, dtype=self.torch_dtype)
-                    else:
-                        ctrl_img = None
-                        has_control_images = False
-                        if gen_config.ctrl_img is not None or gen_config.ctrl_img_1 is not None or gen_config.ctrl_img_2 is not None or gen_config.ctrl_img_3 is not None:
-                            has_control_images = True
-                        # load the control image if out model uses it in text encoding
-                        if has_control_images and self.encode_control_in_text_embeddings:
-                            ctrl_img_list = []
-                    
-                            if gen_config.ctrl_img is not None and os.path.splitext(str(gen_config.ctrl_img))[1].lower() in ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']:
-                                # control VIDEO: pass the path through; models with
-                                # supports_video_control_images handle it in get_prompt_embeds
-                                ctrl_img_list.append(str(gen_config.ctrl_img))
-                            elif gen_config.ctrl_img is not None:
-                                ctrl_img = Image.open(gen_config.ctrl_img).convert("RGB")
-                                # convert to 0 to 1 tensor
-                                ctrl_img = (
-                                    TF.to_tensor(ctrl_img)
-                                    .unsqueeze(0)
-                                    .to(self.device_torch, dtype=self.torch_dtype)
-                                )
-                                ctrl_img_list.append(ctrl_img)
-                            
-                            if gen_config.ctrl_img_1 is not None and os.path.splitext(str(gen_config.ctrl_img_1))[1].lower() in ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']:
-                                # control VIDEO: pass the path through; models with
-                                # supports_video_control_images handle it in get_prompt_embeds
-                                ctrl_img_list.append(str(gen_config.ctrl_img_1))
-                            elif gen_config.ctrl_img_1 is not None:
-                                ctrl_img_1 = Image.open(gen_config.ctrl_img_1).convert("RGB")
-                                # convert to 0 to 1 tensor
-                                ctrl_img_1 = (
-                                    TF.to_tensor(ctrl_img_1)
-                                    .unsqueeze(0)
-                                    .to(self.device_torch, dtype=self.torch_dtype)
-                                )
-                                ctrl_img_list.append(ctrl_img_1)
-                            if gen_config.ctrl_img_2 is not None and os.path.splitext(str(gen_config.ctrl_img_2))[1].lower() in ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']:
-                                # control VIDEO: pass the path through; models with
-                                # supports_video_control_images handle it in get_prompt_embeds
-                                ctrl_img_list.append(str(gen_config.ctrl_img_2))
-                            elif gen_config.ctrl_img_2 is not None:
-                                ctrl_img_2 = Image.open(gen_config.ctrl_img_2).convert("RGB")
-                                # convert to 0 to 1 tensor
-                                ctrl_img_2 = (
-                                    TF.to_tensor(ctrl_img_2)
-                                    .unsqueeze(0)
-                                    .to(self.device_torch, dtype=self.torch_dtype)
-                                )
-                                ctrl_img_list.append(ctrl_img_2)
-                            if gen_config.ctrl_img_3 is not None and os.path.splitext(str(gen_config.ctrl_img_3))[1].lower() in ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']:
-                                # control VIDEO: pass the path through; models with
-                                # supports_video_control_images handle it in get_prompt_embeds
-                                ctrl_img_list.append(str(gen_config.ctrl_img_3))
-                            elif gen_config.ctrl_img_3 is not None:
-                                ctrl_img_3 = Image.open(gen_config.ctrl_img_3).convert("RGB")
-                                # convert to 0 to 1 tensor
-                                ctrl_img_3 = (
-                                    TF.to_tensor(ctrl_img_3)
-                                    .unsqueeze(0)
-                                    .to(self.device_torch, dtype=self.torch_dtype)
-                                )
-                                ctrl_img_list.append(ctrl_img_3)
-                            
-                            if self.has_multiple_control_images:
-                                ctrl_img = ctrl_img_list
+                        extra = {}
+                        validation_image = None
+                        if self.adapter is not None and gen_config.adapter_image_path is not None:
+                            validation_image = Image.open(gen_config.adapter_image_path)
+                            if ".inpaint." not in gen_config.adapter_image_path:
+                                validation_image = validation_image.convert("RGB")
                             else:
-                                ctrl_img = ctrl_img_list[0] if len(ctrl_img_list) > 0 else None
-                        # encode the prompt ourselves so we can do fun stuff with embeddings
-                        self.prepare_sample_prompt_context(gen_config)
-                        if isinstance(self.adapter, CustomAdapter):
-                            self.adapter.is_unconditional_run = False
-                        conditional_embeds = self.encode_prompt(
-                            gen_config.prompt,
-                            gen_config.prompt_2,
-                            force_all=True,
-                            control_images=ctrl_img,
-                            target_size=(gen_config.width, gen_config.height),
+                                # make sure it has an alpha
+                                if validation_image.mode != "RGBA":
+                                    raise ValueError("Inpainting images must have an alpha channel")
+                            if isinstance(self.adapter, T2IAdapter):
+                                # not sure why this is double??
+                                validation_image = validation_image.resize(
+                                    (gen_config.width * 2, gen_config.height * 2))
+                                extra['image'] = validation_image
+                                extra['adapter_conditioning_scale'] = gen_config.adapter_conditioning_scale
+                            if isinstance(self.adapter, ControlNetModel):
+                                validation_image = validation_image.resize(
+                                    (gen_config.width, gen_config.height))
+                                extra['image'] = validation_image
+                                extra['controlnet_conditioning_scale'] = gen_config.adapter_conditioning_scale
+                            if isinstance(self.adapter, CustomAdapter) and self.adapter.control_lora is not None:
+                                validation_image = validation_image.resize((gen_config.width, gen_config.height))
+                                extra['control_image'] = validation_image
+                                extra['control_image_idx'] = gen_config.ctrl_idx
+                            if isinstance(self.adapter, IPAdapter) or isinstance(self.adapter, ClipVisionAdapter):
+                                transform = transforms.Compose([
+                                    transforms.ToTensor(),
+                                ])
+                                validation_image = transform(validation_image)
+                            if isinstance(self.adapter, CustomAdapter):
+                                # todo allow loading multiple
+                                transform = transforms.Compose([
+                                    transforms.ToTensor(),
+                                ])
+                                validation_image = transform(validation_image)
+                                self.adapter.num_images = 1
+                            if isinstance(self.adapter, ReferenceAdapter):
+                                # need -1 to 1
+                                validation_image = transforms.ToTensor()(validation_image)
+                                validation_image = validation_image * 2.0 - 1.0
+                                validation_image = validation_image.unsqueeze(0)
+                                self.adapter.set_reference_images(validation_image)
+
+                        if network is not None:
+                            network.multiplier = gen_config.network_multiplier
+                        self._sample_step_index = 0
+                        torch.manual_seed(gen_config.seed)
+                        torch.cuda.manual_seed(gen_config.seed)
+
+                        generator = torch.manual_seed(gen_config.seed)
+
+                        if self.adapter is not None and isinstance(self.adapter, ClipVisionAdapter) \
+                                and gen_config.adapter_image_path is not None:
+                            # run through the adapter to saturate the embeds
+                            conditional_clip_embeds = self.adapter.get_clip_image_embeds_from_tensors(
+                                validation_image)
+                            self.adapter(conditional_clip_embeds)
+
+                        if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
+                            # handle condition the prompts
+                            gen_config.prompt = self.adapter.condition_prompt(
+                                gen_config.prompt,
+                                is_unconditional=False,
+                            )
+                            gen_config.prompt_2 = gen_config.prompt
+                            gen_config.negative_prompt = self.adapter.condition_prompt(
+                                gen_config.negative_prompt,
+                                is_unconditional=True,
+                            )
+                            gen_config.negative_prompt_2 = gen_config.negative_prompt
+
+                        if self.adapter is not None and isinstance(self.adapter, CustomAdapter) and validation_image is not None:
+                            self.adapter.trigger_pre_te(
+                                tensors_0_1=validation_image,
+                                is_training=False,
+                                has_been_preprocessed=False,
+                                quad_count=4
+                            )
+
+                        if self.is_llm:
+                            # text-generating models take the prompt and media directly
+                            conditional_embeds = None
+                            unconditional_embeds = None
+                        elif self.sample_prompts_cache is not None:
+                            conditional_embeds = self.sample_prompts_cache[i]['conditional'].to(self.device_torch, dtype=self.torch_dtype)
+                            unconditional_embeds = self.sample_prompts_cache[i]['unconditional'].to(self.device_torch, dtype=self.torch_dtype)
+                        else:
+                            ctrl_img = None
+                            has_control_images = False
+                            if gen_config.ctrl_img is not None or gen_config.ctrl_img_1 is not None or gen_config.ctrl_img_2 is not None or gen_config.ctrl_img_3 is not None:
+                                has_control_images = True
+                            # load the control image if out model uses it in text encoding
+                            if has_control_images and self.encode_control_in_text_embeddings:
+                                ctrl_img_list = []
+                    
+                                if gen_config.ctrl_img is not None and os.path.splitext(str(gen_config.ctrl_img))[1].lower() in ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']:
+                                    # control VIDEO: pass the path through; models with
+                                    # supports_video_control_images handle it in get_prompt_embeds
+                                    ctrl_img_list.append(str(gen_config.ctrl_img))
+                                elif gen_config.ctrl_img is not None:
+                                    ctrl_img = Image.open(gen_config.ctrl_img).convert("RGB")
+                                    # convert to 0 to 1 tensor
+                                    ctrl_img = (
+                                        TF.to_tensor(ctrl_img)
+                                        .unsqueeze(0)
+                                        .to(self.device_torch, dtype=self.torch_dtype)
+                                    )
+                                    ctrl_img_list.append(ctrl_img)
+                            
+                                if gen_config.ctrl_img_1 is not None and os.path.splitext(str(gen_config.ctrl_img_1))[1].lower() in ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']:
+                                    # control VIDEO: pass the path through; models with
+                                    # supports_video_control_images handle it in get_prompt_embeds
+                                    ctrl_img_list.append(str(gen_config.ctrl_img_1))
+                                elif gen_config.ctrl_img_1 is not None:
+                                    ctrl_img_1 = Image.open(gen_config.ctrl_img_1).convert("RGB")
+                                    # convert to 0 to 1 tensor
+                                    ctrl_img_1 = (
+                                        TF.to_tensor(ctrl_img_1)
+                                        .unsqueeze(0)
+                                        .to(self.device_torch, dtype=self.torch_dtype)
+                                    )
+                                    ctrl_img_list.append(ctrl_img_1)
+                                if gen_config.ctrl_img_2 is not None and os.path.splitext(str(gen_config.ctrl_img_2))[1].lower() in ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']:
+                                    # control VIDEO: pass the path through; models with
+                                    # supports_video_control_images handle it in get_prompt_embeds
+                                    ctrl_img_list.append(str(gen_config.ctrl_img_2))
+                                elif gen_config.ctrl_img_2 is not None:
+                                    ctrl_img_2 = Image.open(gen_config.ctrl_img_2).convert("RGB")
+                                    # convert to 0 to 1 tensor
+                                    ctrl_img_2 = (
+                                        TF.to_tensor(ctrl_img_2)
+                                        .unsqueeze(0)
+                                        .to(self.device_torch, dtype=self.torch_dtype)
+                                    )
+                                    ctrl_img_list.append(ctrl_img_2)
+                                if gen_config.ctrl_img_3 is not None and os.path.splitext(str(gen_config.ctrl_img_3))[1].lower() in ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']:
+                                    # control VIDEO: pass the path through; models with
+                                    # supports_video_control_images handle it in get_prompt_embeds
+                                    ctrl_img_list.append(str(gen_config.ctrl_img_3))
+                                elif gen_config.ctrl_img_3 is not None:
+                                    ctrl_img_3 = Image.open(gen_config.ctrl_img_3).convert("RGB")
+                                    # convert to 0 to 1 tensor
+                                    ctrl_img_3 = (
+                                        TF.to_tensor(ctrl_img_3)
+                                        .unsqueeze(0)
+                                        .to(self.device_torch, dtype=self.torch_dtype)
+                                    )
+                                    ctrl_img_list.append(ctrl_img_3)
+                            
+                                if self.has_multiple_control_images:
+                                    ctrl_img = ctrl_img_list
+                                else:
+                                    ctrl_img = ctrl_img_list[0] if len(ctrl_img_list) > 0 else None
+                            # encode the prompt ourselves so we can do fun stuff with embeddings
+                            self.prepare_sample_prompt_context(gen_config)
+                            if isinstance(self.adapter, CustomAdapter):
+                                self.adapter.is_unconditional_run = False
+                            conditional_embeds = self.encode_prompt(
+                                gen_config.prompt,
+                                gen_config.prompt_2,
+                                force_all=True,
+                                control_images=ctrl_img,
+                                target_size=(gen_config.width, gen_config.height),
+                            )
+
+                            if isinstance(self.adapter, CustomAdapter):
+                                self.adapter.is_unconditional_run = True
+                            unconditional_embeds = self.encode_prompt(
+                                gen_config.negative_prompt,
+                                gen_config.negative_prompt_2,
+                                force_all=True,
+                                control_images=ctrl_img,
+                                target_size=(gen_config.width, gen_config.height),
+                            )
+                            if isinstance(self.adapter, CustomAdapter):
+                                self.adapter.is_unconditional_run = False
+
+                        # allow any manipulations to take place to embeddings
+                        gen_config.post_process_embeddings(
+                            conditional_embeds,
+                            unconditional_embeds,
                         )
 
-                        if isinstance(self.adapter, CustomAdapter):
-                            self.adapter.is_unconditional_run = True
-                        unconditional_embeds = self.encode_prompt(
-                            gen_config.negative_prompt,
-                            gen_config.negative_prompt_2,
-                            force_all=True,
-                            control_images=ctrl_img,
-                            target_size=(gen_config.width, gen_config.height),
+                        if self.decorator is not None:
+                            # apply the decorator to the embeddings
+                            conditional_embeds.text_embeds = self.decorator(
+                                conditional_embeds.text_embeds)
+                            unconditional_embeds.text_embeds = self.decorator(
+                                unconditional_embeds.text_embeds, is_unconditional=True)
+
+                        if self.adapter is not None and isinstance(self.adapter, IPAdapter) \
+                                and gen_config.adapter_image_path is not None:
+                            # apply the image projection
+                            conditional_clip_embeds = self.adapter.get_clip_image_embeds_from_tensors(
+                                validation_image)
+                            unconditional_clip_embeds = self.adapter.get_clip_image_embeds_from_tensors(validation_image,
+                                                                                                        True)
+                            conditional_embeds = self.adapter(
+                                conditional_embeds, conditional_clip_embeds, is_unconditional=False)
+                            unconditional_embeds = self.adapter(
+                                unconditional_embeds, unconditional_clip_embeds, is_unconditional=True)
+
+                        if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
+                            conditional_embeds = self.adapter.condition_encoded_embeds(
+                                tensors_0_1=validation_image,
+                                prompt_embeds=conditional_embeds,
+                                is_training=False,
+                                has_been_preprocessed=False,
+                                is_generating_samples=True,
+                            )
+                            unconditional_embeds = self.adapter.condition_encoded_embeds(
+                                tensors_0_1=validation_image,
+                                prompt_embeds=unconditional_embeds,
+                                is_training=False,
+                                has_been_preprocessed=False,
+                                is_unconditional=True,
+                                is_generating_samples=True,
+                            )
+
+                        if self.adapter is not None and isinstance(self.adapter, CustomAdapter) and len(
+                                gen_config.extra_values) > 0:
+                            extra_values = torch.tensor([gen_config.extra_values], device=self.device_torch,
+                                                        dtype=self.torch_dtype)
+                            # apply extra values to the embeddings
+                            self.adapter.add_extra_values(
+                                extra_values, is_unconditional=False)
+                            self.adapter.add_extra_values(torch.zeros_like(
+                                extra_values), is_unconditional=True)
+                            pass  # todo remove, for debugging
+
+                        if self.refiner_unet is not None and gen_config.refiner_start_at < 1.0:
+                            # if we have a refiner loaded, set the denoising end at the refiner start
+                            extra['denoising_end'] = gen_config.refiner_start_at
+                            extra['output_type'] = 'latent'
+                            if not self.is_xl:
+                                raise ValueError(
+                                    "Refiner is only supported for XL models")
+
+                        if conditional_embeds is not None:
+                            conditional_embeds = conditional_embeds.to(
+                                self.device_torch, dtype=self.unet.dtype)
+                        if unconditional_embeds is not None:
+                            unconditional_embeds = unconditional_embeds.to(
+                                self.device_torch, dtype=self.unet.dtype)
+
+                        img = self.generate_single_image(
+                            pipeline,
+                            gen_config,
+                            conditional_embeds,
+                            unconditional_embeds,
+                            generator,
+                            extra,
                         )
-                        if isinstance(self.adapter, CustomAdapter):
-                            self.adapter.is_unconditional_run = False
 
-                    # allow any manipulations to take place to embeddings
-                    gen_config.post_process_embeddings(
-                        conditional_embeds,
-                        unconditional_embeds,
-                    )
+                        gen_config.save_image_atomic(img, i)
+                        gen_config.log_image(img, i)
+                        self._after_sample_image(i, len(image_configs))
+                        flush()
 
-                    if self.decorator is not None:
-                        # apply the decorator to the embeddings
-                        conditional_embeds.text_embeds = self.decorator(
-                            conditional_embeds.text_embeds)
-                        unconditional_embeds.text_embeds = self.decorator(
-                            unconditional_embeds.text_embeds, is_unconditional=True)
+                    if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):
+                        self.adapter.clear_memory()
 
-                    if self.adapter is not None and isinstance(self.adapter, IPAdapter) \
-                            and gen_config.adapter_image_path is not None:
-                        # apply the image projection
-                        conditional_clip_embeds = self.adapter.get_clip_image_embeds_from_tensors(
-                            validation_image)
-                        unconditional_clip_embeds = self.adapter.get_clip_image_embeds_from_tensors(validation_image,
-                                                                                                    True)
-                        conditional_embeds = self.adapter(
-                            conditional_embeds, conditional_clip_embeds, is_unconditional=False)
-                        unconditional_embeds = self.adapter(
-                            unconditional_embeds, unconditional_clip_embeds, is_unconditional=True)
-
-                    if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
-                        conditional_embeds = self.adapter.condition_encoded_embeds(
-                            tensors_0_1=validation_image,
-                            prompt_embeds=conditional_embeds,
-                            is_training=False,
-                            has_been_preprocessed=False,
-                            is_generating_samples=True,
-                        )
-                        unconditional_embeds = self.adapter.condition_encoded_embeds(
-                            tensors_0_1=validation_image,
-                            prompt_embeds=unconditional_embeds,
-                            is_training=False,
-                            has_been_preprocessed=False,
-                            is_unconditional=True,
-                            is_generating_samples=True,
-                        )
-
-                    if self.adapter is not None and isinstance(self.adapter, CustomAdapter) and len(
-                            gen_config.extra_values) > 0:
-                        extra_values = torch.tensor([gen_config.extra_values], device=self.device_torch,
-                                                    dtype=self.torch_dtype)
-                        # apply extra values to the embeddings
-                        self.adapter.add_extra_values(
-                            extra_values, is_unconditional=False)
-                        self.adapter.add_extra_values(torch.zeros_like(
-                            extra_values), is_unconditional=True)
-                        pass  # todo remove, for debugging
-
-                    if self.refiner_unet is not None and gen_config.refiner_start_at < 1.0:
-                        # if we have a refiner loaded, set the denoising end at the refiner start
-                        extra['denoising_end'] = gen_config.refiner_start_at
-                        extra['output_type'] = 'latent'
-                        if not self.is_xl:
-                            raise ValueError(
-                                "Refiner is only supported for XL models")
-
-                    if conditional_embeds is not None:
-                        conditional_embeds = conditional_embeds.to(
-                            self.device_torch, dtype=self.unet.dtype)
-                    if unconditional_embeds is not None:
-                        unconditional_embeds = unconditional_embeds.to(
-                            self.device_torch, dtype=self.unet.dtype)
-
-                    img = self.generate_single_image(
-                        pipeline,
-                        gen_config,
-                        conditional_embeds,
-                        unconditional_embeds,
-                        generator,
-                        extra,
-                    )
-
-                    gen_config.save_image_atomic(img, i)
-                    gen_config.log_image(img, i)
-                    self._after_sample_image(i, len(image_configs))
-                    flush()
-
-                if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):
-                    self.adapter.clear_memory()
-
-        unwrap_step_hooks()
+            unwrap_step_hooks()
+        finally:
+            unwrap_sigma_override()
         # clear pipeline and cache to reduce vram usage
         del pipeline
         torch.cuda.empty_cache()
@@ -1253,6 +1260,68 @@ class BaseModel:
     def encode_audio(self, audio_data_list):
         # audio_date_list is a list of {"waveform": waveform[C, L], "sample_rate": int(sample_rate)}
         raise NotImplementedError("Audio encoding not implemented for this model.")
+
+    # ------------------------------------------------------------------
+    # Joint audio stream contract. A model with an audio stream resolves its
+    # audio input through audio_stream_input and returns through
+    # audio_stream_output, so every trainer sees one shape:
+    #   input : a latent DTO carrying `audio` marks a stream-aware caller (an
+    #           on-policy distiller). Its rows, already noised at the audio
+    #           sigma, replace the dataset soundtrack; `audio=None` asks for a
+    #           fresh noised start. Plain tensors keep the dataset path.
+    #   output: DTO(video_pred, audio=pred, audio_target=noise - clean | None,
+    #           audio_noisy=the rows the model saw, audio_sigma=sigma_a)
+    #           whenever a target exists or the caller streams; else the tensor.
+    # ------------------------------------------------------------------
+    def audio_sigma(self, sigma_v: torch.Tensor) -> torch.Tensor:
+        """Audio-stream sigma coupled to a video sigma (0..1). Default: shared."""
+        return sigma_v
+
+    def audio_stream_input(self, latent_model_input, batch, raw_audio, sigma_a, silence_rows):
+        """Returns (audio_rows, audio_target, audio_noisy, stream). raw_audio is the
+        clean dataset audio in the model's row layout or None; silence_rows is the
+        model's no-soundtrack input (shape/dtype/device reference)."""
+        stream = isinstance(latent_model_input, DTO) and "audio" in latent_model_input.extras
+        override = latent_model_input.get("audio") if stream else None
+        sa = sigma_a.to(silence_rows.device, silence_rows.dtype).view(
+            (-1,) + (1,) * (silence_rows.dim() - 1)
+        )
+        if override is not None:
+            rows = override.to(silence_rows.device, silence_rows.dtype)
+            return rows, None, rows, True
+        if raw_audio is not None:
+            raw_audio = raw_audio.to(silence_rows.device, silence_rows.dtype)
+            # the audio noise is drawn once per step and shared by every pass
+            # (prior, primary, cfg/guidance, preservation) so they all see the
+            # same soundtrack; it rides on the latents DTO with the clean audio
+            # so on-the-fly encodes are not repeated per pass
+            noise = batch.latents.get("audio_noise") if isinstance(batch.latents, DTO) else None
+            if noise is not None and noise.shape == raw_audio.shape:
+                noise = noise.to(raw_audio.device, raw_audio.dtype)
+            else:
+                noise = torch.randn_like(raw_audio)
+                if batch.latents is not None:
+                    batch.latents = DTO(batch.latents, audio=raw_audio, audio_noise=noise)
+            # mixed in fp32 so bf16 rows match the scheduler's add_noise numerics
+            rows = ((1.0 - sa.float()) * raw_audio.float() + sa.float() * noise.float()).to(raw_audio.dtype)
+            return rows, (noise - raw_audio).detach(), rows, stream
+        if stream:
+            # no soundtrack: silence noised at the audio sigma (pure noise at 1.0)
+            rows = sa * torch.randn_like(silence_rows)
+            return rows, None, rows, True
+        return silence_rows, None, None, False
+
+    def audio_stream_output(self, video_pred, audio_pred, audio_target, audio_noisy, sigma_a, stream):
+        """audio_pred in ai-toolkit's noise - clean convention."""
+        if audio_target is None and not stream:
+            return video_pred
+        return DTO(
+            video_pred,
+            audio=audio_pred,
+            audio_target=audio_target,
+            audio_noisy=audio_noisy,
+            audio_sigma=sigma_a,
+        )
 
     def decode_latents(
             self,

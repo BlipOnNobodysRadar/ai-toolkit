@@ -81,7 +81,8 @@ class _StubModel:
 
 
 @pytest.mark.parametrize("cond_len,uncond_len", [(11, 4), (6, 6)])
-def test_pipeline_batched_cfg_matches_two_call_path(cond_len, uncond_len):
+@pytest.mark.parametrize("sigmas", [None, [1.0, 0.7, 0.2]])
+def test_pipeline_batched_cfg_matches_two_call_path(cond_len, uncond_len, sigmas):
     m = _model()
     torch.manual_seed(1)
     cond = types.SimpleNamespace(text_embeds=[torch.randn(cond_len, 32)])
@@ -91,11 +92,13 @@ def test_pipeline_batched_cfg_matches_two_call_path(cond_len, uncond_len):
     for batched in (False, True):
         model = _StubModel(m)
         MossImagePipeline(model)(cond, uncond, height=96, width=96, num_inference_steps=4,
-                                 latents=latents, uncond_skip_layers=(SKIP,), batched_cfg=batched)
+                                 latents=latents, uncond_skip_layers=(SKIP,), batched_cfg=batched,
+                                 sigmas=sigmas)
         results[batched] = (model.decoded, model.calls)
         del m.forward
     (two, two_calls), (one, one_calls) = results[False], results[True]
     assert one_calls * 2 == two_calls
+    assert one_calls == (4 if sigmas is None else len(sigmas))
     torch.testing.assert_close(one, two, atol=1e-5, rtol=1e-5)
 
 
