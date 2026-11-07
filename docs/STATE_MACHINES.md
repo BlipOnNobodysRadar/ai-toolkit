@@ -1,5 +1,9 @@
 # State machines: catalog, invariants, transitions, defects
 
+**CURRENT STATUS — 2026-11-07.** Section 20 supersedes the relevant older behaviour/status. Commits: UI `bb21cae1`; core and shared CLI/UI leases `964d79a1`; data/cache/inference `cb692933`. Final combined CPU suite: **863 passed, 53 skipped**, with unchanged Python source hashes. Full UI: **101 passed**; both TypeScript projects: **zero diagnostics**. All fixes are committed on `codex/opus-state-machines-20261106`, unmerged and unpushed; main remains `f6c137b4`. The separate detached `db8dafb5` GPU comparison is unchanged and does not validate these new commits. No GPU throughput/full-model validation was run here.
+
+**Historical status (sections 1-19; preserved verbatim; superseded where section 20 applies):**
+
 Status: **living document**, branch `codex/opus-state-machines-20261106`, base `f6c137b4`; phase03 Python work committed
 by Codex as `b83505f9`; the reviewed UI/manager/MiniCPM groups are also committed locally (section 19). Upstream (`ostris`) HEAD and main are still `beb94824`,
 already merged into fork main `f6c137b4` (read-only check, run folder `upstream-final-remote.txt`).
@@ -1020,3 +1024,232 @@ The audit document is committed separately. The final branch HEAD, file hashes a
     tests `ui/tests/upload.test.cjs`, `ui/tests/fixtures/uploadChild.cjs`.
 * SM-22: `manager/launch.py`, `tests/test_manager_launch.py`. SM-16 finalization: `training_extras/minicpm_trainer.py`,
   `tests/test_minicpm_finalization.py`.
+
+## 20. Invariant hardening addendum (baseline `db8dafb5`, finalized 2026-11-07)
+
+Sections 1-19 are historical and preserved. This section records the later invariant-hardening pass and supersedes the
+relevant earlier behaviour and status. The baseline is `db8dafb53d7008db21f65e01c7d8aad2b3be1a3d` (`db8`). This is a
+bounded record of the 24 named acceptance-matrix issues and the state-machine boundaries they touch, not an exhaustive
+proof of every transition.
+
+**Final integration status.** Core and CLI/UI lease integration: `964d79a1`; initial UI guards: `bb21cae1`; data/cache/inference: `cb692933`. Codex independently verified the combined CPU suite: **863 passed / 53 skipped**, with unchanged source hashes. Full UI **101 passed**, both TypeScript configurations **0 diagnostics**. Opus's 510/10 and the data worker's 123/1 focused runs are supporting subsets. Main is unmerged; no GPU throughput/full-model, production DB or live browser validation is claimed.
+
+Evidence labels used below: **C** = confirmed on original code by a recorded probe/original-code behaviour; **S** =
+source-supported; **T** = implemented source plus focused worker test (worker-reported; acceptance only where the
+final status above says accepted); **H** = hypothesis/unproven. A focused test is not a full-suite, GPU, or production
+claim.
+
+### 20.1 What an invariant means here
+
+An **invariant** is a condition the code needs to remain true for a safe result, whether or not any line of code checks
+it. Examples: one trainer writes a save root at a time; a cache hit came from the current source bytes and encoder
+recipe; an optimizer state belongs to the checkpoint and parameter order it is loaded onto.
+
+An implemented guard or test establishes only a narrower claim: the guard rejects the fixtures/paths it actually
+inspects, and a passing test shows those tested transitions behaved as asserted. It does **not** establish that every
+writer, filesystem race, model architecture, GPU path, or legacy folder is safe, nor that an unchecked condition is
+true. Source-supported means the failure path was read in source; confirmed means an original-code or real route/selector
+probe reproduced the bad transition. Absence of a helper in the original tree is not behavioural evidence.
+
+### 20.2 Acceptance-matrix disposition
+
+All 24 acceptance-matrix IDs are listed once below. Counts and final commit mapping for the data work remain parent-owned;
+the committed core and UI statuses above are the only accepted integration statuses stated here.
+
+| ID | Group / impact | Evidence | Resulting rule/change or disposition | Test/reference |
+|---|---|---|---|---|
+| OPUS-RES-01 | Persistence/resume; wrong checkpoint or foreign-file pruning | C: filename-only selection probe; original-code bracket, foreign-folder and sibling-prune behaviours reported | Exact writer-name/suffix save sets, no glob; Wan split halves form one save; incomplete newest skipped; `optimizer.pt` and `training_extras.pt` excluded. Core committed `964d79a1`. | `tests/test_core_save_discovery.py` |
+| OPUS-RES-02 | Persistence/resume; optimizer attached to another checkpoint | S; core focused tests | One generation stamped into every artifact; `optimizer.pt` records generation, step, optimizer class, ordered parameter manifest, recipe and metadata-less content hashes. Checked before `load_state_dict`; an interrupted save falls back to the last complete matching save or refuses. Core committed `964d79a1`. | `tests/test_core_resume_identity.py` |
+| OPUS-PARAM-ID-01 | Resume/optimizer; moments on wrong parameter names | S; Codex reproduced RAWR + AdamW; strict refusal source/test-confirmed | Ordered `(name, shape, dtype)` manifest; `require_named` refuses free/unnamed optimizer parameters before resume, training or save; versioned positional records are refused before loading; module swap/reorder/class changes refuse; legacy record-less pairs warn only. Core committed `964d79a1`. | `tests/test_core_resume_identity.py` (`test_unnamed_parameters_are_refused_before_training`, `test_reordered_unnamed_parameters_are_refused_without_loading_moments`, `test_named_producers_are_certified`) |
+| OPUS-SEC-01 | UI boundary; unauthenticated mutation | C: middleware probe showed mutation routes passing without a bearer token | Public reads are only GET/HEAD under media prefixes; all other `/api/*` require the `AI_TOOLKIT_AUTH` bearer. UI committed `bb21cae1`. | `ui/tests/uiInvariantRoutes.test.cjs`; `ui/tests/uiInvariantLaunchBinding.test.cjs` |
+| OPUS-SEC-02 | UI boundary; delete/caption outside roots | C: traversal probe deleted an outside image/caption | Shared lexical + physical mutation resolver; both image and caption targets validated before mutation; caption extension restricted. UI committed `bb21cae1`. | `ui/tests/uiInvariantRoutes.test.cjs`; `ui/tests/uiInvariantLaunchBinding.test.cjs` |
+| OPUS-UI-01 | UI launch binding; writes outside claimed run folder | S: stale training folder/name could differ from the admitted folder | Launch rewrites a single supported training process to `training_folder=parent` and `name=job name`; inference `job_folder` is bound; multi-process or unknown writer types refuse. UI committed `bb21cae1`. | `ui/tests/uiInvariantLaunchBinding.test.cjs` |
+| OPUS-ONEWRITER-01 | Writer ownership; overlapping writers corrupt saves/prune | S; core focused and cross-language path tests | Exact-root SQLite writer lease acquired before config writes; same-job holders share, other jobs/processes/delete are busy; release on run/constructor/cleanup/finally; distributed start refuses. UI preparation uses the same path formula but the handoff to the spawned trainer is not an atomic lease transfer. Core committed `964d79a1`; UI lease evidence accepted. | `tests/test_core_save_root_lease.py`; `ui/tests/writerLease.test.cjs` |
+| OPUS-PRUNE-01 | Save pruning; another job's or newer data deleted | C: mixed LoRA/adapter budget, prefix-sharing job and derived-export pruning reproduced | Per-artifact-kind budgets over exactly the kinds this run writes; split save counts once; final save never pruned; only saves older than the oldest kept complete save go; newer interrupted save remains; a failed optimizer write skips pruning. Core committed `964d79a1`. | `tests/test_core_save_discovery.py`; `tests/test_core_resume_identity.py` (`test_a_failed_optimizer_save_prunes_nothing_and_the_resume_falls_back`) |
+| OPUS-CACHE-01 | Data/cache; stale latent from changed media or VAE | S; T focused worker tests | Cache schema v2 latent key includes source SHA-256, schema version, preprocessing policy, model latent-space override and a compact latent-encoder digest. Admission compares the stored key and lazily atomically rebuilds misses/legacy/unreadable files. Data committed `cb692933`; final CPU suite accepted within the limits below. | `tests/test_data_invariants_cache_final.py`; `tests/test_latent_cache_recovery.py` |
+| OPUS-CACHE-02 | Data/cache; stale text embedding/control conditioning | S; T focused worker tests | Text key adds text-encoder identity, overrides, ordered reference content identities, first-frame/control flags, target size where applicable, and self-media scale/crop/flip policy. Lazy rebuild on miss; reference hashing is memoized per prepared item. Data committed `cb692933`; final CPU suite accepted within the limits below. | `tests/test_data_invariants_cache_final.py`; `tests/test_embedding_cache_recovery.py` |
+| OPUS-MF-01 | Training loss; weighting/accumulation hit unweighted gradient | S; core focused tests | `get_mean_flow_loss` returns the differentiable, per-sample-weighted loss; shared `backward_weighted_loss` owns non-finite handling, reg weight, accumulation scale and the only backward. Core committed `964d79a1`. | `tests/test_core_mean_flow_mask.py` |
+| OPUS-EMA-01 | Resume/EMA; raw weights and shadow lost on resume | S; core focused tests | Export remains EMA; `optimizer.pt` carries raw weights, shadow, update count and EMA options; the whole record validates before restore; changed options are printed and the new options used; legacy EMA is explicit "not exact". Core committed `964d79a1`. | `tests/test_core_resume_identity.py` |
+| OPUS-UPL-01 | UI upload; acknowledged files overwrite each other | C: `a b.png` and `a_b.png` both accepted, only one survived | Sanitization collisions refused; destinations prechecked; staged publication is no-clobber/atomic with rollback; unsupported filesystem returns explicit failure. UI committed `bb21cae1`. | `ui/tests/uiInvariantRoutes.test.cjs` |
+| OPUS-VAL-01 | Data/held-out validation; training sees validation files | S; T with real hardlink and directory-junction aliases | `_file_identity` now returns only a nonzero `(dev, ino)` identity; canonical path equality is separate. Equal/nested roots and actual admitted file-list path overlap refuse before validation admission; real hardlinks under disjoint roots and junction aliases are detected; true prefix siblings are admitted; nested `_controls` roots are conservatively refused. Data committed `cb692933`; final CPU suite accepted within the limits below. | `tests/test_data_invariants_runtime_final.py`; `tests/test_training_extras.py` |
+| OPUS-INF-01 | Inference LoRA; reused weights do not match current path | S; T with real tiny safetensors and the real engine path | `InferenceLoRA.load` binds the file generation actually loaded and rejects a generation change during read; stack keys and `set_strengths` compare current generation so the engine reloads; merge-cleanup key stays stable and removal is reload-based. Metadata-only limitation remains. Data committed `cb692933`; final CPU suite accepted within the limits below. | `tests/test_data_invariants_runtime_final.py`; `tests/test_inference_engine_lifecycle.py` |
+| OPUS-SAVE-01 | Save naming; two artifacts overwrite one path | S; core focused tests | Decorator gets `{job}_decorator`; startup refuses any two configured artifact kinds sharing a filename (case-folded on Windows). Core committed `964d79a1`. | `tests/test_core_save_discovery.py` |
+| OPUS-RAWR-01 | RAWR writer; unsupported split layout aborts only at save | S; core focused tests | Startup and `rawr_pair.begin` refuse pair mode with a declared split LoRA layout; non-pair split layouts remain allowed. Core committed `964d79a1`. | `tests/test_core_save_discovery.py` |
+| OPUS-DIST-01 | Distribution; duplicate ranks write one folder | S; core focused test | `BaseTrainProcess` refuses `num_processes > 1` before taking the lease or writing; the message directs a single-process launch. Core committed `964d79a1`. | `tests/test_core_save_root_lease.py` |
+| OPUS-DADAPT-01 | Optimizer dispatch; name selected a different algorithm | S; T dispatch tests using a stub optional module | `dadaptationadam` now selects `DAdaptAdam`; `dadaptationlion` selects `DAdaptLion`; bare legacy `dadaptation` selects `DAdaptAdam`; `lion` remains Lion and bare `adam` remains `torch.optim.Adam`. The test uses a stub module and does not run actual DAdapt optimizer training. Legacy Lion state produced by the old `dadaptationadam` path is not certified for the corrected algorithm; use a fresh optimizer for affected legacy saves. Data committed `cb692933`; final CPU suite accepted within the limits below. | `tests/test_data_invariants_runtime_final.py` (`test_dadaptationadam_and_lion_dispatch_to_their_real_optimizers`, `test_bare_legacy_adam_stays_torch_adam`) |
+| OPUS-GRAD-01 | Gradient finiteness; hypothesis only | H: no reachable non-finite-gradient path established | Deliberately not patched. The shared loss guard substitutes a zero loss only for a non-finite loss; it does not scan parameter gradients before every optimizer step. Remains unproven. | None |
+| OPUS-CAP-01 | Caption randomness with cached text embeddings | S; T focused guard, source/test-confirmed only within the exact options | `cache_text_embeddings` refuses `shuffle_tokens` and `random_triggers` separately at cache admission; a concrete caption-draw test shows those options produce multiple captions across accesses. Static normal captions and the supported caption-dropout cache path complete. This is not acceptance-confirmed beyond those options. | `tests/test_data_invariants_cache_final.py` (`test_cached_embeddings_refuse_dynamic_caption_redraws`, `test_static_and_dropout_caption_cache_paths_remain_accepted`) |
+| INV-DATA-01 | Data loader; bucket replacement changes shape | S; T focused worker tests | Bucket mode returns only a same-bucket index or a deliberate `RuntimeError`; no cross-bucket fallback. Failed-item retry remains bounded at 11 load attempts. Data committed `cb692933`; final CPU suite accepted within the limits below. | `tests/test_data_invariants_cache_final.py` (`test_replacement_index_stays_in_the_source_bucket`, `test_singleton_and_missing_bucket_fail_clearly`, `test_failed_item_retry_stays_bounded`) |
+| INV-PATH-02 | UI boundary; nested junction escapes root | C: pre-existing directory junction deletion removed an outside file | Physical resolver rejects a nested link resolving outside a configured root while preserving an explicitly linked root; lexical component checks prevent sibling-prefix/traversal. Check-then-act swap remains outside the guarantee. UI committed `bb21cae1`. | `ui/tests/uiInvariantRoutes.test.cjs` |
+| INV-MASK-01 | Training mask; empty support produced NaN weights | C: empty foreground and all-white inverted-prior helpers produced non-finite weights; caller consequence source-supported | Support is read from the pixel mask; zero-mass batches yield zero additive weights instead of 0/0; ordinary masks remain bit-identical; selection is device-side without a host sync. Core committed `964d79a1`. | `tests/test_core_mean_flow_mask.py`; `tests/test_sdtrainer_masks.py` |
+
+### 20.3 Enforcement boundaries and transitions
+
+#### 20.3.1 Exact-root writer lease (training, launch preparation, deletion)
+
+**Invariant:** for one canonical save root, at most one writer/operation acts as owner; sequential trainer objects of the
+same job in one Python process may share the training ownership. **Old behaviour superseded:** exclusive writing was assumed, not enforced;
+UI launch preparation and CLI trainers did not share a lifetime lease. The lease is an SQLite `BEGIN EXCLUSIVE` on
+`<canonical parent>/.aitk_locks/writer.<sha256(canonical root)>.lock`, outside the folder so deletion cannot unlink it.
+Python `toolkit/save_root_lease.py` and TypeScript `ui/cron/ownership/writerLease.ts` compute the same path.
+
+| State | Transition | Guard/result |
+|---|---|---|
+| Free | Training constructor acquires | `BaseTrainProcess.__init__` takes the lease before tensorboard/config writes. |
+| Held by job J, holder H | Another holder of the same Python job object in the same OS process | Shared connection; holder added. |
+| Held by job J | Another job/process or UI deletion acquires | SQLite busy -> `SaveRootBusy` / HTTP 409; no config, checkpoint, or deletion mutation. |
+| Held by UI launch preparation | `withOpLock(writerLeasePath(folder))` around `mkdir`, log rotation and atomic config write | Lock released before spawning; the Python constructor must acquire the lifetime lease next. If another trainer wins, Python refuses before training writes. This handoff is not an atomic lease transfer. |
+| Held by trainer | UI `deleteJob` takes `delete.<job_id>.lock` then the writer lock | Busy -> 409 preserves row, claims, folder and checkpoint bytes; deletes only after acquiring the writer lock and the `expectedFolder` admission check. |
+| Held | Last holder releases, run ends, constructor fails, or process dies | Explicit release on run/cleanup/finally; SQLite OS lock drops on process death. Sidecar file remains and is never unlinked. |
+| Free | Recreate deleted folder and acquire | Same canonical path maps to the same sidecar lock, so a stale/replacement folder does not create a second writer window. |
+
+The lease covers the **exact canonical root** and cooperating writers using this protocol. It does not fence arbitrary
+nested CLI roots, unrelated programs, or network filesystems that do not honour SQLite locks. Hostile filesystem swaps
+remain outside all path/lease guarantees.
+
+#### 20.3.2 Checkpoint + optimizer identity (including EMA and named manifests)
+
+**Invariant for versioned records:** optimizer state must match the save generation, optimizer class and ordered trainable
+parameters it was written with. Legacy record-less state follows the explicitly uncertified compatibility path below. **Old behaviour superseded:**
+optimizer state was mapped positionally to whatever checkpoint was newest, and an EMA resume continued from the EMA
+export without the raw weights/shadow. The new check certifies pairing, not bit-exact continuation of scheduler,
+dtype, accumulated state, or every underlying tensor.
+
+| State | Transition | Guard/result |
+|---|---|---|
+| New save | Write artifacts with one generation; write `optimizer.pt` record and EMA record | Record includes generation, completed step, optimizer class, ordered `(name, shape, dtype)`, base recipe, and content hashes for formats without metadata (embedding files). |
+| Optimizer built, unnamed/free trainable parameter exists | Before resume, EMA, training or save | `require_named` refuses at startup: an optimizer parameter owned by no module could be paired only by position. Current in-tree producers are named; an out-of-tree extension adding a free parameter is refused. |
+| Versioned record contains positional entries | Resume | Refuse before `load_state_dict`; move `optimizer.pt` aside for fresh optimizer state or restore the recorded checkpoint. |
+| Newest complete save, identity matches every artifact | Resume | Load optimizer state after validation; with EMA restore raw weights + shadow; continue. |
+| Newest complete save, optimizer belongs to an earlier save | Discover previous complete match | Print fallback and resume there; if none match, refuse rather than pair mismatched moments. |
+| New checkpoint written, optimizer still carries an older valid generation | Resume discovery | Find the last complete matching artifact set; refuse if no match. A failed optimizer write skips pruning so that fallback remains available. |
+| Optimizer absent or unreadable | Resume | Non-RAWR can continue with fresh optimizer state (a read failure prints a warning); RAWR continuation requires its paired optimizer and refuses. This is not certified continuation. |
+| Compatible LoRA rank conversion changed loaded weights | Resume | Non-RAWR explicitly starts fresh optimizer state; RAWR continuation refuses. |
+| Recorded optimizer beside recorded but different checkpoint/parameter list/class | Resume | Refuse before `load_state_dict`. |
+| Optimizer present, no checkpoint of this job resumed | Resume | Refuse; do not attach old moments to fresh weights. |
+| Legacy record-less optimizer + legacy checkpoint | Resume | Load with an explicit "not certified/exact" warning; next save records identity. |
+| Record-less optimizer + recorded checkpoint | Resume | Refuse. |
+| EMA record present | Resume | Validate whole record (lengths, shapes, dtypes, update count, options) before mutating; a bad late entry restores nothing. Changed EMA options are printed and the new settings used. |
+| Legacy EMA checkpoint | Resume | Continue from EMA weights with fresh EMA and print that this is not an exact continuation. |
+| Changed base-model recipe | Resume | Warn only; this record stores recipe fields, not a digest of the base weights. Exactness is not claimed. |
+
+Strict named-manifest refusal is implemented and reviewed. The naming fallback depends on attribute names staying the
+same between save and resume; a renamed attribute holding a trained module refuses loudly. There is **no absolute
+guarantee of matching tensors**: identity covers generation, optimizer class, ordered name/shape/dtype and content only
+for metadata-less artifacts; the checkpoint base-model record stores recipe fields only (large local cache-model files use metadata identity), legacy state is uncertified, and scheduler or
+accumulated-state exactness is not promised. Wan 2.2 full fine-tune split files remain undeclared.
+
+#### 20.3.3 Cache preparation, admission and trusted dataset lifetime
+
+**Invariant:** a latent-cache hit corresponds to current source bytes plus the effective VAE/preprocessing recipe; a
+text-embedding hit corresponds to the current text encoder/prompt pipeline, current ordered reference content, and the
+consumed self-media policy where applicable. **Old behaviour superseded:** keys covered names, geometry and similar
+flags but not source bytes, encoder identity, ordered reference bytes, or self-media crop/flip policy; a readable legacy
+file was treated as reusable.
+
+| State | Transition | Guard/result |
+|---|---|---|
+| Dataset preparation | Build compact encoder fingerprints once per prepared dataset | Fingerprints are built only for enabled latent/text cache kinds; caching-off initialization makes zero builder calls. Source media/reference files are hashed at preparation/admission. |
+| Latent cache key | Build/read | Key includes source SHA-256, schema version, preprocessing policy, model latent-space override and compact latent-encoder digest; a same-length rewrite with restored mtime changes the key on a new preparation. |
+| Text cache key | Build/read | Key includes text-encoder identity, overrides, ordered control-image/video content identities, first-frame/control flags, target size where applicable, and self-media policy. |
+| D-OPSD still image or i2v first frame | Self-media key | Includes the actual consumed pixel policy: scale, crop and flip plus dataset preprocessing policy. |
+| D-OPSD video | Self-media key | Uses a raw-path reference policy with dataset temporal settings and the model's 2-fps video-reference presentation, not loader crop/flip flags. A random start-frame draw is temporal policy, not a content hash. |
+| Reference bytes | Preparation/admission and explicit recalculation | Hashed through a per-item memo refreshed on `recalculate=True` or new admission, not on each training step. |
+| Cache miss / schema mismatch / unreadable / legacy file | Re-encode | Latent/text reads compare stored keys; mismatch rebuilds lazily and atomically. Old files remain; no eager global invalidation. |
+| Cache hit | Admit to prepared dataset | Item carries the preparation's encoder fingerprint and source/control digest; it is not rehashed per item/step. |
+| Prepared dataset active | Source, control, or reference file replaced on disk | Not observed by already-admitted normal steps; a fresh preparation or explicit recalculation is required. This is a trust boundary, not a filesystem-watch guarantee. |
+| `cache_text_embeddings` + `shuffle_tokens`/`random_triggers` | Text-cache admission | Refuse: per-access caption redraws cannot all be represented by one cached file. |
+| Encoder/model identity changes | Next preparation | Fingerprint changes the key, so old compatible-format files are not admitted. No full-model weight hash is claimed. |
+
+Model-path identity hashes small files (at most 1 MiB each, first 256 small files in a directory) and records local
+metadata for large weights; it is not a content hash of multi-GB checkpoints. Active prepared input immutability is a
+documented trust boundary: bytes are snapshotted at admission and memoized, not watched or rehashed on every step.
+
+#### 20.3.4 Held-out validation overlap refusal
+
+**Invariant:** no file admitted as validation data is also admitted as training data. **Old behaviour superseded:** setup
+could compare only resolved folder strings and miss aliases/nesting.
+
+| State | Transition | Result |
+|---|---|---|
+| Validation disabled or no validation datasets | Setup | Return without a new check. |
+| Validation configured | `toolkit_validation.setup` starts | `_check_validation_disjoint` runs before validation dataset admission. |
+| Equal or nested training/validation roots | Check | Conservative `ValueError`; put validation outside the training tree. |
+| Disjoint roots but an actual admitted validation file equals an admitted training path | Check | Refuse before training-validation use. |
+| Hardlink under a different path | Check | `_file_identity` uses only a nonzero `(dev, ino)` identity, with canonical path equality kept separate, so real hardlinks under disjoint roots are detected. |
+| Directory junction or canonical alias | Check | Resolved canonical overlap is detected; true prefix siblings such as `data` and `data2` are admitted. |
+| Nested `_controls` or hidden validation root | Check | Conservatively refused rather than relying on loader skipping rules. |
+| Disjoint data | Validation cache/setup | Continue to frozen-text-encoder/plain-conditioning checks and validation loading. |
+
+This is a refusal boundary, not proof that every file in a complex layout leaked, and not a substitute for exact
+filesystem-walk or concurrent-swap protection. File-symlink creation was unavailable in the Windows worker environment
+(`WinError 1314`); canonical path handling is implemented, and a real directory-junction alias test passes.
+
+#### 20.3.5 Inference loaded-file generation
+
+**Invariant:** a reused loaded LoRA stack reflects the file currently at the requested path. **Old behaviour
+superseded:** path-only keys allowed an in-place strength update or merge cleanup to keep old weights after the file
+was replaced.
+
+| State | Transition | Guard/result |
+|---|---|---|
+| Desired spec unloaded | Engine asks key | Reads current local file generation (metadata) into the key. |
+| Loading | Capture before/after generation | If the file changed during `load_file`, refuse to bind an unverified snapshot. |
+| Loaded | Bind `_loaded_file_generation` | Stack key uses the bound generation; merge-cleanup tag stays stable for the exact prior set. |
+| Loaded, file path replaced | Engine computes desired key | Key differs -> evict/reload affected components. |
+| Hook mode, same paths | In-place `set_strengths` requested | Return false if current generation differs from bound generation; engine detaches the old hook generation and reloads. |
+| Merge mode | Remove requested | Reload-based removal; does not unmerge weights. |
+| Same size/mtime/inode rewritten in place | Any check | Undetectable: generation is metadata-only, not a content hash. No absolute matching-tensor guarantee is made. |
+
+#### 20.3.6 Optimizer dispatch
+
+**Invariant:** the configured optimizer name selects the named algorithm. `dadaptationadam` now actually selects
+`DAdaptAdam`; `dadaptationlion` selects `DAdaptLion`; the bare legacy `dadaptation` alias selects `DAdaptAdam`; `lion`
+remains Lion and bare `adam` remains `torch.optim.Adam`. The focused test uses a stub optional module and does not run
+actual DAdapt optimizer training. Legacy Lion optimizer state produced by the old `dadaptationadam` path is **not
+certified** for the corrected algorithm; use a fresh optimizer if using affected legacy saves.
+
+### 20.4 Compatibility and performance boundaries
+
+- Cache source/reference hashing happens during preparation/admission, not on the normal training-step path. Encoder
+  fingerprints are built once per preparation and only for enabled cache kinds; caching-off initialization makes zero
+  builder calls. No GPU throughput measurement was made, and none should be inferred.
+- Active prepared input immutability is not enforced: media/reference bytes are admission-time snapshots memoized on
+  the prepared DTO. A file changed after preparation is not re-hashed during a normal training step.
+- Cache schema v2 is lazy: incompatible/legacy files are misses and are rebuilt atomically; old files are retained
+  rather than eagerly deleted. Resume refuses generation/identity mismatches instead of trying a lossy repair.
+- Large model weight files are metadata-only (small-file content hashing is bounded as above); inference LoRA
+  generations are metadata-only. There is no full-model content hash and no absolute guarantee that two same-metadata
+  tensors are identical.
+- EMA resume adds CPU copies of raw weights and the EMA shadow to `optimizer.pt`, so save/load RAM, disk and I/O grow
+  with trainable parameter count beyond the optimizer state itself. This is an untested overhead policy, not a
+  benchmark.
+- RAWR pair mode with a split LoRA layout and distributed multi-process training are explicitly unsupported and refuse
+  at startup; non-pair split layouts still work. Wan 2.2 full fine-tune split remains undeclared.
+- Root/ancestor junction spellings are canonicalized, but concurrent hostile filesystem replacement after validation
+  remains outside the guarantee.
+- The exact-root lease does not serialize arbitrary nested CLI roots, unrelated programs, or network filesystems
+  without working SQLite locks.
+- Unknown/free optimizer parameters owned by no module are refused. Legacy checkpoint/optimizer/EMA state remains
+  uncertified, and legacy DAdapt-Lion state from the old dispatch is not certified for corrected DAdaptAdam.
+- GRAD-01 remains an unproven hypothesis; no per-step gradient scan was added.
+
+### 20.5 Evidence and remaining limits
+
+- Core evidence is the committed `964d79a1` focused CPU run: 510 passed / 10 skipped across 27 files, including a real
+  tiny CPU SDTrainer resume with bit-identical uninterrupted versus resumed output. No final combined CPU suite, GPU,
+  offload, compile, full-model, or full-training validation is claimed.
+- UI evidence covers commits `bb21cae1` and `964d79a1`: 101 UI passed and TypeScript 0 diagnostics. These are CPU/TypeScript fixtures
+  and mocked/real route helpers, not a live HTTP/browser deployment.
+- Data/cache/validation/inference/dispatch is committed as `cb692933` and accepted in the combined CPU suite above. The focused worker result is 123 passed/1 skipped (Windows file-symlink privilege); real hardlink/junction tests pass. CAP-01 is source/test-confirmed within its exact options. DAdapt dispatch uses a stub module, without real DAdapt optimizer training.
+- Original-code behavioural evidence is bounded to the detached `db8` source snapshot and harness additions. Tests
+  that only fail because a new helper is absent are absence-only, not behavioural proof.
+- Legacy checkpoint/optimizer/EMA state is not certified. The checkpoint base-model recipe warns rather than enforcing weight identity; large local cache-model files use metadata identity; inference generation is metadata-only. Active prepared input immutability is not guaranteed.
+- Wan 2.2 full fine-tune split files remain undeclared; exact-root leases exclude arbitrary nested roots and
+  non-cooperating programs; no full GPU validation was performed.
+- No universal "every invariant found" or exhaustive-proof claim is made. This addendum records the 24 named
+  acceptance-matrix issues and the named boundaries only; the historical sections retain their own scope and gaps.
+
+### 20.6 Final integration acceptance
+
+Codex independently ran the complete `tests/` suite after all Python writers finished: **863 passed, 53 skipped**. The source hash manifest was unchanged through the run and rechecked before committing. Full UI **101/101**, TypeScript **0/0 diagnostics**. Core commit `964d79a1`, UI `bb21cae1`, data `cb692933`; documentation is committed separately. No merge/push or GPU test was performed. The data worker's 123/1 focused result and Opus's 510/10 focused result are supporting subsets, not counts to add to the full suite. One new Windows file-symlink case is skipped for missing privilege; real hardlink and directory-junction cases execute. Earlier overlapping/duplicate-log runs are excluded from acceptance; exact failures and replacements are in the implementation run's failure ledger.
