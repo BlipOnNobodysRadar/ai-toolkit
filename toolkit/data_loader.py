@@ -19,6 +19,11 @@ from tqdm import tqdm
 import albumentations as A
 
 from toolkit import image_utils
+from toolkit.cache_identity import (
+    build_latent_encoder_identity,
+    build_text_encoder_identity,
+    cache_key_digest,
+)
 from toolkit.buckets import get_bucket_for_image_size, BucketResolution
 from toolkit.config_modules import DatasetConfig, preprocess_dataset_raw_config
 from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingMixin, Augments, CLIPCachingMixin, ControlCachingMixin, TextEmbeddingCachingMixin
@@ -435,6 +440,22 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         self.epoch_num = 0
 
         self.sd = sd
+        # Compute each full encoder identity at most once per prepared dataset,
+        # and only for a cache kind that is actually enabled.  The compact
+        # digests are carried into every item; the full manifests are retained
+        # only for diagnostics and are never serialized per item.  With caching
+        # off this performs no model-directory manifest scan at all.
+        self.cache_encoder_identities = {}
+        self.cache_encoder_fingerprints = {}
+        if sd is not None:
+            if self.is_caching_latents:
+                latent_identity = build_latent_encoder_identity(sd)
+                self.cache_encoder_identities["latent"] = latent_identity
+                self.cache_encoder_fingerprints["latent"] = cache_key_digest(latent_identity)
+            if self.is_caching_text_embeddings:
+                text_identity = build_text_encoder_identity(sd)
+                self.cache_encoder_identities["text"] = text_identity
+                self.cache_encoder_fingerprints["text"] = cache_key_digest(text_identity)
 
         if self.sd is None and self.is_caching_latents:
             raise ValueError(f"sd is required for caching latents")
@@ -583,6 +604,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     text_embedding_uses_target_size=getattr(self.sd, 'text_embedding_uses_target_size', False) if self.sd else False,
                     te_padding_side=self.sd.te_padding_side if self.sd else "right",
                     latent_space_version=latent_space_version,
+                    latent_cache_encoder_identity=self.cache_encoder_fingerprints.get("latent"),
+                    text_encoder_cache_identity=self.cache_encoder_fingerprints.get("text"),
                     temporal_compression=temporal_compression,
                     sample_rate=self.sd.sample_rate if (self.is_audio_model or self.is_multimodal_llm) and self.sd is not None else 48000,
                 )
@@ -674,13 +697,21 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
     def _get_replacement_index(self, index) -> int:
         # when an image fails to load we have to swap in a different one. With buckets the
         # replacement must come from the same bucket so the collated shapes still match.
+        # A singleton bucket has no compatible replacement: falling back to another
+        # bucket would silently substitute a different geometry into the batch.
         if self.dataset_config.buckets:
-            for bucket in self.buckets.values():
+            for bucket_key, bucket in self.buckets.items():
                 if index in bucket.file_list_idx:
                     candidates = [i for i in bucket.file_list_idx if i != index]
                     if candidates:
                         return random.choice(candidates)
-                    break
+                    raise RuntimeError(
+                        f"Exhausted latent bucket {bucket_key!r} for index {index}: "
+                        "no same-bucket replacement item is available"
+                    )
+            raise RuntimeError(
+                f"No latent bucket contains index {index}; cannot choose a same-bucket replacement"
+            )
         return random.randint(0, len(self.file_list) - 1)
 
     def _roll_crop_on_access(self, file_item: 'FileItemDTO'):
