@@ -523,6 +523,11 @@ def main():
 
     if not changed_any:
         raise SystemExit('No adapter tensor changed across this run; try enough steps to pass optimizer initialization, or inspect the configuration')
+    # The final checkpoint keeps TRAINING coordinates and is written before any final evaluation: an eval()/train()
+    # round trip is not an identity in bf16 (it moved 79/256 values in the CPU probe), and a run resumed from it with a
+    # larger --steps must continue from the trained values (--steps is not part of the options hash). Then one switch
+    # to evaluation coordinates, kept for the final loss, validation and the exported adapter (docs M15, C12).
+    checkpoint(a.steps)
     if callable(getattr(opt,"eval",None)):opt.eval()
     rec["final_train_loss"] = train_eval(a.steps)
     if val_rows and (not rec["validation_history"] or rec["validation_history"][-1]["step"] != a.steps):
@@ -531,9 +536,6 @@ def main():
     rec["peak_reserved_gib"] = torch.cuda.max_memory_reserved() / 2**30
     rec["runtime_s"] = time.time() - t0
 
-    if callable(getattr(opt,"train",None)):opt.train()
-    checkpoint(a.steps)
-    if callable(getattr(opt,"eval",None)):opt.eval()
     model.save_pretrained(out, safe_serialization=True)
     from safetensors.torch import load_file
     sd = load_file(os.path.join(out, "adapter_model.safetensors"))
