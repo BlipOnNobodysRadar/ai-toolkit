@@ -11,7 +11,7 @@ import { startQueue, stopQueue } from '@/utils/queue';
 import { CgSpinner } from 'react-icons/cg';
 import useGPUInfo from '@/hooks/useGPUInfo';
 import { openConfirm } from '@/components/ConfirmModal';
-import { deleteJob, getTotalSteps, stopJob } from '@/utils/jobs';
+import { actionError, deleteJob, displayStatus, getAvaliableJobActions, getTotalSteps, ownershipOf } from '@/utils/jobs';
 import { Trash2 } from 'lucide-react';
 
 interface JobsTableProps {
@@ -54,14 +54,19 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
   const onMassDelete = () => {
     const jobsToDelete = jobs.filter(job => selectedIds.has(job.id));
     if (jobsToDelete.length === 0) return;
-    const runningCount = jobsToDelete.filter(job => job.status === 'running').length;
-    let message = `Are you sure you want to delete ${jobsToDelete.length} job${
-      jobsToDelete.length === 1 ? '' : 's'
+    // same rule as the single Delete button: a job that still owns a process (running, or finished but not yet
+    // verified as exited) is skipped; an unfinished earlier deletion is retried
+    const deletable = jobsToDelete.filter(job => getAvaliableJobActions(job).canDelete);
+    const owned = jobsToDelete.filter(job => !deletable.includes(job));
+    const retries = deletable.filter(job => getAvaliableJobActions(job).isRetryDelete).length;
+    let message = `Are you sure you want to delete ${deletable.length} job${
+      deletable.length === 1 ? '' : 's'
     }? This will also permanently remove them from your disk.`;
-    if (runningCount > 0) {
-      message += ` WARNING: ${runningCount} of them ${
-        runningCount === 1 ? 'is' : 'are'
-      } currently running and will be stopped first.`;
+    if (retries > 0) {
+      message += ` ${retries} of them ${retries === 1 ? 'is a deletion' : 'are deletions'} that did not finish and will be retried.`;
+    }
+    if (owned.length > 0) {
+      message += ` ${owned.length} selected job${owned.length === 1 ? ' is' : 's are'} still running or exiting and will be skipped; stop ${owned.length === 1 ? 'it' : 'them'} first.`;
     }
     openConfirm({
       title: 'Delete Jobs',
@@ -69,17 +74,11 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
       type: 'warning',
       confirmText: 'Delete',
       onConfirm: async () => {
-        setDeleteProgress({ done: 0, total: jobsToDelete.length });
-        for (let i = 0; i < jobsToDelete.length; i++) {
-          const job = jobsToDelete[i];
+        setDeleteProgress({ done: 0, total: deletable.length });
+        const refused: string[] = [];
+        for (let i = 0; i < deletable.length; i++) {
+          const job = deletable[i];
           try {
-            if (job.status === 'running') {
-              try {
-                await stopJob(job.id);
-              } catch (e) {
-                console.error('Error stopping job before deleting:', e);
-              }
-            }
             await deleteJob(job.id);
             setSelectedIds(prev => {
               const next = new Set(prev);
@@ -88,10 +87,12 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
             });
           } catch (e) {
             console.error('Error deleting job:', job.name, e);
+            refused.push(`${job.name}: ${actionError(e)}`);
           }
-          setDeleteProgress({ done: i + 1, total: jobsToDelete.length });
+          setDeleteProgress({ done: i + 1, total: deletable.length });
           refreshJobs();
         }
+        if (refused.length) alert(`Not deleted:\n${refused.join('\n')}`);
         setDeleteProgress(null);
         refresh();
       },
@@ -148,7 +149,7 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
         }
         return (
           <Link href={href} className="font-medium whitespace-nowrap">
-            {['running', 'stopping'].includes(row.status) ? (
+            {['starting', 'running', 'stopping'].includes(row.status) || ownershipOf(row).held ? (
               <CgSpinner className="inline animate-spin mr-2 text-blue-400" />
             ) : null}
             {title}
@@ -190,10 +191,17 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
       render: row => {
         let statusClass = 'text-gray-400';
         if (row.status === 'completed') statusClass = 'text-green-400';
-        if (row.status === 'failed') statusClass = 'text-red-400';
-        if (row.status === 'running') statusClass = 'text-blue-400';
+        if (row.status === 'error' || row.status === 'delete_failed') statusClass = 'text-red-400';
+        if (row.status === 'running' || row.status === 'starting') statusClass = 'text-blue-400';
+        if (row.status === 'stopping' || row.status === 'deleting') statusClass = 'text-orange-400';
 
-        return <span className={statusClass}>{row.status}</span>;
+        // the ownership note explains a retained reservation or a wait (hover)
+        return (
+          <span className={statusClass} title={row.ownership_note ?? undefined}>
+            {displayStatus(row)}
+            {row.ownership_note ? ' *' : ''}
+          </span>
+        );
       },
     },
     {
@@ -222,7 +230,7 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
     jobs.forEach(job => {
       const gpu = gpuList.find(gpu => job.gpu_ids?.split(',').includes(gpu.index.toString())) as GpuInfo;
       const key = `${gpu?.index || '0'}`;
-      if (['queued', 'running', 'stopping'].includes(job.status) && key in jd) {
+      if ((['queued', 'starting', 'running', 'stopping'].includes(job.status) || ownershipOf(job).held) && key in jd) {
         jd[key].jobs.push(job);
       } else {
         jd['Idle'].jobs.push(job);
