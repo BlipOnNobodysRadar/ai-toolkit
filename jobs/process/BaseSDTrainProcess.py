@@ -1,5 +1,4 @@
 import copy
-import glob
 import inspect
 import json
 import random
@@ -80,6 +79,7 @@ import hashlib
 from toolkit.util.blended_blur_noise import get_blended_blur_noise
 from toolkit.util.get_model import get_model_class
 from toolkit.basic import flush
+from toolkit import checkpoint_identity
 from toolkit.optimizers import pending_grads
 
 
@@ -112,6 +112,53 @@ def save_write_rank(path):
         written = os.path.getmtime(path)
     step = _SAVE_STEP.search(os.path.basename(path))
     return written, int(step.group(1)) if step else float('inf')
+
+
+# State files that share the folder and must never be taken for (or pruned as) a checkpoint
+_NOT_CHECKPOINTS = ('optimizer.pt', 'training_extras.pt')
+
+
+class SaveSet:
+    """One save of one artifact kind: its files by model-declared suffix (Wan 2.2 14B writes _high_noise and
+    _low_noise halves for one LoRA). Complete when every declared file exists."""
+
+    def __init__(self, step, extension, files, suffixes):
+        self.step, self.extension, self.files, self.suffixes = step, extension, files, suffixes
+        self.complete = all(s in files for s in suffixes)
+        self.rank = max(save_write_rank(p) for p in files.values())
+
+    @property
+    def path(self):
+        # the first declared file; a split model's load_lora finds the other halves from it
+        return self.files.get(self.suffixes[0]) or next(iter(self.files.values()))
+
+    def missing(self):
+        return [s for s in self.suffixes if s not in self.files]
+
+
+def find_save_sets(root, name, suffixes=('',), post=''):
+    """This name's saves in root, oldest first: exactly {name}, optionally _<9-digit step>, a declared suffix, post,
+    and .safetensors/.pt or nothing (a Diffusers folder). Listed, never globbed: a glob treats a balanced [...] in the
+    folder or the name as a character class, which missed this run's saves and matched other folders and other jobs
+    (docs/STATE_MACHINES.md, OPUS-RES-01). Derived exports such as {name}_000000300-comfy never match."""
+    if not os.path.isdir(root):
+        return []
+    flags = re.IGNORECASE if os.name == 'nt' else 0
+    patterns = [(s, re.compile(rf'{re.escape(name)}(?:_(\d{{9}}))?{re.escape(s)}{re.escape(post)}(\.safetensors|\.pt)?',
+                               flags)) for s in suffixes]
+    grouped = {}
+    for entry in os.listdir(root):
+        if entry.lower() in _NOT_CHECKPOINTS:
+            continue
+        for suffix, pattern in patterns:
+            match = pattern.fullmatch(entry)
+            if match:
+                key = (match.group(1), (match.group(2) or '').lower())
+                grouped.setdefault(key, {})[suffix] = os.path.join(root, entry)
+                break
+    sets = [SaveSet(None if step is None else int(step), ext, files, tuple(suffixes))
+            for (step, ext), files in grouped.items()]
+    return sorted(sets, key=lambda s: s.rank)
 
 
 def _is_cuda_oom(e):
@@ -469,81 +516,114 @@ class BaseSDTrainProcess(BaseTrainProcess):
         return info
 
     def clean_up_saves(self):
+        """Keep the newest max_step_saves_to_keep step saves of each artifact kind this run writes; return the newest
+        save path. Only exact names this run's writers produce are candidates (find_save_sets), each kind has its own
+        budget, and a split save counts once with all its files: a mixed budget deleted the newest LoRA next to an
+        adapter, and a bare prefix glob took derived exports and other jobs' checkpoints (OPUS-PRUNE-01, OPUS-RES-01).
+        The final (step-less) save is never pruned, as before. Saves older than the oldest kept complete save go, an
+        incomplete one included; a newer incomplete one (an interrupted save) stays for the next save to replace."""
         if not self.accelerator.is_main_process:
             return
-        # remove old saves
-        # get latest saved step
         latest_item = None
-        if os.path.exists(self.save_root):
-            # pattern is {job_name}_{zero_filled_step} for both files and directories
-            pattern = f"{self.job.name}_*"
-            items = glob.glob(os.path.join(self.save_root, pattern))
-            # Separate files and directories
-            safetensors_files = [f for f in items if f.endswith('.safetensors')]
-            pt_files = [f for f in items if f.endswith('.pt')]
-            directories = [d for d in items if os.path.isdir(d) and not d.endswith('.safetensors')]
-            embed_files = []
-            # do embedding files
-            if self.embed_config is not None:
-                embed_pattern = f"{self.embed_config.trigger}_*"
-                embed_items = glob.glob(os.path.join(self.save_root, embed_pattern))
-                # will end in safetensors or pt
-                embed_files = [f for f in embed_items if f.endswith('.safetensors') or f.endswith('.pt')]
-
-            # check for critic files
-            critic_pattern = f"CRITIC_{self.job.name}_*"
-            critic_items = glob.glob(os.path.join(self.save_root, critic_pattern))
-
-            # Sort the lists by when each save was last written (not creation time, see save_write_rank)
-            if safetensors_files:
-                safetensors_files.sort(key=save_write_rank)
-            if pt_files:
-                pt_files.sort(key=save_write_rank)
-            if directories:
-                directories.sort(key=save_write_rank)
-            if embed_files:
-                embed_files.sort(key=save_write_rank)
-            if critic_items:
-                critic_items.sort(key=save_write_rank)
-
-            # Combine and sort the lists
-            combined_items = safetensors_files + directories + pt_files
-            combined_items.sort(key=save_write_rank)
-            
-            num_saves_to_keep = self.save_config.max_step_saves_to_keep
-            
-            if hasattr(self.sd, 'max_step_saves_to_keep_multiplier'):
-                num_saves_to_keep *= self.sd.max_step_saves_to_keep_multiplier
-
-            # Use slicing with a check to avoid 'NoneType' error
-            safetensors_to_remove = safetensors_files[
-                                    :-num_saves_to_keep] if safetensors_files else []
-            pt_files_to_remove = pt_files[:-num_saves_to_keep] if pt_files else []
-            directories_to_remove = directories[:-num_saves_to_keep] if directories else []
-            embeddings_to_remove = embed_files[:-num_saves_to_keep] if embed_files else []
-            critic_to_remove = critic_items[:-num_saves_to_keep] if critic_items else []
-
-            items_to_remove = safetensors_to_remove + pt_files_to_remove + directories_to_remove + embeddings_to_remove + critic_to_remove
-
-            # remove all but the latest max_step_saves_to_keep
-            # items_to_remove = combined_items[:-num_saves_to_keep]
-
-            # remove duplicates
-            items_to_remove = list(dict.fromkeys(items_to_remove))
-
-            for item in items_to_remove:
-                print_acc(f"Removing old save: {item}")
-                if os.path.isdir(item):
-                    shutil.rmtree(item)
-                else:
-                    os.remove(item)
-                # see if a yaml file with same name exists
-                yaml_file = os.path.splitext(item)[0] + ".yaml"
-                if os.path.exists(yaml_file):
-                    os.remove(yaml_file)
-            if combined_items:
-                latest_item = combined_items[-1]
+        if not os.path.exists(self.save_root):
+            return latest_item
+        keep = self.save_config.max_step_saves_to_keep
+        newest = None
+        for kind, name, suffixes in BaseSDTrainProcess._save_artifact_kinds(self):
+            sets = [s for s in find_save_sets(self.save_root, name, suffixes) if s.step is not None]
+            if sets and (newest is None or sets[-1].rank > newest.rank):
+                newest = sets[-1]
+            kept = [s for s in sets if s.complete][-keep:] if keep else []
+            if not kept:
+                continue
+            oldest_kept = min(s.rank for s in kept)
+            for save in sets:
+                if save in kept or save.rank >= oldest_kept:
+                    continue
+                for item in save.files.values():
+                    print_acc(f"Removing old save: {item}")
+                    if os.path.isdir(item):
+                        shutil.rmtree(item)
+                    else:
+                        os.remove(item)
+                    # see if a yaml file with same name exists
+                    yaml_file = os.path.splitext(item)[0] + ".yaml"
+                    if os.path.exists(yaml_file):
+                        os.remove(yaml_file)
+        if newest is not None:
+            latest_item = newest.path
         return latest_item
+
+    # Artifact names: the one source for the writers in _save_checkpoint, resume discovery and pruning. Called through
+    # the class, so trainer-like namespaces (tests) work.
+
+    def _lora_save_name(self):
+        return self.job.name + ('_LoRA' if getattr(self, 'named_lora', False) else '')
+
+    def _lora_save_suffixes(self):
+        """The files the model's save_lora writes per LoRA save ('' = the path itself)."""
+        declared = getattr(getattr(self, 'sd', None), 'lora_save_suffixes', None)
+        if declared is None or getattr(self, 'network', None) is None:
+            return ('',)
+        return tuple(declared())
+
+    def _decorator_save_name(self):
+        # alongside a LoRA the decorator once took the LoRA's own filename and overwrote it at every save (OPUS-SAVE-01)
+        return self.job.name + ('_decorator' if getattr(self, 'network_config', None) is not None else '')
+
+    def _adapter_save_name(self):
+        name = self.job.name
+        if getattr(self, 'network_config', None) is not None or getattr(self, 'embed_config', None) is not None:
+            adapter_type = self.adapter_config.type
+            if adapter_type == 't2i':
+                name += '_t2i'
+            elif adapter_type == 'control_net':
+                name += '_cn'
+            elif adapter_type == 'clip':
+                name += '_clip'
+            elif adapter_type.startswith('ip'):
+                name += '_ip'
+            else:
+                name += '_adapter'
+        return name
+
+    def _save_artifact_kinds(self):
+        """(kind, name, suffixes) for every artifact _save_checkpoint writes with this configuration."""
+        job = self.job.name
+        train_config = getattr(self, 'train_config', None)
+        merge = getattr(train_config, 'merge_network_on_save', False)
+        network_config = getattr(self, 'network_config', None)
+        fine_tuning = getattr(self, 'is_fine_tuning', network_config is None)
+        kinds = []
+        if fine_tuning or merge:
+            kinds.append(('model', job, ('',)))
+            if getattr(train_config, 'train_refiner', False):
+                kinds.append(('refiner', job + '_refiner', ('',)))
+        else:
+            if network_config is not None:
+                kinds.append(('LoRA', BaseSDTrainProcess._lora_save_name(self),
+                              BaseSDTrainProcess._lora_save_suffixes(self)))
+            if getattr(self, 'embed_config', None) is not None:
+                kinds.append(('embedding', self.embed_config.trigger, ('',)))
+            if getattr(self, 'decorator_config', None) is not None:
+                kinds.append(('decorator', BaseSDTrainProcess._decorator_save_name(self), ('',)))
+            adapter_config = getattr(self, 'adapter_config', None)
+            if adapter_config is not None and adapter_config.train:
+                kinds.append(('adapter', BaseSDTrainProcess._adapter_save_name(self), ('',)))
+        kinds.append(('critic', f'CRITIC_{job}', ('',)))
+        return kinds
+
+    def _refuse_colliding_save_names(self):
+        """Two artifacts must not share a filename: one would overwrite the other at every save (OPUS-SAVE-01)."""
+        seen = {}
+        for kind, name, suffixes in BaseSDTrainProcess._save_artifact_kinds(self):
+            for suffix in suffixes:
+                key = (name + suffix).casefold() if os.name == 'nt' else name + suffix
+                if key in seen:
+                    raise ValueError(f"The {seen[key]} and the {kind} would both be saved as {name + suffix}"
+                                     f"[_step].safetensors in {self.save_root}, and one would overwrite the other; "
+                                     f"rename the job or the embedding trigger")
+                seen[key] = kind
 
     def post_save_hook(self, save_path):
         # override in subclass
@@ -787,22 +867,42 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     # do not load optimizer if the network changed, it will result in
                     # a double state that will oom.
                     load_optimizer = False
+                    print_acc("The LoRA rank changed since this checkpoint: continuing with fresh optimizer state "
+                              "(not an exact continuation)")
 
             if load_optimizer:
+                BaseSDTrainProcess._refuse_unresumed_optimizer_state(self, optimizer_state_file_path)
+                optimizer_state_dict = None
                 try:
                     print_acc(f"Loading optimizer state from {optimizer_state_file_path}")
                     optimizer_state_dict = torch.load(optimizer_state_file_path, weights_only=True,
                                                      map_location='cpu' if rawr_resume_enabled else None)
-                    optimizer.load_state_dict(optimizer_state_dict)
-                    if rawr_resume_enabled:
-                        rawr_resume = rawr_checkpoint.capture(optimizer_state_dict)
-                    del optimizer_state_dict
-                    flush()
                 except Exception as e:
                     if rawr_resume_enabled:
                         raise RuntimeError('Could not load RAWR optimizer/scheduler checkpoint; refusing a partial resume') from e
                     print_acc(f"Failed to load optimizer state from {optimizer_state_file_path}")
                     print_acc(e)
+                if optimizer_state_dict is not None:
+                    # checked before loading: torch maps saved state onto parameters by position only
+                    identity = optimizer_state_dict.pop(checkpoint_identity.KEY, None)
+                    ema_state = optimizer_state_dict.pop(checkpoint_identity.EMA_KEY, None)
+                    BaseSDTrainProcess._check_optimizer_identity(self, identity, optimizer, optimizer_state_file_path)
+                    try:
+                        optimizer.load_state_dict(optimizer_state_dict)
+                        if rawr_resume_enabled:
+                            rawr_resume = rawr_checkpoint.capture(optimizer_state_dict)
+                    except Exception as e:
+                        if rawr_resume_enabled:
+                            raise RuntimeError('Could not load RAWR optimizer/scheduler checkpoint; refusing a partial resume') from e
+                        if identity is not None:
+                            raise RuntimeError(f'Could not load {optimizer_state_file_path}, although it belongs to '
+                                               f'this checkpoint and these parameters') from e
+                        print_acc(f"Failed to load optimizer state from {optimizer_state_file_path}")
+                        print_acc(e)
+                    else:
+                        self._resume_ema_state = ema_state
+                    del optimizer_state_dict
+                    flush()
 
             # update the optimizer LR from the params
             print_acc(f"Updating optimizer LR from params")
@@ -821,6 +921,93 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                'not loaded (the network shape changed since that checkpoint); start a new run '
                                'for weights-only training')
         return rawr_resume
+
+    def _refuse_unresumed_optimizer_state(self, path):
+        """optimizer.pt with no checkpoint of this job resumed (a fresh start, or only a pretrained_lora_path) belongs
+        to some earlier run: it used to be attached to the new weights, and the new saves then overwrote and pruned
+        that run's checkpoints (docs/STATE_MACHINES.md, OPUS-RES-01/02)."""
+        if (getattr(self, '_resume_record', None) is not None
+                or getattr(self, '_rawr_paired_optimizer_path', None) is not None):
+            return
+        raise ValueError(f"{path} holds optimizer state from an earlier run, but no checkpoint of {self.job.name} "
+                         f"was found to resume in {self.save_root}. Use a new output folder, or delete optimizer.pt "
+                         f"(and that run's checkpoints) to start over in this one")
+
+    def _check_optimizer_identity(self, identity, optimizer, path):
+        """Refuse optimizer state that belongs to another save or other parameters, before it is loaded."""
+        record = getattr(self, '_resume_record', None) or {'path': None, 'artifacts': []}
+        checkpoint = record['path'] or 'the selected checkpoint'
+        self._resume_identity_present = identity is not None
+        if identity is None:
+            if any(generation is not None for _, generation in record['artifacts']):
+                raise ValueError(f"{path} has no save record (an older version wrote it), so it cannot belong to "
+                                 f"{checkpoint}, which has one: that save was probably stopped before its optimizer "
+                                 f"state was written. Move {path} out of the folder to continue with fresh optimizer "
+                                 f"state, or restore the checkpoint it was saved with")
+            print_acc(f"Legacy optimizer state: {path} does not record which checkpoint and parameters it belongs to, "
+                      f"so pairing it with {checkpoint} cannot be verified. Resuming, but not certified as an exact "
+                      f"continuation; the next save records it")
+            return
+        current = {'optimizer': checkpoint_identity.optimizer_class(optimizer),
+                   'parameters': BaseSDTrainProcess._parameter_manifest(self, optimizer),
+                   'base_model': checkpoint_identity.base_recipe(getattr(self, 'model_config', None))}
+        start_step = getattr(getattr(self, 'train_config', None), 'start_step', None)
+        checkpoint_identity.check(identity, current, record['artifacts'], self.step_num, start_step is None,
+                                  checkpoint, path)
+        # a matching save and parameter list, not a bit-exact continuation: save dtype, scheduler and accumulation
+        # limits stay as warned elsewhere
+        print_acc(f"Optimizer state is from the same save as {checkpoint} (step {identity['step']}) and matches "
+                  f"this run's parameters")
+
+    def _parameter_manifest(self, optimizer):
+        manifest = getattr(self, '_resume_manifest', None)
+        if manifest is None:
+            manifest = self._resume_manifest = checkpoint_identity.parameter_manifest(
+                optimizer, checkpoint_identity.trainer_parameter_names(self))
+        return manifest
+
+    def _restore_ema_resume_state(self):
+        """After setup_ema: the resumed checkpoint holds EMA weights (the export). Put the raw training weights back
+        into the parameters and the saved shadow into the EMA, so training continues exactly (OPUS-EMA-01)."""
+        saved = getattr(self, '_resume_ema_state', None)
+        self._resume_ema_state = None
+        resumed = getattr(self, '_resume_record', None) is not None
+        if saved is None:
+            if not resumed:
+                return
+            if getattr(self, '_resume_identity_present', False):
+                if self.ema is not None:
+                    print_acc("EMA starts from the resumed weights (the checkpoint was saved without EMA)")
+            elif self.ema is not None:
+                print_acc("Legacy checkpoint: if it was trained with EMA, it holds the EMA weights, and training "
+                          "continues from them with a fresh EMA (not an exact continuation)")
+            return
+        params = [p for group in self.optimizer.param_groups for p in group['params']]
+        # the whole record first: a bad late entry must not leave some parameters restored (the identity check
+        # already bound it to this save and to these parameters)
+        checkpoint_identity.validate_ema_record(saved, params)
+        if self.ema is not None:
+            # changed EMA settings are the user's call, like a changed learning rate: continue under the new ones
+            current = checkpoint_identity.ema_options(self.ema)
+            changed = sorted(k for k in current if saved['options'].get(k) != current[k])
+            if changed:
+                was = saved['options']
+                listed = ', '.join(f"{k}: {was.get(k)} -> {current[k]}" for k in changed)
+                print_acc(f"EMA settings changed since this checkpoint ({listed}); the restored shadow continues "
+                          f"under the new settings")
+            num_updates = saved.get('num_updates') if current['use_num_updates'] else None
+            if current['use_num_updates'] and num_updates is None:
+                num_updates = 0
+            self.ema.load_state_dict({'decay': self.ema.decay, 'num_updates': num_updates,
+                                      'shadow_params': saved['shadow'], 'collected_params': None})
+        with torch.no_grad():
+            for p, value in zip(params, saved['raw']):
+                p.data.copy_(value.to(device=p.device))
+        if self.ema is not None:
+            print_acc("Restored the raw training weights and the EMA shadow saved with this checkpoint")
+        else:
+            print_acc("Restored the raw training weights saved with this EMA checkpoint (EMA is now off; its shadow "
+                      "is dropped)")
 
     def _check_accumulation_support(self, optimizer):
         """Refuse accumulation the optimizer setup cannot do (before training starts)."""
@@ -903,12 +1090,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
         save_meta = get_meta_for_safetensors(save_meta, self.job.name)
         if rawr_pair_save is not None:
             save_meta['aitk_rawr_generation'] = json.dumps(rawr_pair_save['generation'])
+        # every artifact of this save and its optimizer.pt carry one generation, so resume can tell they belong
+        # together (docs/STATE_MACHINES.md, OPUS-RES-02)
+        resume_generation = checkpoint_identity.new_generation()
+        save_meta[checkpoint_identity.META_GENERATION] = json.dumps(resume_generation)
+        unstamped = {}
         if not self.is_fine_tuning and not self.train_config.merge_network_on_save:
             if self.network is not None:
-                lora_name = self.job.name
-                if self.named_lora:
-                    # add _lora to name
-                    lora_name += '_LoRA'
+                lora_name = BaseSDTrainProcess._lora_save_name(self)
 
                 filename = f'{lora_name}{step_num}.safetensors'
                 file_path = os.path.join(self.save_root, filename)
@@ -952,9 +1141,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     raise ValueError("An embedding trigger named 'optimizer' saved as .pt would overwrite "
                                      "optimizer.pt; rename the trigger")
                 self.embedding.save(emb_file_path)
+                # the embedding format has no room for the generation: optimizer.pt records its hash instead (small)
+                unstamped[os.path.basename(emb_file_path)] = checkpoint_identity.sha256(emb_file_path)
             
             if self.decorator is not None:
-                dec_filename = f'{self.job.name}{step_num}.safetensors'
+                dec_filename = f'{BaseSDTrainProcess._decorator_save_name(self)}{step_num}.safetensors'
                 dec_file_path = os.path.join(self.save_root, dec_filename)
                 decorator_state_dict = self.decorator.state_dict()
                 for key, value in decorator_state_dict.items():
@@ -967,19 +1158,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 )
 
             if self.adapter is not None and self.adapter_config.train:
-                adapter_name = self.job.name
-                if self.network_config is not None or self.embedding is not None:
-                    # add _lora to name
-                    if self.adapter_config.type == 't2i':
-                        adapter_name += '_t2i'
-                    elif self.adapter_config.type == 'control_net':
-                        adapter_name += '_cn'
-                    elif self.adapter_config.type == 'clip':
-                        adapter_name += '_clip'
-                    elif self.adapter_config.type.startswith('ip'):
-                        adapter_name += '_ip'
-                    else:
-                        adapter_name += '_adapter'
+                adapter_name = BaseSDTrainProcess._adapter_save_name(self)
 
                 filename = f'{adapter_name}{step_num}.safetensors'
                 file_path = os.path.join(self.save_root, filename)
@@ -1010,7 +1189,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         )
                         meta_path = os.path.join(name_or_path, 'aitk_meta.yaml')
                         with open(meta_path, 'w') as f:
-                            yaml.dump(self.meta, f)
+                            yaml.dump({**self.meta, checkpoint_identity.META_GENERATION: resume_generation}, f)
                     except BaseException as primary:
                         sampling_state.settle([adapter_back], primary, 'the adapter placement')
                         raise
@@ -1090,6 +1269,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         print_acc(f"Saved checkpoint to {file_path}")
 
         # save optimizer
+        optimizer_failed = False
         if self.optimizer is not None:
             try:
                 filename = f'optimizer.pt'
@@ -1104,6 +1284,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     getattr(self, '_rawr_checkpoint_config', None), checkpoint_step,
                     training_state=(rawr_checkpoint.training_state(self, checkpoint_step)
                                     if getattr(self, '_rawr_checkpoint_config', None) is not None else None))
+                # which save, step, optimizer and parameters this state belongs to, checked before any resume loads it
+                state_dict[checkpoint_identity.KEY] = checkpoint_identity.record(
+                    self, resume_generation, self.meta['training_info']['completed_steps'], content=unstamped)
+                # the checkpoint above holds the EMA weights (the export); the raw training weights and the shadow
+                # travel here, in the same file and generation, so a resume continues training exactly (OPUS-EMA-01)
+                ema_state = checkpoint_identity.ema_record(getattr(self, 'ema', None))
+                if ema_state is not None:
+                    state_dict[checkpoint_identity.EMA_KEY] = ema_state
                 if rawr_pair_save is not None:
                     rawr_extras = None
                     if getattr(self, 'training_extras', None) is not None:
@@ -1125,13 +1313,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     raise RuntimeError('Could not save RAWR optimizer/scheduler checkpoint') from e
                 print_acc(e)
                 print_acc("Could not save optimizer")
+                optimizer_failed = True
 
         if getattr(self, 'training_extras', None) is not None and (rawr_pair_save is None or self.optimizer is None):
             # A committed pair already wrote (and aliased) its own copy above.
             # Stamped with completed_steps: the value a resume restores into step_num (checked on restore).
             self.training_extras.checkpoint(os.path.join(self.save_root, 'training_extras.pt'),
                                             step=self.meta['training_info']['completed_steps'])
-        self.clean_up_saves()
+        if optimizer_failed:
+            # optimizer.pt still belongs to an earlier save; pruning could delete that save, the only one a resume can
+            # pair with it (OPUS-RES-02). The next successful save prunes.
+            print_acc("Keeping older saves: this save's optimizer state was not written")
+        else:
+            self.clean_up_saves()
         self.post_save_hook(file_path)
 
     # Called before the model is loaded
@@ -1251,7 +1445,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def hook_after_sd_init_before_load(self):
         pass
 
-    def get_latest_save_path(self, name=None, post='', include_pretrained_lora=True):
+    def get_latest_save_path(self, name=None, post='', include_pretrained_lora=True, suffixes=('',)):
         if name == None:
             name = self.job.name
         from training_extras import rawr_checkpoint, rawr_pair
@@ -1264,34 +1458,27 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self._rawr_paired_extras_path = selected.get('training_extras')
                 self._rawr_pair_generation = selected['generation']
                 return selected['model']
-        # get latest saved step
+        # get latest saved step: the most recently written complete save of exactly this name (RAWR pairs were
+        # selected above). find_save_sets also drops the _LoRA/_refiner/_t2i/_cn siblings and derived exports.
         latest_path = None
-        if os.path.exists(self.save_root):
-            # Only {name}, {name}_<9-digit step>, plus post and an optional extension (none for a diffusers folder)
-            # are this run's saves. A bare prefix glob also took derived exports such as {name}_000000300-comfy,
-            # whose folded weights and copied metadata resume silently wrong.
-            save_name = re.compile(rf'{re.escape(name)}(_\d{{9}})?{re.escape(post)}(\.safetensors|\.pt)?',
-                                   re.IGNORECASE if os.name == 'nt' else 0)
-            # Define patterns for both files and directories
-            patterns = [
-                f"{name}*{post}.safetensors",
-                f"{name}*{post}.pt",
-                f"{name}*{post}"
-            ]
-            # Search for both files and directories
-            paths = []
-            for pattern in patterns:
-                paths.extend(glob.glob(os.path.join(self.save_root, pattern)))
+        sets = find_save_sets(self.save_root, name, suffixes, post)
+        complete = [s for s in sets if s.complete]
+        if sets and not complete:
+            raise ValueError(f"{self.save_root} holds saves of {name}, but none is complete (e.g. "
+                             f"{sets[-1].path} lacks its {', '.join(sets[-1].missing())} file). Restore the missing "
+                             f"files or use a new output folder")
+        if complete:
+            chosen = BaseSDTrainProcess._committed_save(self, complete)
+            for save in sets:
+                if not save.complete and save.rank > chosen.rank:
+                    print_acc(f"Skipping the incomplete save {save.path} (missing {', '.join(save.missing())}; "
+                              f"its save was interrupted)")
+            latest_path = chosen.path
+            # the other files of a split save load with this path; the resume binds them to the optimizer state too
+            files = getattr(self, '_latest_save_files', None) or {}
+            files[latest_path] = list(chosen.files.values())
+            self._latest_save_files = files
 
-            # Filter out non-existent paths and pick the most recently written (RAWR pairs were selected above)
-            if paths:
-                # the exact-name match also drops the _LoRA/_refiner/_t2i/_cn siblings the old substring filters
-                # removed, without misfiring when those strings appear in the folder path
-                paths = [p for p in paths if os.path.exists(p) and save_name.fullmatch(os.path.basename(p))]
-
-                if len(paths) > 0:
-                    latest_path = max(paths, key=save_write_rank)
-        
         if include_pretrained_lora and latest_path is None and self.network_config is not None and self.network_config.pretrained_lora_path is not None:
             # set pretrained lora path as load path if we do not have a checkpoint to resume from
             if os.path.exists(self.network_config.pretrained_lora_path):
@@ -1302,6 +1489,43 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print_acc(f"Pretrained lora path from config does not exist: {self.network_config.pretrained_lora_path}")
 
         return latest_path
+
+    def _committed_save(self, complete):
+        """The newest complete save, unless optimizer.pt was written by an earlier one. A save stopped after its
+        checkpoint and before its optimizer state (a UI Stop during "Saving model") then resumes exactly from the last
+        save whose optimizer state was written, instead of pairing the new weights with older moments (OPUS-RES-02)."""
+        newest = complete[-1]
+        optimizer_path = os.path.join(self.save_root, 'optimizer.pt')
+        try:
+            stat = os.stat(optimizer_path)
+        except OSError:
+            return newest
+        cache = getattr(self, '_optimizer_identity_cache', None)
+        key = (stat.st_mtime_ns, stat.st_size)
+        if cache is None or cache[0] != key:
+            cache = (key, checkpoint_identity.read_optimizer_identity(optimizer_path))
+            self._optimizer_identity_cache = cache
+        committed = cache[1]
+
+        def belongs(save):  # every file of the save (both halves of a split LoRA)
+            return all(checkpoint_identity.belongs(committed, p, checkpoint_identity.read_checkpoint_generation(p))
+                       for p in save.files.values())
+        if committed is None or belongs(newest):
+            return newest
+        for save in reversed(complete[:-1]):
+            if belongs(save):
+                print_acc(f"The newest save {newest.path} has no optimizer state (its save was interrupted after the "
+                          f"checkpoint was written); resuming from {save.path}, the last complete save")
+                return save
+        return newest  # nothing matches: the optimizer check refuses with what to do
+
+    def _note_resumed(self, path, meta=None):
+        """Record a checkpoint this run resumed from, and its save generation, for the optimizer-state check."""
+        record = getattr(self, '_resume_record', None)
+        if record is None:
+            record = self._resume_record = {'path': path, 'artifacts': []}
+        generation = (meta or {}).get(checkpoint_identity.META_GENERATION)
+        record['artifacts'].append((path, generation if isinstance(generation, str) else None))
 
     def load_training_state_from_metadata(self, path):
         if not self.accelerator.is_main_process:
@@ -1322,6 +1546,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if meta is not None and meta.get('aitk_rawr_generation') is not None:
             if meta['aitk_rawr_generation'] != getattr(self, '_rawr_pair_generation', None):
                 raise ValueError('RAWR model requires its committed-pair manifest; refusing an unpaired export')
+        BaseSDTrainProcess._note_resumed(self, path, meta)
+        for sibling in (getattr(self, '_latest_save_files', None) or {}).get(path, []):
+            if sibling != path:
+                BaseSDTrainProcess._note_resumed(self, sibling, load_metadata_from_safetensors(sibling))
         # if 'training_info' in Orderdict keys
         if meta is not None and 'training_info' in meta and 'step' in meta['training_info'] and self.train_config.start_step is None:
             self.step_num = meta['training_info'].get('completed_steps', meta['training_info']['step'])
@@ -1347,6 +1575,34 @@ class BaseSDTrainProcess(BaseTrainProcess):
             f"{path} was trained with LoRA on modules this model now skips ({self.network.model_lora_ignores}, "
             f"{len(hit)} saved weights, e.g. {hit[0]}). To resume it as trained, set network.network_kwargs."
             f"use_model_lora_ignores: false; otherwise start a new output folder")
+
+    def _check_resumed_network_keys(self, path):
+        """Resume loads the network strictly: every trainable weight must come from the checkpoint and every saved
+        weight must have a module. A same-size change of the trained modules (only_if_contains or ignore_if_contains
+        moved to a sibling block) otherwise left the new modules at initialization, dropped the saved ones, and
+        attached their optimizer moments by position (docs/STATE_MACHINES.md, OPUS-PARAM-ID-01). A
+        pretrained_lora_path is the deliberate partial, weights-only load and is not checked."""
+        if self.network_config.pretrained_lora_path is not None and path == self.network_config.pretrained_lora_path:
+            return
+        report = getattr(self.network, 'last_load_report', None)
+        if report is None:
+            return
+        # a LoRA trained with an embedding carries the embedding's vectors; they load from the embedding file
+        embedded = {'emb_params', 'clip_l', 'clip_g'} if self.embed_config is not None else set()
+        not_loaded = report['not_loaded']
+        unexpected = [k for k in report['unexpected'] if k not in embedded]
+        if not not_loaded and not unexpected:
+            return
+        details = []
+        if not_loaded:
+            details.append(f"{len(not_loaded)} trainable weights are not in it (e.g. {not_loaded[0]})")
+        if unexpected:
+            details.append(f"{len(unexpected)} of its weights have no module in this network (e.g. {unexpected[0]})")
+        raise ValueError(
+            f"{path} was saved for a different network: {'; '.join(details)}. The network's target modules, type or "
+            f"model changed since it was saved, so resuming would train the new modules from initialization under "
+            f"the saved optimizer state. Resume with the original network settings; or, to start from its matching "
+            f"weights only, use a new output folder with network.pretrained_lora_path: {path}")
 
     def load_weights(self, path):
         if self.network is not None:
@@ -1931,22 +2187,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # t2i adapter
         is_t2i = self.adapter_config.type == 't2i'
         is_control_net = self.adapter_config.type == 'control_net'
-        if self.adapter_config.type == 't2i':
-            suffix = 't2i'
-        elif self.adapter_config.type == 'control_net':
-            suffix = 'cn'
-        elif self.adapter_config.type == 'clip':
-            suffix = 'clip'
-        elif self.adapter_config.type == 'reference':
-            suffix = 'ref'
-        elif self.adapter_config.type.startswith('ip'):
-            suffix = 'ip'
-        else:
-            suffix = 'adapter'
-        adapter_name = self.name
-        if self.network_config is not None:
-            adapter_name = f"{adapter_name}_{suffix}"
-        latest_save_path = self.get_latest_save_path(adapter_name)
+        # the writer's name: discovery once looked for _ref (written as _adapter), ignored an embedding, and used the
+        # process name instead of the job name the files carry
+        latest_save_path = self.get_latest_save_path(BaseSDTrainProcess._adapter_save_name(self))
         
         if latest_save_path is not None and not self.adapter_config.train:
             # the save path is for something else since we are not training
@@ -2232,6 +2475,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # the loop's commit observers hold this trainer; an error, KeyboardInterrupt or failed save/sample must
             # not leave them on an optimizer a later job in this process may reuse (docs/STATE_MACHINES.md, R01)
             self._remove_update_commit_observers()
+            # this run no longer writes its folder (OPUS-ONEWRITER-01); the job releases whatever is left
+            BaseTrainProcess.release_save_root(self)
 
     def _check_trainer_accumulation_capability(self):
         """Refuse accumulation settings this trainer's hook_train_loop does not implement, before any model loads.
@@ -2262,6 +2507,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if not rawr_checkpoint.is_rawr_name(self.train_config.lr_scheduler):
             # before resuming or writing anything: a committed pair here would stay the resume point
             rawr_pair.refuse_stale_manifest(self.save_root)
+        # before loading anything: two artifacts sharing a filename would overwrite each other at every save
+        self._refuse_colliding_save_names()
 
         ### HOOK ###
         self.hook_before_model_load()
@@ -2577,18 +2824,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.train_config.gradient_checkpointing:
                     self.network.enable_gradient_checkpointing()
 
-                lora_name = self.name
-                # need to adapt name so they are not mixed up
-                if self.named_lora:
-                    lora_name = f"{lora_name}_LoRA"
+                # the names the writer uses (job name, not process name; the model's split files), so the LoRA it saved
+                # is the one resumed (OPUS-RES-01)
+                lora_name = BaseSDTrainProcess._lora_save_name(self)
 
-                latest_save_path = self.get_latest_save_path(lora_name)
+                latest_save_path = self.get_latest_save_path(
+                    lora_name, suffixes=BaseSDTrainProcess._lora_save_suffixes(self))
                 extra_weights = None
                 if latest_save_path is not None and not self.train_config.merge_network_on_save:
                     print_acc(f"#### IMPORTANT RESUMING FROM {latest_save_path} ####")
                     print_acc(f"Loading from {latest_save_path}")
                     extra_weights = self.load_weights(latest_save_path)
                     self._check_model_lora_ignores_on_resume(latest_save_path, extra_weights)
+                    self._check_resumed_network_keys(latest_save_path)
                     self.network.multiplier = 1.0
                 elif self.train_config.merge_network_on_save and self.network_config.pretrained_lora_path is not None:
                     # with merge_network_on_save, saved checkpoints are full models that get loaded as the
@@ -2619,6 +2867,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # load last saved weights
                 if latest_save_path is not None:
                     self.embedding.load_embedding_from_file(latest_save_path, self.device_torch)
+                    BaseSDTrainProcess._note_resumed(self, latest_save_path)
                     if self.embedding.step > 1:
                         self.step_num = self.embedding.step
                         self.start_step = self.step_num
@@ -2637,7 +2886,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     num_tokens=self.decorator_config.num_tokens,
                     token_size=4096 # t5xxl hidden size for flux
                 )
-                latest_save_path = self.get_latest_save_path()
+                latest_save_path = self.get_latest_save_path(BaseSDTrainProcess._decorator_save_name(self))
                 # load last saved weights
                 if latest_save_path is not None:
                     state_dict = load_file(latest_save_path)
@@ -2728,6 +2977,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                   optimizer_params=optimizer_params)
         self.optimizer = optimizer
         self._check_accumulation_support(optimizer)
+        # the ordered (name, shape, dtype) of what this optimizer trains: saved with, and checked against, optimizer.pt;
+        # refused here, before any resume or training, if a parameter has no module name to record
+        checkpoint_identity.require_named(BaseSDTrainProcess._parameter_manifest(self, optimizer))
 
         # set it to do paramiter swapping
         if self.train_config.do_paramiter_swapping:
@@ -2748,6 +3000,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         # set up the ema now that the optimizer (and its params) are ready
         self.setup_ema()
+        BaseSDTrainProcess._restore_ema_resume_state(self)
+        # every save mode is known now (EMA, embedding, adapter): refuse a RAWR pair the writer cannot produce before
+        # training toward a first save that would abort (OPUS-RAWR-01)
+        rawr_pair.refuse_unsupported_writer(self)
 
         lr_scheduler_params = self.train_config.lr_scheduler_params
 

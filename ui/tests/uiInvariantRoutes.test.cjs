@@ -246,4 +246,3 @@ test('dataset upload refuses sanitization collisions and concurrent publication 
   assert.deepEqual(raceFiles, ['same_name.png']);
   assert.ok(['AAAA', 'BBBB'].includes(fs.readFileSync(path.join(root, 'race', 'same_name.png'), 'utf8')));
 });
-

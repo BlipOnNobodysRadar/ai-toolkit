@@ -17,6 +17,8 @@ import path from 'path';
 import type { Job } from '@prisma/client';
 import { Db, attachRun, markRelayExited, markSpawnRequested, noteOwnership, recordRelay, releaseRun } from './store';
 import { bindLaunchConfig } from './launchConfig';
+import { withOpLock } from './opLock';
+import { writerLeasePath } from './writerLease';
 
 export const RELAY_EXIT = { SPAWNED: 0, NOT_SPAWNED: 2, RECEIPT_FAILED: 3, UNCERTAIN: 4 };
 
@@ -152,16 +154,21 @@ export const launchRun = async (ctx: LaunchContext, job: Job): Promise<LaunchRes
     // stale Training Folder setting and process/config names, and refuses ambiguous multi-process layouts.
     const jobConfig = bindLaunchConfig(job.job_config, job.name, folder);
     jobConfig.config.process[0].sqlite_db_path = ctx.sqliteDbPath;
-    fs.mkdirSync(folder, { recursive: true });
-    rotateLog(folder, files.log);
-    writeAtomic(files.config, JSON.stringify(jobConfig, null, 2));
+    // CLI trainers have no UI claim. Respect their lease during launch preparation too, before rotating their log
+    // or replacing a config. Release before spawning: the Python constructor acquires its lifetime lease itself.
+    // If another trainer wins that handoff, Python refuses before training/config writes.
+    await withOpLock(writerLeasePath(folder), async () => {
+      fs.mkdirSync(folder, { recursive: true });
+      rotateLog(folder, files.log);
+      writeAtomic(files.config, JSON.stringify(jobConfig, null, 2));
+      logFd = fs.openSync(files.log, 'a');
+    });
     if (!fs.existsSync(ctx.runPy)) throw new PreSpawnError('run.py not found');
     const platform = ctx.platform ?? process.platform;
     if (!SUPPORTED_PLATFORMS.includes(platform)) {
       // no process boundary is implemented there, so a launched run could never be proven finished
       throw new PreSpawnError(`launching jobs is not supported on ${platform} in this version: no process ownership boundary is implemented for it`);
     }
-    logFd = fs.openSync(files.log, 'a');
 
     if (!(await markSpawnRequested(db, job.id, runId))) {
       // a stop arrived before anything was spawned, or the run is no longer this one: nothing was started
@@ -204,7 +211,7 @@ export const launchRun = async (ctx: LaunchContext, job: Job): Promise<LaunchRes
     if (spawnError) {
       // the relay process itself was never created, so it cannot have started anything
       const info = `Error launching job: ${spawnError.message}`;
-      appendLog(files.log, `${info}\n`);
+      if (logFd !== null) appendLog(files.log, `${info}\n`);
       await releaseRun(db, job.id, runId, { phase: 'spawn_requested' }, { kind: 'not_spawned', info });
       return { result: 'not_spawned', info };
     }
@@ -240,7 +247,7 @@ export const launchRun = async (ctx: LaunchContext, job: Job): Promise<LaunchRes
     if (!spawnRequested) {
       const info = `Error launching job: ${e?.message || 'Unknown error'}`;
       console.error('Error launching process:', e);
-      appendLog(files.log, `${info}\n`);
+      if (logFd !== null) appendLog(files.log, `${info}\n`);
       // if this release fails the claims stay in 'claimed'; the reconciler releases them (no spawn ever happened)
       await releaseRun(db, job.id, runId, { phase: 'claimed' }, { kind: 'not_spawned', info }).catch(err => console.error('Release failed:', err));
       return { result: 'not_spawned', info };
@@ -259,4 +266,3 @@ export const launchRun = async (ctx: LaunchContext, job: Job): Promise<LaunchRes
     }
   }
 };
-

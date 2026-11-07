@@ -23,6 +23,8 @@ ts.mock('./store', {
 
 const launch = require(ts.uiPath('cron/ownership/launch.ts'));
 const { bindLaunchConfig, LaunchConfigError } = require(ts.uiPath('cron/ownership/launchConfig.ts'));
+const { withOpLock } = require(ts.uiPath('cron/ownership/opLock.ts'));
+const { writerLeasePath } = require(ts.uiPath('cron/ownership/writerLease.ts'));
 
 const roots = [];
 const makeRoot = label => {
@@ -60,6 +62,28 @@ const ctx = () => ({
   env: {},
   inFlight: new Set(),
   platform: 'darwin', // forces a pre-spawn refusal AFTER the real binding/config write, never a child process
+});
+
+test('launch refuses a held CLI writer lease before config writes or log rotation, including error logging', async () => {
+  const root = makeRoot('cli-held');
+  const runDir = path.join(root, 'job');
+  fs.mkdirSync(runDir);
+  const log = path.join(runDir, 'log.txt');
+  fs.writeFileSync(log, 'active CLI log');
+  const job = jobFor(runDir, { job: 'extension', config: { name: 'job', process: [{ type: 'diffusion_trainer' }] } });
+  const configPath = launch.runFiles(runDir, job.run_id).config;
+  await withOpLock(writerLeasePath(runDir), async () => {
+    const result = await launch.launchRun(ctx(), job);
+    assert.equal(result.result, 'not_spawned');
+    assert.match(result.info, /another operation holds/);
+    assert.equal(fs.readFileSync(log, 'utf8'), 'active CLI log');
+    assert.equal(fs.existsSync(configPath), false);
+    assert.equal(fs.existsSync(path.join(runDir, 'logs')), false);
+  });
+  const retry = await launch.launchRun(ctx(), job);
+  assert.equal(retry.result, 'not_spawned'); // platform guard, after successful preparation
+  assert.equal(fs.existsSync(configPath), true);
+  assert.equal(fs.readFileSync(path.join(runDir, 'logs', '0_log.txt'), 'utf8'), 'active CLI log');
 });
 
 test('launch binds a stale/mismatched training process to the exact claimed folder, with no outside write', async () => {

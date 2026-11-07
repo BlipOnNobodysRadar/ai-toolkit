@@ -119,6 +119,8 @@ def main():
         print_acc(f"Running {len(config_file_list)} job{'' if len(config_file_list) == 1 else 's'}")
 
     for config_file in config_file_list:
+        # bound per config: a get_job failure must not report to (or release) the previous config's job
+        job = None
         try:
             job = get_job(config_file, args.name)
             job.run()
@@ -127,31 +129,49 @@ def main():
         except Exception as e:
             print_acc(f"Error running job: {e}")
             jobs_failed += 1
-            try:
-                job.process[0].on_error(e)
-            except Exception as e2:
-                print_acc(f"Error running on_error: {e2}")
+            report_error(job, e)
             if not args.recover:
                 print_end_message(jobs_completed, jobs_failed)
                 raise e
             # Recovering: the failed job never reached its teardown, so drop it and everything the shared
             # Accelerator still holds from it before the next config loads its model.
+            release_save_roots(job)
             job = None
             try:
                 accelerator.free_memory()
             except Exception as e2:
                 print_acc(f"Error freeing the failed job's memory: {e2}")
         except KeyboardInterrupt as e:
-            try:
-                job.process[0].on_error(e)
-            except Exception as e2:
-                print_acc(f"Error running on_error: {e2}")
+            report_error(job, e)
             if not args.recover:
                 print_acc("")
                 print_acc("========================================")
                 print_acc("Job stopped")
                 print_acc("========================================")
                 sys.exit(0)
+        finally:
+            # every terminal path gives up the job's output-folder leases (OPUS-ONEWRITER-01); idempotent after cleanup
+            release_save_roots(job)
+
+
+def report_error(job, e):
+    processes = getattr(job, 'process', None) or []
+    if not processes:
+        return  # the job (or its first process) was never built
+    try:
+        processes[0].on_error(e)
+    except Exception as e2:
+        print_acc(f"Error running on_error: {e2}")
+
+
+def release_save_roots(job):
+    release = getattr(job, 'release_save_roots', None)
+    if release is None:
+        return
+    try:
+        release()
+    except Exception as e2:
+        print_acc(f"Error releasing the job's output folders: {e2}")
 
 
 if __name__ == '__main__':

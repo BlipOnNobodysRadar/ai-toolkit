@@ -8,6 +8,7 @@ import torch
 import yaml
 
 from jobs.process.BaseProcess import BaseProcess
+from toolkit import save_root_lease
 
 if TYPE_CHECKING:
     from jobs import TrainJob, BaseJob, ExtensionJob
@@ -46,8 +47,27 @@ class BaseTrainProcess(BaseProcess):
         self.step = 0
         self.first_step = 0
         self.log_dir = self.get_conf('log_dir', self.job.log_dir if hasattr(self.job, 'log_dir') else None)
+        self._refuse_distributed()
+        # before anything is written to the folder, and before any resume reads it (docs/STATE_MACHINES.md,
+        # OPUS-ONEWRITER-01). Owned by the job: BaseJob releases it if a later constructor fails.
+        self._save_root_lease = save_root_lease.acquire(self.save_root, owner=self.job, holder=self)
         self.setup_tensorboard()
         self.save_training_config()
+
+    def _refuse_distributed(self):
+        # Data loaders are not sharded, resume metadata is read on the main rank only, per-step reseeding gives every
+        # rank the same draws, and every rank would take this folder's lease (OPUS-DIST-01). Refuse before writing.
+        from toolkit.accelerator import get_accelerator
+        processes = get_accelerator().num_processes
+        if processes > 1:
+            raise ValueError(f"Training with {processes} processes (accelerate launch / torchrun) is not supported: "
+                             f"each process would train on the same batches and write the same output folder. Launch "
+                             f"one process")
+
+    def release_save_root(self):
+        """Give up this process's share of the save-root lease (idempotent): its run is over."""
+        save_root_lease.release(getattr(self, '_save_root_lease', None), self)
+        self._save_root_lease = None
 
     def run(self):
         super().run()

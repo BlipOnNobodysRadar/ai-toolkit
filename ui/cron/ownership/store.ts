@@ -10,6 +10,7 @@ import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { OpLockBusy, withOpLock } from './opLock';
+import { writerLeasePath } from './writerLease';
 import type { Job, Prisma, PrismaClient, RunClaim } from '@prisma/client';
 import {
   FolderIdentityError,
@@ -337,7 +338,7 @@ export const saveJob = (db: Db, body: any, trainingRoot: string, forcedGpuIds?: 
 // admitted to it until removal finishes. The row (and its name) stay until the folder is gone.
 // resume=true is only for a caller holding the job's deletion lock (deleteJob): a row left 'deleting' by a deleter
 // that crashed, or whose final DB write failed, is then safely continued.
-export const beginDelete = (db: Db, jobId: string, trainingRoot: string, opts: { resume?: boolean } = {}): Promise<Outcome> =>
+export const beginDelete = (db: Db, jobId: string, trainingRoot: string, opts: { resume?: boolean; expectedFolder?: string } = {}): Promise<Outcome> =>
   routeTx(db, async tx => {
     const job = await tx.job.findUnique({ where: { id: jobId } });
     if (!job) return { status: 404, body: { error: 'Job not found' } };
@@ -348,6 +349,9 @@ export const beginDelete = (db: Db, jobId: string, trainingRoot: string, opts: {
     const nameError = jobFolderError(trainingRoot, job.name);
     if (nameError) return { status: 400, body: { error: `${nameError}; its folder is not removed from here.` } };
     const folder = canonicalFolder(trainingRoot, job.name);
+    if (opts.expectedFolder !== undefined && folder !== opts.expectedFolder) {
+      return conflict('The job folder changed before deletion was reserved; retry Delete.');
+    }
     const resource = `folder:${folder}`;
     const holder = await tx.runClaim.findUnique({ where: { resource } });
     // any other owner of this folder, of a folder inside it, or of one containing it (recursive removal would hit it)
@@ -380,20 +384,32 @@ export const deleteJob = async (
     return await withOpLock(
       lockFile,
       async () => {
-        const begun = await beginDelete(db, jobId, trainingRoot, { resume: true });
-        if (begun.status !== 200) return begun;
-        if (deps.afterBegin) await deps.afterBegin();
-        const folder = path.join(trainingRoot, begun.body.name);
-        let error: string | null = null;
+        const candidate = await db.job.findUnique({ where: { id: jobId } });
+        if (!candidate) return { status: 404, body: { error: 'Job not found' } };
+        const invalid = jobFolderError(trainingRoot, candidate.name);
+        if (invalid) return { status: 400, body: { error: invalid } };
+        const expectedFolder = canonicalFolder(trainingRoot, candidate.name);
         try {
-          // force:true makes this a no-op if the folder is already gone (a resumed deletion)
-          await (deps.rm ?? (dir => fs.promises.rm(dir, { recursive: true, force: true })))(folder);
-        } catch (e: any) {
-          error = e?.message || String(e);
+          return await withOpLock(writerLeasePath(expectedFolder), async () => {
+            const begun = await beginDelete(db, jobId, trainingRoot, { resume: true, expectedFolder });
+            if (begun.status !== 200) return begun;
+            if (deps.afterBegin) await deps.afterBegin();
+            const folder = path.join(trainingRoot, begun.body.name);
+            let error: string | null = null;
+            try {
+              // force:true makes this a no-op if the folder is already gone (a resumed deletion)
+              await (deps.rm ?? (dir => fs.promises.rm(dir, { recursive: true, force: true })))(folder);
+            } catch (e: any) {
+              error = e?.message || String(e);
+            }
+            await finishDelete(db, jobId, error); // a DB failure here throws: still 'deleting', resumable
+            if (error) return { status: 500, body: { error: `Could not delete the job folder: ${error}` } };
+            return { status: 200, body: begun.body };
+          });
+        } catch (e) {
+          if (e instanceof OpLockBusy) return conflict('A training run or another deletion owns this output folder; stop it or retry after it finishes.');
+          throw e;
         }
-        await finishDelete(db, jobId, error); // a DB failure here throws: still 'deleting', resumable
-        if (error) return { status: 500, body: { error: `Could not delete the job folder: ${error}` } };
-        return { status: 200, body: begun.body };
       },
       deps.waitMs ?? 0,
     );
