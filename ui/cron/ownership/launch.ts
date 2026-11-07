@@ -16,6 +16,7 @@ import fs from 'fs';
 import path from 'path';
 import type { Job } from '@prisma/client';
 import { Db, attachRun, markRelayExited, markSpawnRequested, noteOwnership, recordRelay, releaseRun } from './store';
+import { bindLaunchConfig } from './launchConfig';
 
 export const RELAY_EXIT = { SPAWNED: 0, NOT_SPAWNED: 2, RECEIPT_FAILED: 3, UNCERTAIN: 4 };
 
@@ -147,14 +148,12 @@ export const launchRun = async (ctx: LaunchContext, job: Job): Promise<LaunchRes
   let logFd: number | null = null;
   try {
     // ---- claimed: nothing exists yet; every failure is a known pre-spawn failure
+    // Bind the saved config to the claimed folder BEFORE any run-folder/config write. In particular this rebinds a
+    // stale Training Folder setting and process/config names, and refuses ambiguous multi-process layouts.
+    const jobConfig = bindLaunchConfig(job.job_config, job.name, folder);
+    jobConfig.config.process[0].sqlite_db_path = ctx.sqliteDbPath;
     fs.mkdirSync(folder, { recursive: true });
     rotateLog(folder, files.log);
-    const jobConfig = JSON.parse(job.job_config);
-    jobConfig.config.process[0].sqlite_db_path = ctx.sqliteDbPath;
-    if (job.job_type === 'inference') {
-      // the engine publishes engine.json (endpoint + token) and writes outputs under the job folder
-      jobConfig.config.process[0].engine = { ...(jobConfig.config.process[0].engine || {}), job_folder: folder };
-    }
     writeAtomic(files.config, JSON.stringify(jobConfig, null, 2));
     if (!fs.existsSync(ctx.runPy)) throw new PreSpawnError('run.py not found');
     const platform = ctx.platform ?? process.platform;
@@ -260,3 +259,4 @@ export const launchRun = async (ctx: LaunchContext, job: Job): Promise<LaunchRes
     }
   }
 };
+
