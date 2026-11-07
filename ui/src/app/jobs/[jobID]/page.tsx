@@ -87,11 +87,11 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
 
   // poll for plugin.html in the job folder; show the Plugin tab if it exists
   usePollLoop(
-    () =>
+    isCurrent =>
       apiClient
         .get(`/api/jobs/${jobID}/plugin?check=1`)
         .then(res => res.data)
-        .then(data => setHasPlugin(!!data.exists))
+        .then(data => isCurrent() && setHasPlugin(!!data.exists))
         .catch(() => {}),
     5000,
     [jobID],

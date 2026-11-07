@@ -13,9 +13,13 @@ import { useEffect, useRef } from 'react';
  *   reloadInterval=null behavior).
  * - Changing `deps` (or `intervalMs`) restarts the loop, running `fn`
  *   immediately.
+ * - `fn` receives `isCurrent()`: false once this loop instance has been
+ *   stopped (deps changed or unmounted). A request still in flight from the
+ *   old loop must check it before touching state, or an old job's response
+ *   lands in the new job's view.
  */
 export default function usePollLoop(
-  fn: () => void | Promise<unknown>,
+  fn: (isCurrent: () => boolean) => void | Promise<unknown>,
   intervalMs: number | null | undefined,
   deps: unknown[] = [],
 ) {
@@ -26,10 +30,11 @@ export default function usePollLoop(
   useEffect(() => {
     let stopped = false;
     let timeout: ReturnType<typeof setTimeout> | undefined;
+    const isCurrent = () => !stopped;
 
     const tick = async () => {
       try {
-        await fnRef.current();
+        await fnRef.current(isCurrent);
       } catch (error) {
         console.error('Poll error:', error);
       }

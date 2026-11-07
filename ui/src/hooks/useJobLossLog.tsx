@@ -3,6 +3,7 @@
 import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { apiClient } from '@/utils/api';
 import usePollLoop from '@/hooks/usePollLoop';
+import { RequestOwner, Ticket } from '@/utils/requestOwner';
 
 // Columnar series: steps[i] pairs with values[i]. Null / non-finite values are
 // dropped at ingest, so every value here is a finite number.
@@ -16,16 +17,26 @@ type SeriesMap = Record<string, LossSeries>;
 interface LossResponse {
   keys?: string[];
   since_step?: number;
+  run_id?: string | null;
   series?: Record<string, { steps: number[]; values: (number | null)[] }>;
 }
 
+// Request ownership (utils/requestOwner): reads belong to the job that issued them, one cursor read is in flight
+// per job, and deleteRange invalidates every read issued before its DELETE completed (such a read may carry the
+// deleted points) before it clears the cursor and reloads.
 export default function useJobLossLog(jobID: string, reloadInterval: null | number = null) {
   const [series, setSeries] = useState<SeriesMap>({});
   const [keys, setKeys] = useState<string[]>([]);
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error' | 'refreshing'>('idle');
 
   const didInitialLoadRef = useRef(false);
-  const inFlightRef = useRef(false);
+  const inFlightRef = useRef<{ ticket: Ticket; promise: Promise<void> } | null>(null);
+  const ownerRef = useRef<RequestOwner | null>(null);
+  if (ownerRef.current === null) ownerRef.current = new RequestOwner();
+  // the run whose points the incremental cursor counts (the metric history itself spans runs)
+  const runIdRef = useRef<string | null | undefined>(undefined);
+  // the full reload scheduled after a run change; cancelled when the job changes or the hook unmounts
+  const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Highest step seen across every key. Polls ask for step >= this (not >) so a
   // key logged at that step after the previous poll is still picked up; the
@@ -39,92 +50,119 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
     return [...base].sort();
   }, [keys]);
 
-  const refreshLoss = useCallback(async () => {
-    if (!jobID) return;
-
-    if (inFlightRef.current) return;
-    inFlightRef.current = true;
+  const refreshLoss = useCallback((): Promise<void> => {
+    if (!jobID) return Promise.resolve();
+    const owner = ownerRef.current!;
+    // a callback from an earlier render (old jobID), e.g. a queued retry, must not request under the new identity
+    if (!owner.isCurrent(jobID)) return Promise.resolve();
+    const current = inFlightRef.current;
+    if (current && owner.valid(current.ticket)) return current.promise;
+    const ticket = owner.begin();
 
     const loadStatus: 'loading' | 'refreshing' = didInitialLoadRef.current ? 'refreshing' : 'loading';
     setStatus(loadStatus);
 
-    try {
-      // One request returns every key. Incremental after the initial load.
-      const params: Record<string, number> = {};
-      if (reloadInterval && didInitialLoadRef.current && lastStepRef.current != null) {
-        params.since_step = lastStepRef.current;
-      }
-      const res = await apiClient.get(`/api/jobs/${jobID}/loss`, { params });
-      const data = res.data as LossResponse;
+    // One request returns every key. Incremental after the initial load.
+    const params: Record<string, number> = {};
+    const incremental = !!reloadInterval && didInitialLoadRef.current && lastStepRef.current != null;
+    if (incremental) params.since_step = lastStepRef.current!;
 
-      const newKeys = data.keys ?? [];
-      setKeys(newKeys);
-      const wantedLossKeys = (newKeys.length ? [...newKeys] : ['loss']).sort();
-      const incoming = data.series ?? {};
-      const initial = !didInitialLoadRef.current;
+    const promise = (async () => {
+      try {
+        const res = await apiClient.get(`/api/jobs/${jobID}/loss`, { params });
+        if (!owner.accept(ticket)) return;
+        const data = res.data as LossResponse;
+        const runId = data.run_id ?? null;
+        if (incremental && runIdRef.current !== undefined && runId !== runIdRef.current) {
+          // another run wrote this log since our cursor was set: reload everything on the next read
+          didInitialLoadRef.current = false;
+          lastStepRef.current = null;
+          runIdRef.current = runId;
+          if (retryRef.current) clearTimeout(retryRef.current);
+          retryRef.current = setTimeout(() => {
+            retryRef.current = null;
+            // still the job (and identity) whose response asked for the reload?
+            if (owner.owns(ticket) && owner.isCurrent(jobID)) void refreshLoss();
+          }, 0);
+          return;
+        }
+        runIdRef.current = runId;
 
-      setSeries(prev => {
-        const next: SeriesMap = initial ? {} : { ...prev };
-        let maxStep = lastStepRef.current ?? null;
+        const newKeys = data.keys ?? [];
+        setKeys(newKeys);
+        const wantedLossKeys = (newKeys.length ? [...newKeys] : ['loss']).sort();
+        const incoming = data.series ?? {};
+        const initial = !didInitialLoadRef.current;
 
-        for (const k of wantedLossKeys) {
-          const inc = incoming[k];
-          const existing = initial ? undefined : next[k];
-          const prevLast = existing && existing.steps.length ? existing.steps[existing.steps.length - 1] : null;
+        setSeries(prev => {
+          const next: SeriesMap = initial ? {} : { ...prev };
+          let maxStep = initial ? null : (lastStepRef.current ?? null);
 
-          const steps: number[] = existing ? existing.steps.slice() : [];
-          const values: number[] = existing ? existing.values.slice() : [];
-          let appended = false;
-          if (inc) {
-            const n = Math.min(inc.steps.length, inc.values.length);
-            for (let i = 0; i < n; i++) {
-              const v = inc.values[i];
-              if (v === null || !Number.isFinite(v)) continue;
-              const s = inc.steps[i];
-              if (prevLast != null && s <= prevLast) continue;
-              steps.push(s);
-              values.push(v as number);
-              appended = true;
+          for (const k of wantedLossKeys) {
+            const inc = incoming[k];
+            const existing = initial ? undefined : next[k];
+            const prevLast = existing && existing.steps.length ? existing.steps[existing.steps.length - 1] : null;
+
+            const steps: number[] = existing ? existing.steps.slice() : [];
+            const values: number[] = existing ? existing.values.slice() : [];
+            let appended = false;
+            if (inc) {
+              const n = Math.min(inc.steps.length, inc.values.length);
+              for (let i = 0; i < n; i++) {
+                const v = inc.values[i];
+                if (v === null || !Number.isFinite(v)) continue;
+                const s = inc.steps[i];
+                if (prevLast != null && s <= prevLast) continue;
+                steps.push(s);
+                values.push(v as number);
+                appended = true;
+              }
+            }
+            if (initial || appended) next[k] = { steps, values };
+            else next[k] = existing ?? { steps: [], values: [] };
+
+            const arr = next[k].steps;
+            if (arr.length) {
+              const last = arr[arr.length - 1];
+              if (maxStep == null || last > maxStep) maxStep = last;
             }
           }
-          if (initial || appended) next[k] = { steps, values };
-          else next[k] = existing ?? { steps: [], values: [] };
 
-          const arr = next[k].steps;
-          if (arr.length) {
-            const last = arr[arr.length - 1];
-            if (maxStep == null || last > maxStep) maxStep = last;
+          // remove stale keys that no longer exist (rare, but keeps UI clean)
+          for (const existingKey of Object.keys(next)) {
+            if (!wantedLossKeys.includes(existingKey)) delete next[existingKey];
           }
-        }
 
-        // remove stale keys that no longer exist (rare, but keeps UI clean)
-        for (const existingKey of Object.keys(next)) {
-          if (!wantedLossKeys.includes(existingKey)) delete next[existingKey];
-        }
+          lastStepRef.current = maxStep;
+          return next;
+        });
 
-        lastStepRef.current = maxStep;
-        return next;
-      });
-
-      setStatus('success');
-      didInitialLoadRef.current = true;
-    } catch (err) {
-      console.error('Error fetching loss logs:', err);
-      setStatus('error');
-    } finally {
-      inFlightRef.current = false;
-    }
+        setStatus('success');
+        didInitialLoadRef.current = true;
+      } catch (err) {
+        if (!owner.accept(ticket)) return;
+        console.error('Error fetching loss logs:', err);
+        setStatus('error');
+      } finally {
+        if (inFlightRef.current?.ticket === ticket) inFlightRef.current = null;
+      }
+    })();
+    inFlightRef.current = { ticket, promise };
+    return promise;
   }, [jobID, reloadInterval]);
 
-  // Delete every logged step in [minStep, maxStep] from the on-disk log, then
-  // drop those points locally so the chart updates without a full reload.
+  // Delete every logged step in [minStep, maxStep] from the on-disk log, drop those points locally so the chart
+  // updates at once, then reload from scratch. Reads issued before the DELETE finished are discarded on arrival.
   const deleteRange = useCallback(
     async (minStep: number, maxStep: number) => {
       if (!jobID) return;
+      const owner = ownerRef.current!;
+      const ticket = owner.mutate();
       await apiClient.delete(`/api/jobs/${jobID}/loss`, { data: { min_step: minStep, max_step: maxStep } });
+      if (!owner.owns(ticket)) return; // the hook moved to another job meanwhile: not this series
+      owner.mutate(); // reads issued while the DELETE was pending may still hold the deleted points
       setSeries(prev => {
         const next: SeriesMap = {};
-        let last: number | null = null;
         for (const k of Object.keys(prev)) {
           const steps: number[] = [];
           const values: number[] = [];
@@ -137,25 +175,35 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
             }
           }
           next[k] = { steps, values };
-          if (steps.length && (last == null || steps[steps.length - 1] > last)) last = steps[steps.length - 1];
         }
-        // Re-anchor incremental polling to the new tail so a deleted tail
-        // isn't treated as already-fetched.
-        lastStepRef.current = last;
         return next;
       });
+      // cursor cleared: the next read is a full load
+      didInitialLoadRef.current = false;
+      lastStepRef.current = null;
+      inFlightRef.current = null;
+      await refreshLoss();
     },
-    [jobID],
+    [jobID, refreshLoss],
   );
 
   // reset when job changes. Declared before the poll loop so the reset runs
   // before the first fetch when jobID changes.
   useEffect(() => {
+    ownerRef.current!.reset(jobID);
+    if (retryRef.current) clearTimeout(retryRef.current);
+    retryRef.current = null;
+    inFlightRef.current = null;
+    runIdRef.current = undefined;
     didInitialLoadRef.current = false;
     lastStepRef.current = null;
     setSeries({});
     setKeys([]);
     setStatus('idle');
+    return () => {
+      if (retryRef.current) clearTimeout(retryRef.current);
+      retryRef.current = null;
+    };
   }, [jobID]);
 
   usePollLoop(refreshLoss, reloadInterval, [jobID]);

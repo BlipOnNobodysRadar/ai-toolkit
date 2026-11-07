@@ -154,12 +154,15 @@ function GeneratePageInner() {
     [engineJobId],
   );
 
+  // Each loop instance is tied to the ids it was started with; once they change (isCurrent() false), a response
+  // still in flight must not clear or alert about the newer start/stop.
   usePollLoop(
-    () =>
+    isCurrent =>
       apiClient
         .get(`/api/inference/status${preferredJob ? `?job=${preferredJob}` : ''}`)
         .then(res => res.data)
         .then(async (data: EngineStatus) => {
+          if (!isCurrent()) return;
           setEngineStatus(data);
           if (startingJobId) {
             const mine = data.engines.find(e => e.jobId === startingJobId);
@@ -171,6 +174,7 @@ function GeneratePageInner() {
                 .get('/api/jobs', { params: { id: startingJobId } })
                 .then(r => r.data)
                 .catch(() => null);
+              if (!isCurrent()) return;
               if (!job || ['error', 'stopped', 'completed'].includes(job.status)) {
                 setStartingJobId(null);
                 alert(`The engine did not start${job?.info ? `: ${job.info}` : ''}. Check the job log in the Queue.`);
@@ -184,8 +188,8 @@ function GeneratePageInner() {
           if (data.running) {
             return apiClient
               .get(proxy('health'))
-              .then(r => setHealth(r.data))
-              .catch(() => setHealth(null));
+              .then(r => isCurrent() && setHealth(r.data))
+              .catch(() => isCurrent() && setHealth(null));
           }
           setHealth(null);
         })
