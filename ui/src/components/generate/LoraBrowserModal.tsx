@@ -54,6 +54,7 @@ interface UploadState {
 }
 
 const isAbort = (e: any) => e?.code === 'ERR_CANCELED' || e?.name === 'CanceledError' || e?.name === 'AbortError';
+const retryable = (e: any) => !e?.response || e.response.status === 503;
 
 export default function LoraBrowserModal({ isOpen, onClose, onPick, cloudLoras }: Props) {
   const hasCloud = !!cloudLoras?.length;
@@ -132,17 +133,28 @@ export default function LoraBrowserModal({ isOpen, onClose, onPick, cloudLoras }
             });
             break;
           } catch (e: any) {
-            // Only transport failures are retried; the server rejects bad requests with 4xx.
-            if (isAbort(e) || e?.response || ++attempt >= CHUNK_RETRIES) throw e;
+            // Transport failures and 503 (busy with another request for this upload) are retried; a retried chunk
+            // carries the same bytes, which the server accepts. Other 4xx/5xx are final.
+            if (isAbort(e) || !retryable(e) || ++attempt >= CHUNK_RETRIES) throw e;
             await new Promise(r => setTimeout(r, 1000 * attempt));
           }
         }
         setUpload(u => (u ? { ...u, sent: offset + chunk.size } : u));
       }
-      const fin = await apiClient.post('/api/loras/upload', null, {
-        params: params({ action: 'finish', uploadId, fileName: file.name, size: file.size }),
-        signal: ctrl.signal,
-      });
+      // finish is idempotent server-side (a retry returns the first result), so a lost reply is retried, not cancelled
+      let fin;
+      for (let attempt = 0; ; ) {
+        try {
+          fin = await apiClient.post('/api/loras/upload', null, {
+            params: { action: 'finish', uploadId },
+            signal: ctrl.signal,
+          });
+          break;
+        } catch (e: any) {
+          if (isAbort(e) || !retryable(e) || ++attempt >= CHUNK_RETRIES) throw e;
+          await new Promise(r => setTimeout(r, 1000 * attempt));
+        }
+      }
       setUpload(u => (u ? { ...u, status: 'done', sent: file.size, result: fin.data } : u));
       refresh();
     } catch (e: any) {
