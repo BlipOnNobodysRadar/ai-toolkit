@@ -1,11 +1,12 @@
 from typing import List
 import torch
 from toolkit.optimizers.optimizer_utils import Auto8bitTensor, copy_stochastic, stochastic_grad_accummulation
+from toolkit.optimizers.pending_grads import PendingGradZeroGradMixin
 from optimum.quanto import QBytesTensor
 import random
 
 
-class Automagic(torch.optim.Optimizer):
+class Automagic(PendingGradZeroGradMixin, torch.optim.Optimizer):
     def __init__(
         self,
         params,
@@ -67,6 +68,8 @@ class Automagic(torch.optim.Optimizer):
             self.enable_paramiter_swapping(self.paramiter_swapping_factor)
 
     def enable_paramiter_swapping(self, paramiter_swapping_factor=0.1):
+        if not 0 < paramiter_swapping_factor <= 1:
+            raise ValueError(f"paramiter_swapping_factor must be in (0, 1], got {paramiter_swapping_factor}")
         self.do_paramiter_swapping = True
         self.paramiter_swapping_factor = paramiter_swapping_factor
         # call it an initial time
@@ -84,16 +87,15 @@ class Automagic(torch.optim.Optimizer):
         # shuffle all paramiters
         random.shuffle(all_params)
 
-        # keep activating paramiters until we are going to go over the target paramiters
+        # keep activating paramiters until the next one would go over the target paramiters; at least one trains
         target_paramiters = int(
             self._total_paramiter_size * self.paramiter_swapping_factor)
         total_paramiters = 0
         for param in all_params:
-            total_paramiters += torch.numel(param)
-            if total_paramiters >= target_paramiters:
+            if total_paramiters > 0 and total_paramiters + torch.numel(param) > target_paramiters:
                 break
-            else:
-                param.requires_grad_(True)
+            param.requires_grad_(True)
+            total_paramiters += torch.numel(param)
 
     @staticmethod
     def _get_lr(param_group, param_state):

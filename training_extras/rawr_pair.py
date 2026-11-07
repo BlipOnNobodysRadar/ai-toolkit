@@ -44,8 +44,19 @@ def _paths(root, slot):
     return os.path.join(base, 'model.safetensors'), os.path.join(base, 'optimizer.pt')
 
 
+def refuse_stale_manifest(root):
+    """Ordinary (non-RAWR) training must not share a folder with a committed pair: the manifest would stay the
+    resume point, so switching back to RAWR later would silently rewind past this run's saves. The pair is the
+    user's data, so refuse instead of deleting or renaming it."""
+    if _manifest(root) is not None:
+        raise ValueError(f'{root} holds a committed RAWR resume pair ({MANIFEST}). Training here without the RAWR '
+                         'scheduler would leave that pair as the resume point, and a later RAWR resume would discard '
+                         'this run. Use a new output folder, or keep the RAWR scheduler.')
+
+
 def begin(trainer):
     if getattr(trainer, '_rawr_checkpoint_config', None) is None:
+        refuse_stale_manifest(trainer.save_root)
         return None
     previous = _manifest(trainer.save_root)
     # Learnable SNR state now travels in the pair either way (recorded-state path or training_state['snr']);

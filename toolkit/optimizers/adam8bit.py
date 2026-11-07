@@ -2,8 +2,9 @@ import math
 import torch
 from torch.optim import Optimizer
 from toolkit.optimizers.optimizer_utils import copy_stochastic, Auto8bitTensor, stochastic_grad_accummulation
+from toolkit.optimizers.pending_grads import PendingGradZeroGradMixin
 
-class Adam8bit(Optimizer):
+class Adam8bit(PendingGradZeroGradMixin, Optimizer):
     """
     Implements Adam optimizer with 8-bit state storage and stochastic rounding.
     

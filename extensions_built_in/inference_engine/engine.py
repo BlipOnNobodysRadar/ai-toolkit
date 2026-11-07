@@ -23,6 +23,7 @@ from toolkit.config_modules import GenerateImageConfig, ModelConfig
 from toolkit.models.registry import OUTPUT_EXT, get_arch_entry
 from toolkit.models.v2.pool import ComponentPool
 from toolkit.inference_lora import InferenceLoRA, LoRAStack
+from toolkit.sampling_state import settle
 from toolkit.util.get_model import LEGACY_ARCHS, get_model_class
 
 from .latent_preview import preview_info
@@ -33,6 +34,14 @@ END = None  # frames-queue terminator (after the "end" frame)
 
 class GenerationCancelled(Exception):
     pass
+
+
+class EngineBusy(RuntimeError):
+    """The engine is running a request; the operation must wait for it to finish."""
+
+
+class EngineClosed(RuntimeError):
+    """The engine has stopped accepting requests."""
 
 
 class GenerationJob:
@@ -59,10 +68,17 @@ class GenerationJob:
         self.step = 0
         self.total_steps: Optional[int] = None
 
+    # Lifecycle (docs/STATE_MACHINES.md, M11): queued -> running (claim) -> done/error/cancelled -> finished.
+    # The status transitions out of "queued" and finish() happen under _sub_lock, so a cancel racing the engine's
+    # dequeue either wins (the job never runs) or loses (the running job sees the cancel event), and exactly one
+    # end frame is ever emitted. Nothing is emitted after it.
+
     def emit(self, type_: str, payload: bytes = b"", **fields):
         header = {"type": type_, "request_id": self.request_id, **fields}
         data = encode_frame(header, payload)
         with self._sub_lock:
+            if self.finished:
+                return
             if type_ == "latent":
                 if self._latent_index is not None:
                     self.history[self._latent_index] = data
@@ -73,6 +89,24 @@ class GenerationJob:
                 self.history.append(data)
             for q in self._subscribers:
                 q.put(data)
+
+    def claim(self) -> bool:
+        """queued -> running, for the engine thread; False if the job was cancelled first."""
+        with self._sub_lock:
+            if self.status != "queued":
+                return False
+            self.status = "running"
+            self.started_at = time.time()
+            return True
+
+    def cancel_if_queued(self) -> bool:
+        """queued -> cancelled; False once the engine has claimed the job."""
+        with self._sub_lock:
+            if self.status != "queued":
+                return False
+            self.status = "cancelled"
+            self.error = "cancelled"
+            return True
 
     def subscribe(self, replay: bool = True) -> "queue.Queue[Optional[bytes]]":
         """A queue that receives this job's frames (history first when
@@ -88,14 +122,28 @@ class GenerationJob:
                 self._subscribers.append(q)
         return q
 
-    def finish(self):
-        self.finished_at = time.time()
-        self.emit("end", status=self.status)
+    def unsubscribe(self, q: "queue.Queue[Optional[bytes]]"):
+        """A reader went away (client disconnect): stop feeding its queue, and wake a read still blocked on it.
+        The job itself keeps running."""
         with self._sub_lock:
+            if q in self._subscribers:
+                self._subscribers.remove(q)
+        q.put(END)
+
+    def finish(self) -> bool:
+        """Emit the one end frame and release every reader; later calls do nothing."""
+        with self._sub_lock:
+            if self.finished:
+                return False
+            self.finished_at = time.time()
+            data = encode_frame({"type": "end", "request_id": self.request_id, "status": self.status}, b"")
+            self.history.append(data)
             self.finished = True
             for q in self._subscribers:
+                q.put(data)
                 q.put(END)
             self._subscribers = []
+        return True
 
     def info(self) -> dict:
         return {
@@ -159,15 +207,23 @@ class Engine:
         self.lora_stack = None
         self.stats = {"holder_loads": 0, "generations": 0, "errors": 0, "cancelled": 0, "oom_retries": 0}
         self._lock = threading.Lock()
+        # held by the engine thread for each request it runs, and by unload/preload: the holder and the pool
+        # change under one owner at a time (docs/STATE_MACHINES.md, M12)
+        self._exec_lock = threading.Lock()
+        # set once run_forever stops taking requests; submit refuses from then on
+        self._closed = False
         # resident components shared across holders (same TE/VAE under two archs)
         self.pool = ComponentPool()
 
     # ------------------------------------------------------------------ api
     def submit(self, model: dict, sample: dict, stream: Optional[dict] = None) -> GenerationJob:
-        if "arch" not in model:
-            raise ValueError("model.arch is required")
+        arch = model.get("arch") if isinstance(model, dict) else None
+        if not isinstance(arch, str) or not arch:
+            raise ValueError("model.arch is required (a string)")
         job = GenerationJob(model, sample, stream)
         with self._lock:
+            if self._closed:
+                raise EngineClosed("the engine has stopped")
             self.jobs[job.request_id] = job
             # bounded memory: drop the oldest finished jobs' frame history
             finished = [j for j in self.jobs.values() if j.finished]
@@ -175,7 +231,8 @@ class Engine:
                 finished.sort(key=lambda j: j.created_at)
                 for old in finished[: len(finished) - 100]:
                     self.jobs.pop(old.request_id, None)
-        self.queue.put(job)
+            # enqueued under the lock: run_forever's final drain sees every job admitted before it closed
+            self.queue.put(job)
         return job
 
     def get_job(self, request_id: str) -> Optional[GenerationJob]:
@@ -186,8 +243,7 @@ class Engine:
         if job is None:
             return False
         job.cancel.set()
-        if job.status == "queued":
-            job.status = "cancelled"
+        if job.cancel_if_queued():
             job.emit("error", message="cancelled", cancelled=True)
             job.finish()
         return True
@@ -252,12 +308,19 @@ class Engine:
         gc.collect()
 
     def unload(self):
-        if self.holder is None and not self.pool.entries:
-            return
-        self.status_cb("Unloading model")
-        self._drop_holder()
-        self.pool.clear()
-        flush()
+        """Drop the holder and the pool. Called from the HTTP thread: refused (EngineBusy) while a request runs,
+        and no request can start until it returns."""
+        if not self._exec_lock.acquire(blocking=False):
+            raise EngineBusy("a generation is running")
+        try:
+            if self.holder is None and not self.pool.entries:
+                return
+            self.status_cb("Unloading model")
+            self._drop_holder()
+            self.pool.clear()
+            flush()
+        finally:
+            self._exec_lock.release()
 
     def preload(self, model: dict):
         """Load a model's holder ahead of any request (warm start). Runs on
@@ -265,21 +328,30 @@ class Engine:
         run_forever."""
         job = GenerationJob(dict(model), {}, {"latents": "none"})
         job.status = "running"
-        self.current = job
-        try:
-            self._ensure_holder(job)
-            job.status = "done"
-        except Exception as e:
-            job.status = "error"
-            job.error = f"{type(e).__name__}: {e}"
-            traceback.print_exc()
-        finally:
-            self.current = None
-            job.finish()
+        with self._exec_lock:
+            self.current = job
+            try:
+                self._ensure_holder(job)
+                job.status = "done"
+            except Exception as e:
+                job.status = "error"
+                job.error = f"{type(e).__name__}: {e}"
+                traceback.print_exc()
+            finally:
+                self.current = None
+                job.finish()
         return job
 
     # ------------------------------------------------------------------ loop
     def run_forever(self):
+        try:
+            self._serve()
+        except BaseException as primary:
+            settle([self._close_and_drain], primary, 'the request queue')
+            raise
+        self._close_and_drain()
+
+    def _serve(self):
         while not self.stop_event.is_set():
             try:
                 job = self.queue.get(timeout=0.5)
@@ -289,20 +361,34 @@ class Engine:
                 self.stop("stopped")
                 break
             if job.status != "queued":
-                continue
-            self.current = job
-            try:
-                self._run(job)
-            except KeyboardInterrupt:
-                job.status = "cancelled"
-                job.emit("error", message="engine stopping", cancelled=True)
-                job.finish()
-                self.stop("stopped")
-                break
-            finally:
-                self.current = None
-                self._idle_status()
-        # drain anything left queued
+                continue  # cancelled while queued (claim() below decides races)
+            with self._exec_lock:
+                self.current = job
+                try:
+                    self._run(job)
+                except KeyboardInterrupt:
+                    job.status = "cancelled"
+                    job.emit("error", message="engine stopping", cancelled=True)
+                    job.finish()
+                    self.stop("stopped")
+                    break
+                except Exception as e:
+                    # _run settles every request itself; this keeps the worker alive if that ever fails
+                    traceback.print_exc()
+                    if not job.finished:
+                        job.status = "error"
+                        job.error = f"{type(e).__name__}: {e}"
+                        job.emit("error", message=job.error, cancelled=False)
+                        job.finish()
+                finally:
+                    self.current = None
+                    self._idle_status()
+
+    def _close_and_drain(self):
+        # stop admitting, then drain anything left queued (on every exit: a worker that died must not keep
+        # accepting requests nobody will run)
+        with self._lock:
+            self._closed = True
         while True:
             try:
                 job = self.queue.get_nowait()
@@ -428,7 +514,13 @@ class Engine:
         if not specs:
             return
         stack = LoRAStack(self.holder, mode).load(specs, status_fn=status)
-        touched = stack.apply(status_fn=status)
+        try:
+            touched = stack.apply(status_fn=status)
+        except BaseException:
+            # apply mutates module by module: never leave a partial set on a holder or pool entry a later
+            # request would reuse unmarked
+            self._discard_partial_loras(stack, mode)
+            raise
         if mode == "merge":
             for root in [getattr(self.holder, "model", None)] + (
                 self.holder.text_encoder if isinstance(getattr(self.holder, "text_encoder", None), list) else [getattr(self.holder, "text_encoder", None)]
@@ -436,6 +528,18 @@ class Engine:
                 if isinstance(root, torch.nn.Module) and any(id(m) in touched for m in root.modules()):
                     root._aitk_merged_loras = stack.key()
         self.lora_stack = stack
+
+    def _discard_partial_loras(self, stack: "LoRAStack", mode: str):
+        """Undo a LoRA apply that failed part-way. Hook mode: detach what was attached. Merge mode: the merged
+        weights cannot be un-merged exactly, so the holder and every pooled component holding a module the set
+        targets are dropped; the next request reloads them from disk."""
+        if mode != "merge":
+            stack.remove()
+            return
+        targets = {id(e.module) for lora in stack.loras for e in lora.entries}
+        self.pool.evict_where(lambda m: any(id(sub) in targets for sub in m.modules()))
+        self._drop_holder()
+        flush()
 
     def _ensure_holder_for_loras(self, job: GenerationJob, specs: List[dict], mode: str):
         model = dict(self.holder_model or job.model)
@@ -561,13 +665,18 @@ class Engine:
         raise FileNotFoundError(f"control image not found: {value}")
 
     def _run(self, job: GenerationJob):
-        job.status = "running"
-        job.started_at = time.time()
-        arch = job.model.get("arch")
-        entry = get_arch_entry(arch)
-        out_dir = os.path.join(self.output_folder, job.request_id)
-        os.makedirs(out_dir, exist_ok=True)
+        if not job.claim():
+            return  # cancelled between the queue and here: it already has its one end frame
+        out_dir = None
         try:
+            # every step of a claimed request is inside this boundary: any failure settles the job
+            # (error + end frame) and the engine thread goes on to the next request
+            if job.cancel.is_set():
+                raise GenerationCancelled()
+            arch = job.model.get("arch")
+            entry = get_arch_entry(arch)
+            out_dir = os.path.join(self.output_folder, job.request_id)
+            os.makedirs(out_dir, exist_ok=True)
             holder = self._ensure_holder(job)
             if job.cancel.is_set():
                 raise GenerationCancelled()
@@ -693,7 +802,7 @@ class Engine:
             job.emit("error", message=job.error, cancelled=False, traceback=traceback.format_exc())
             flush()
         finally:
-            if job.status != "done":
+            if job.status != "done" and out_dir is not None:
                 shutil.rmtree(out_dir, ignore_errors=True)
             job.finish()
 

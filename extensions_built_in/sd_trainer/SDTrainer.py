@@ -22,6 +22,7 @@ from toolkit.image_utils import show_tensors, show_latents
 from toolkit.ip_adapter import IPAdapter
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.memory_management import sync_grad_transfers
+from toolkit.optimizers import pending_grads
 from toolkit.print import print_acc
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
@@ -31,6 +32,7 @@ from toolkit.train_tools import get_torch_dtype, apply_snr_weight, add_all_snr_t
 import gc
 import torch
 from jobs.process import BaseSDTrainProcess
+from jobs.process.BaseSDTrainProcess import mark_update_commit
 from torchvision import transforms
 from diffusers import EMAModel
 import math
@@ -1328,7 +1330,23 @@ class SDTrainer(BaseSDTrainProcess):
 
 
 
-    def get_prior_prediction(
+    def get_prior_prediction(self, *args, **kwargs):
+        # The prior pass switches the network/adapter off and the unet to eval. A tolerated OOM inside it must not
+        # leave them that way for the rest of training (docs/STATE_MACHINES.md, SM-05).
+        was_unet_training = self.sd.unet.training
+        was_network_active = self.network.is_active if self.network is not None else None
+        was_adapter_active = getattr(self.adapter, 'is_active', None) if self.adapter is not None else None
+        try:
+            return self._get_prior_prediction(*args, **kwargs)
+        finally:
+            if was_unet_training:
+                self.sd.unet.train()
+            if was_network_active is not None:
+                self.network.is_active = was_network_active
+            if was_adapter_active is not None:
+                self.adapter.is_active = was_adapter_active
+
+    def _get_prior_prediction(
             self,
             noisy_latents: torch.Tensor,
             conditional_embeds: PromptEmbeds,
@@ -2428,6 +2446,8 @@ class SDTrainer(BaseSDTrainProcess):
             sync_grad_transfers()
             # fix this for multi params
             if self.train_config.optimizer != 'adafactor' and self.train_config.max_grad_norm > 0:
+                # low-precision optimizers hold the accumulated grads in a hidden buffer; clipping must see them
+                pending_grads.materialize(self.optimizer)
                 if isinstance(self.params[0], dict):
                     for i in range(len(self.params)):
                         self.accelerator.clip_grad_norm_(self.params[i]['params'], self.train_config.max_grad_norm)
@@ -2435,6 +2455,7 @@ class SDTrainer(BaseSDTrainProcess):
                     self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
+                mark_update_commit(self, 'optimizer.step()')
                 self.optimizer.step()
                 if getattr(self, 'training_extras', None) is not None:
                     self.training_extras.step()
@@ -2451,6 +2472,7 @@ class SDTrainer(BaseSDTrainProcess):
 
         # TODO Should we only step scheduler on grad step? If so, need to recalculate last step
         with self.timer('scheduler_step'):
+            mark_update_commit(self, 'the scheduler step')
             self.lr_scheduler.step()
 
         if self.embedding is not None:

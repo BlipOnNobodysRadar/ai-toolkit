@@ -1,6 +1,6 @@
 """Production train-hook/save regressions with tiny CPU tensors.
 
-Run with CUDA_VISIBLE_DEVICES='' ACCELERATE_USE_CPU=true. The integration
+Run with CUDA_VISIBLE_DEVICES=-1 ACCELERATE_USE_CPU=true (an empty value does not hide the GPU on this Windows build). The integration
 fixtures use real Accelerate, optimizer factory, SDTrainer update and base save.
 Only diffusion forward/model serialization are replaced by a scalar fixture.
 """

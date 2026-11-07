@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import tempfile
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, List, Dict, Union
@@ -14,6 +15,7 @@ import traceback
 import cv2
 import numpy as np
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection, SiglipImageProcessor
@@ -32,6 +34,7 @@ from PIL import Image, ImageFilter, ImageOps
 from PIL.ImageOps import exif_transpose
 import albumentations as A
 from toolkit.print import print_acc
+from toolkit import sampling_state
 from toolkit.accelerator import get_accelerator
 from toolkit.prompt_utils import PromptEmbeds
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
@@ -1921,6 +1924,55 @@ def _dto_extras_from_state_dict(state_dict) -> dict:
     return extras
 
 
+def _read_latent_cache(path, load):
+    """(complete, state_dict) for an existing latent cache file. An interrupted write leaves a truncated file, which
+    safetensors refuses at open from its header alone, so the disk-only path need not read the tensors."""
+    try:
+        if load:
+            state_dict = load_file(path, device='cpu')
+            return 'latent' in state_dict, state_dict
+        with safe_open(path, framework='pt', device='cpu') as f:
+            return 'latent' in f.keys(), None
+    except Exception:
+        return False, None
+
+
+def _publish_cache_file(write, path):
+    """write(temp) a new file next to path and swap the name, so a cache path never names a partial file (latent,
+    text-embedding and CLIP-vision caches; docs/STATE_MACHINES.md M8, SM-07/P-01)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix='.', suffix='.tmp', dir=os.path.dirname(path), delete=False) as f:
+            temp = f.name
+        # the handle is closed first: safetensors reopens the name (required on Windows)
+        write(temp)
+        os.replace(temp, path)
+        temp = None
+    finally:
+        if temp is not None and os.path.exists(temp):
+            os.unlink(temp)
+
+
+def _save_cache_file_atomic(state_dict, path, metadata=None):
+    _publish_cache_file(lambda temp: save_file(state_dict, temp, metadata=metadata), path)
+
+
+def _cache_file_is_usable(path):
+    """A cache file that exists and whose safetensors header opens. An interrupted write (before atomic publication,
+    or by an older version) leaves a truncated file, which safe_open refuses; it is derived data, so it is rebuilt
+    from the source instead of crashing every later run."""
+    if not os.path.exists(path):
+        return False
+    try:
+        with safe_open(path, framework='pt', device='cpu') as f:
+            f.keys()
+        return True
+    except Exception:
+        print_acc(f"Unreadable cache file {path} (interrupted write?); rebuilding it")
+        return False
+
+
 class LatentCachingFileItemDTOMixin:
     def __init__(self, *args, **kwargs):
         # if we have super, call it
@@ -2083,8 +2135,9 @@ class LatentCachingMixin:
             if to_memory:
                 print_acc(" - Keeping latents in memory")
             # move sd items to cpu except for vae. Only done on the first item that
-            # actually needs encoding so fully cached datasets don't shuffle models around
-            did_move = False
+            # actually needs encoding so fully cached datasets don't shuffle models around.
+            # Given back in the finally below, also when encoding or publishing a cache file fails (R04).
+            borrowed_device_state = None
 
             # prep (video decode, frame extraction, audio load, disk reads) is done by a
             # thread pool so the next items are ready while the current one is encoding.
@@ -2099,8 +2152,13 @@ class LatentCachingMixin:
                 prep_latent_path = prep_item.get_latent_path(recalculate=True)
                 try:
                     if os.path.exists(prep_latent_path):
-                        cached_state_dict = load_file(prep_latent_path, device='cpu') if to_memory else None
-                        return prep_item, prep_latent_path, cached_state_dict, False
+                        complete, cached_state_dict = _read_latent_cache(prep_latent_path, load=to_memory)
+                        if complete:
+                            return prep_item, prep_latent_path, cached_state_dict, False
+                        # derived data only: rebuild it from the source (same item, same bucket) instead of
+                        # trusting it or dropping the item; written atomically below when caching to disk
+                        print_acc(f"Unreadable latent cache {prep_latent_path} (interrupted write?); "
+                                  f"re-encoding {prep_item.path}")
                     # not saved to disk, load the image/video/audio
                     prep_item.load_and_process_image(prep_item.dataloader_transforms or self.transform, only_load_latents=True)
                 except Exception as e:
@@ -2115,6 +2173,7 @@ class LatentCachingMixin:
             failed_items = []
             pbar = tqdm(total=len(self.file_list), desc=f'Caching latents{" to disk" if to_disk else ""}')
             executor = ThreadPoolExecutor(max_workers=num_workers)
+            primary = None
             try:
                 pending = deque()
                 file_iter = iter(self.file_list)
@@ -2131,9 +2190,10 @@ class LatentCachingMixin:
                         failed_items.append(file_item)
                         pbar.update(1)
                         continue
-                    if needs_encode and not did_move:
-                        self.sd.set_device_state_preset('cache_latents')
-                        did_move = True
+                    if needs_encode and borrowed_device_state is None:
+                        # a preset that fails part way is put back by enter_device_preset itself
+                        # (a 1-tuple: the saved state itself may be None)
+                        borrowed_device_state = (sampling_state.enter_device_preset(self.sd, 'cache_latents'),)
                     try:
                         self._cache_one_latent(file_item, latent_path, cached_state_dict, needs_encode, to_disk, to_memory)
                     except UnusableFileError as e:
@@ -2147,17 +2207,21 @@ class LatentCachingMixin:
                     file_item.is_latent_cached = True
                     i += 1
                     pbar.update(1)
+            except BaseException as e:
+                primary = e
+                raise
             finally:
-                executor.shutdown(wait=True, cancel_futures=True)
-                pbar.close()
+                # three independent give-backs: each is attempted even if another fails (or a KeyboardInterrupt
+                # arrives while waiting for a prep thread), and none replaces the error that ended the pass
+                cleanup = [lambda: executor.shutdown(wait=True, cancel_futures=True), pbar.close]
+                if borrowed_device_state is not None:
+                    # restore device state
+                    cleanup.append(lambda: sampling_state.leave_device_preset(self.sd, borrowed_device_state[0]))
+                sampling_state.settle(cleanup, primary, 'the latent caching pass')
 
             if failed_items:
                 print_acc(f"Removed {len(failed_items)} files from the dataset that failed to load or were unusable")
                 self._remove_file_items(failed_items)
-
-            # restore device state
-            if did_move:
-                self.sd.restore_device_state()
 
     def _remove_file_items(self: 'AiToolkitDataset', items_to_remove: List['FileItemDTO']):
         # buckets hold raw indices into file_list, so removal requires remapping them
@@ -2291,7 +2355,7 @@ class LatentCachingMixin:
                 # metadata
                 meta = get_meta_for_safetensors(file_item.get_latent_info_dict())
                 os.makedirs(os.path.dirname(latent_path), exist_ok=True)
-                save_file(state_dict, latent_path, metadata=meta)
+                _save_cache_file_atomic(state_dict, latent_path, metadata=meta)
 
             if to_memory:
                 # keep it in memory; audio rides inside the latent DTO
@@ -2567,7 +2631,7 @@ class TextEmbeddingCachingMixin:
                         size = 1
                         continue  # redo this chunk one prompt at a time
                     for (path, _), part in zip(chunk, parts):
-                        part.save(path)
+                        _publish_cache_file(part.save, path)
                     del embeds, parts
                     start += len(chunk)
                 pending.clear()
@@ -2613,7 +2677,7 @@ class TextEmbeddingCachingMixin:
                                      "combined with i2v first-frame text embeddings cached from the item's own "
                                      f"crop. Offending item: {file_item.path}")
                 # only process if not saved to disk
-                encode_targets = [t for t in encode_targets if not os.path.exists(t[0])]
+                encode_targets = [t for t in encode_targets if not _cache_file_is_usable(t[0])]
                 if len(encode_targets) > 0:
                     # load if not loaded
                     if not did_move:
@@ -2675,7 +2739,7 @@ class TextEmbeddingCachingMixin:
                             else:
                                 prompt_embeds: PromptEmbeds = self.sd.encode_prompt(
                                     caption, control_images=ctrl_img, target_size=target_size)
-                            prompt_embeds.save(path)
+                            _publish_cache_file(prompt_embeds.save, path)
                             del prompt_embeds
                     elif (
                         getattr(self.sd, 'encode_first_frame_in_text_embeddings', False)
@@ -2706,7 +2770,7 @@ class TextEmbeddingCachingMixin:
                                     prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption, control_images=ctrl_img)
                             else:
                                 prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption, control_images=ctrl_img)
-                            prompt_embeds.save(path)
+                            _publish_cache_file(prompt_embeds.save, path)
                             del prompt_embeds
                         file_item.tensor = None
                     else:
@@ -2737,7 +2801,7 @@ class TextEmbeddingCachingMixin:
                         dopsd_blank_path = file_item.get_dopsd_blank_text_embedding_path(recalculate=True)
                         if dopsd_blank_path != dopsd_targets[0][0]:
                             dopsd_targets.append((dopsd_blank_path, file_item.get_dopsd_dropout_caption()))
-                    dopsd_targets = [t for t in dopsd_targets if not os.path.exists(t[0])]
+                    dopsd_targets = [t for t in dopsd_targets if not _cache_file_is_usable(t[0])]
                     if len(dopsd_targets) > 0:
                         if not did_move:
                             self.sd.set_device_state_preset('cache_text_encoder')
@@ -2762,12 +2826,13 @@ class TextEmbeddingCachingMixin:
                             ctrl_img = ctrl_img[0]
                         for path, caption in dopsd_targets:
                             prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption, control_images=ctrl_img)
-                            prompt_embeds.save(path)
+                            _publish_cache_file(prompt_embeds.save, path)
                             del prompt_embeds
                 file_item.is_text_embedding_cached = True
                 i += 1
             flush_pending()
-            # restore device state
+            # restore device state: deliberately not done here (BaseSDTrainProcess parks the text encoder once after
+            # all datasets are cached, instead of bouncing it per dataset); a failure ends the run
             # if did_move:
             #     self.sd.restore_device_state()
 
@@ -2787,9 +2852,19 @@ class CLIPCachingMixin:
             print_acc(f"Caching clip vision for {self.dataset_path}")
 
             print_acc(" - Saving clip to disk")
-            # move sd items to cpu except for vae
-            self.sd.set_device_state_preset('cache_clip')
+        # move sd items to cpu except for vae; given back also when encoding or publishing fails (R04/P-01)
+        saved_device_state = sampling_state.enter_device_preset(self.sd, 'cache_clip')
+        try:
+            self._cache_clip_vision_borrowed()
+        except BaseException as primary:
+            sampling_state.settle([lambda: sampling_state.leave_device_preset(self.sd, saved_device_state)],
+                                  primary, 'the device state after caching clip vision')
+            raise
+        # restore device state
+        sampling_state.leave_device_preset(self.sd, saved_device_state)
 
+    def _cache_clip_vision_borrowed(self: 'AiToolkitDataset'):
+        with torch.no_grad():
             # make sure the adapter has attributes
             if self.sd.adapter is None:
                 raise Exception("Error: must have an adapter to cache clip vision to disk")
@@ -2850,7 +2925,7 @@ class CLIPCachingMixin:
                 hash_str = hash_str.replace('=', '')
 
                 uncond_path = os.path.join(clip_vision_cache_path, f'uncond_{hash_str}_{i}.safetensors')
-                if os.path.exists(uncond_path):
+                if _cache_file_is_usable(uncond_path):
                     # skip it
                     unconditional_paths.append(uncond_path)
                     continue
@@ -2886,8 +2961,7 @@ class CLIPCachingMixin:
                     ('penultimate_hidden_states', clip_output.hidden_states[-2].clone().detach().cpu()),
                 ])
 
-                os.makedirs(os.path.dirname(uncond_path), exist_ok=True)
-                save_file(state_dict, uncond_path)
+                _save_cache_file_atomic(state_dict, uncond_path)
                 unconditional_paths.append(uncond_path)
 
             self.clip_vision_unconditional_cache = unconditional_paths
@@ -2905,7 +2979,7 @@ class CLIPCachingMixin:
 
                 embedding_path = file_item.get_clip_vision_embeddings_path(recalculate=True)
                 # check if it is saved to disk already
-                if not os.path.exists(embedding_path):
+                if not _cache_file_is_usable(embedding_path):
                     # load the image first
                     file_item.load_clip_image()
                     # add batch dimension
@@ -2931,8 +3005,7 @@ class CLIPCachingMixin:
                     ])
                     # metadata
                     meta = get_meta_for_safetensors(file_item.get_clip_vision_info_dict())
-                    os.makedirs(os.path.dirname(embedding_path), exist_ok=True)
-                    save_file(state_dict, embedding_path, metadata=meta)
+                    _save_cache_file_atomic(state_dict, embedding_path, metadata=meta)
 
                     del clip_image
                     del clip_output
@@ -2944,9 +3017,6 @@ class CLIPCachingMixin:
             # flush every 100
             # if i % 100 == 0:
             #     flush()
-
-        # restore device state
-        self.sd.restore_device_state()
 
 
 

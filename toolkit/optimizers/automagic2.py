@@ -62,6 +62,9 @@ class Automagic2(torch.optim.Optimizer):
         total = sum(p.numel() for g in self.param_groups for p in g["params"])
         print(f"Total training paramiters: {total:,}")
 
+    # Every update happens inside backward; the trainer refuses multi-backward accumulation for it.
+    steps_in_backward = True
+
     # ------------------------------------------------------------------ utils
 
     @staticmethod

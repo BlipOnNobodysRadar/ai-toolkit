@@ -361,19 +361,134 @@ def create_scheduler(optimizer, name, total_steps, kwargs=None):
     return klass(optimizer, **extra)
 
 
+def training_mode(optimizer):
+    """True/False for an optimizer with a train/eval mode (schedule-free), None if it has none or hides it.
+
+    Two layouts exist in the vendored optimizers: one attribute on the optimizer (ScheduleFreeWrapper,
+    ADOPTScheduleFree, FADOPTScheduleFree, AMUSE; not serialized by state_dict) or the mode in every param group
+    (RAdamScheduleFree, AdamWScheduleFreePlus, NorMuonScheduleFree, SODA; serialized with the groups). The attribute
+    wins: FADOPTScheduleFree also carries an unused 'train_mode': True group default."""
+    raw = getattr(optimizer, "optimizer", optimizer)  # AcceleratedOptimizer
+    mode = getattr(raw, "train_mode", None)
+    if isinstance(mode, bool):
+        return mode
+    groups = getattr(raw, "param_groups", None) or []
+    if groups and all("train_mode" in g for g in groups):
+        modes = {bool(g["train_mode"]) for g in groups}
+        return modes.pop() if len(modes) == 1 else None
+    return None
+
+
+def enter_training_mode(optimizer):
+    """Put a schedule-free optimizer in train mode before the first step (docs/STATE_MACHINES.md, C12).
+
+    Construction leaves most of them in eval mode, and step() raises until train(). The weights the trainer holds at
+    this point are training coordinates (y): toolkit checkpoints are written from the training loop, which never runs
+    in eval mode. A per-group mode is serialized, so train() is exact either way (a no-op for a train-mode payload).
+    An optimizer-level mode is not serialized: after loading a checkpoint it reads eval although the weights are y,
+    and train() would move them again (x -> y), so only the flag is set. A fresh optimizer has no z state, so for it
+    both are the same flag flip."""
+    raw = getattr(optimizer, "optimizer", optimizer)
+    if not (callable(getattr(raw, "train", None)) and callable(getattr(raw, "eval", None))):
+        return
+    if isinstance(getattr(raw, "train_mode", None), bool):
+        raw.train_mode = True
+        return
+    groups = getattr(raw, "param_groups", None) or []
+    if groups and all("train_mode" in g for g in groups):
+        raw.train()
+
+
+def _set_training_mode(raw, mode):
+    if isinstance(getattr(raw, "train_mode", None), bool):
+        raw.train_mode = mode
+    else:
+        for group in raw.param_groups:
+            group["train_mode"] = mode
+
+
+def _rng_state(params):
+    """The CPU RNG and the RNG of each CUDA device holding one of params (no other device is touched)."""
+    devices = sorted({p.device.index or 0 for p in params if p.device.type == "cuda"})
+    return torch.get_rng_state(), [(d, torch.cuda.get_rng_state(d)) for d in devices]
+
+
+def _set_rng_state(state):
+    torch.set_rng_state(state[0])
+    for device, cuda_state in state[1]:
+        torch.cuda.set_rng_state(cuda_state, device)
+
+
 @contextmanager
 def evaluation_optimizer(optimizer):
+    """Evaluation coordinates (schedule-free x) for the body, then the training values back exactly.
+
+    eval() -> train() is not an identity in bf16/fp16: both interpolate in fp32 and round back (stochastically), so
+    every validation pass moved the training weights (docs/STATE_MACHINES.md, C12). For an optimizer whose mode can
+    be read (training_mode) and that is training: exact CPU copies of every optimized parameter are taken before
+    anything changes, the optimizer's own eval() makes the evaluation weights, and afterwards the copies are written
+    back in place (same Parameter objects and storage; gradients untouched) and the training mode is set again,
+    instead of calling train(). The stochastic-rounding draws made by eval() are given back to the RNG. The vendored
+    schedule-free eval()/train() change only parameter values, the mode and the RNG (source-read); other
+    side effects of arbitrary optimizers are not covered. Costs host memory and one copy each way per scope.
+    If a copy cannot be written back, the optimizer is marked out of train mode (the weights may be a mix) and the
+    error says to stop and reload from the last checkpoint: nothing else holds the training values.
+
+    Already evaluating (a nested scope): nothing to switch or give back. Mode unreadable: the old eval() ... train().
+    """
     has_pair = (
         callable(getattr(optimizer, "eval", None))
         and callable(getattr(optimizer, "train", None))
     )
-    if has_pair:
+    entry = training_mode(optimizer) if has_pair else None
+    if not has_pair or entry is False:
+        yield optimizer
+        return
+    if entry is None:
         optimizer.eval()
+        try:
+            yield optimizer
+        finally:
+            optimizer.train()
+        return
+    from toolkit.sampling_state import settle
+    raw = getattr(optimizer, "optimizer", optimizer)
+    params = [p for group in raw.param_groups for p in group["params"]]
+    saved = [p.detach().to("cpu", copy=True) for p in params]  # all copies exist before anything changes
+    rng = _rng_state(params)
+
+    def give_back():
+        failed = []
+        with torch.no_grad():
+            for p, value in zip(params, saved):
+                try:  # each restore is independent of the others
+                    p.copy_(value)
+                except BaseException as e:
+                    failed.append(e)
+        if failed:
+            # mixed weights are neither x nor y: never leave them marked as training (a partial eval() may not have
+            # cleared the flag yet)
+            _set_training_mode(raw, False)
+            for e in failed[1:]:
+                failed[0].add_note(f"restoring another parameter also failed: {e!r}")
+            failed[0].add_note(f"could not restore {len(failed)} of {len(params)} parameters to their training "
+                               f"values; the optimizer is left out of train mode. Stop and reload from the last "
+                               f"checkpoint.")
+            raise failed[0]
+        _set_training_mode(raw, True)
+
+    try:
+        optimizer.eval()
+        _set_rng_state(rng)
+    except BaseException as primary:  # a partial eval() is undone from the copies too
+        settle([give_back, lambda: _set_rng_state(rng)], primary, "the training weights")
+        raise
     try:
         yield optimizer
-    finally:
-        if has_pair:
-            optimizer.train()
+    except BaseException as primary:
+        settle([give_back], primary, "the training weights")
+        raise
+    give_back()
 
 
 def lora_plus_groups(groups, network, default_lr, ratio, text_encoder_ratio=None):

@@ -17,9 +17,13 @@ continuation state (or an explicit unsupported-mode reason). Older code rejects
 new versions instead of silently dropping the pending work. Changed LR/configuration,
 step mismatches, unsupported versions, and inconsistent groups are rejected.
 RAWR optimizer load/save errors propagate instead of silently continuing.
-Resuming model metadata beyond step zero also requires its optimizer.pt;
-weights-only adaptation should use a new output folder/pretrained LoRA input.
-Other schedulers retain their existing behavior and checkpoint payloads.
+Resuming model metadata beyond step zero also requires its optimizer.pt, and
+that optimizer state must actually load: a changed network shape (LoRA rank)
+skips the optimizer load and is refused rather than restarting RAWR's cycle.
+Weights-only adaptation should use a new output folder/pretrained LoRA input.
+A folder holding a committed pair refuses training without RAWR (the manifest
+would stay the resume point and a later RAWR resume would rewind past it).
+Other schedulers retain their existing checkpoint payloads.
 
 Periodic saves occur before the training loop increments its zero-based label.
 New RAWR metadata records the completed loop count so resume does not repeat
@@ -30,10 +34,40 @@ is enabled. RAWR continues to advance once per loop iteration, matching the
 existing scheduler horizon.
 
 Fixed-count gradient accumulation is restored after startup clears gradients
-and prepares Accelerate. Periodic saves preserve gradients in the running
-process too. Changing either accumulation setting is rejected. Whole-epoch
+and prepares Accelerate. Pending gradients are read wherever they live,
+including the stochastic-rounding buffer (`p._accum_grad`) of low-precision
+optimizers, and restored to the same place. Periodic saves, UI saves and UI
+samples keep the unfinished window in the running process for every scheduler.
+Changing either accumulation setting is rejected. Whole-epoch
 accumulation (`gradient_accumulation_steps: -1`) cannot safely resume without
-the dataset iterator and is rejected explicitly.
+the dataset iterator and is rejected explicitly. A pair whose accumulation
+position restore would reject is refused at save time instead of committed.
+
+A CUDA OOM before any update of the step began skips the step and its whole
+accumulation window: pending gradients are dropped and the next step starts a
+fresh window, so no update averages a partial window. The skipped step counts
+as completed (it consumed its batch and seeds as the uninterrupted run did), so
+a save at that step resumes at the next one. With whole-epoch accumulation the
+discarded window is the epoch so far, and the next update covers only the
+batches after the OOM. An OOM after `optimizer.step()`, the scheduler step or a
+fused backward update began aborts training before anything is saved. Fused
+optimizers (Automagic2, Automagic3/4 with the default `fused: true`,
+AdamConvRot/AutomagicEXPERIMENT with `fused: true`) refuse any multi-backward
+accumulation. See docs/STATE_MACHINES.md (M1, M2).
+
+**Other schedulers do not continue an accumulation window.** Their resume
+starts the counter at 1 with no pending gradients. With
+`gradient_accumulation_steps` greater than one, a resume from a mid-window save
+(every periodic save when `save_every` is a multiple of it) therefore loses the
+unfinished window and shifts later optimizer boundaries. Per-step reseeding
+keeps the batch order and per-step seeds, but not the update grouping, and
+multi-resolution noise (seeded from the step and this counter) differs too. Use
+RAWR pairs for an exact accumulation continuation. Whole-epoch accumulation
+(`-1`, never combined with `gradient_accumulation > 1`: the config refuses it)
+updates on each epoch's last batch and applies the run's final partial epoch; a
+non-RAWR resume is exact only from a save made right after an epoch update
+(`tests/test_resume_rng.py` case `whole_epoch`), and a mid-epoch save loses that
+epoch's pending window. A resume with accumulation prints this limit.
 
 RAWR optimizer writes use a same-directory temporary file, flush/fsync, and
 atomic replacement. A serialization or replacement failure leaves the previous

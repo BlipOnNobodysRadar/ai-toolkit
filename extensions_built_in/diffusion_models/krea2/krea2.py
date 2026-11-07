@@ -352,6 +352,8 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
         # deactivate lora during training
         self.assistant_lora.multiplier = -1.0
         self.assistant_lora.is_active = False
+        # parked off the device until sampling borrows it (toolkit/sampling_state.py)
+        self.assistant_lora.force_to('cpu', self.torch_dtype)
 
         # tell the model to invert assistant on inference since we want remove lora effects
         self.invert_assistant_lora = True

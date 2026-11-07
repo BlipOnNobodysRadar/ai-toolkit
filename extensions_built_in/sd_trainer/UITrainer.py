@@ -1,6 +1,7 @@
 from collections import OrderedDict
 import os
 import sqlite3
+from toolkit.ui_run_fence import RunFence
 import asyncio
 import concurrent.futures
 from extensions_built_in.sd_trainer.SDTrainer import SDTrainer
@@ -25,6 +26,9 @@ class UITrainer(SDTrainer):
         print(f"Job ID: \"{self.job_id}\"")
         if self.job_id is None:
             raise Exception("AITK_JOB_ID not set")
+        # a UI run id fences every Job read/write to this launch; a fenced run must own its row to start
+        self.fence = RunFence(self.job_id)
+        self.fence.require_owned(self.sqlite_db_path)
         self.is_stopping = False
         # Create a thread pool for database operations
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -106,13 +110,15 @@ class UITrainer(SDTrainer):
         return conn
 
     def should_stop(self):
+        if self.fence.superseded:  # a fenced write matched no row: this run no longer owns the job
+            return True
         def _check_stop():
             with self._db_connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT stop FROM Job WHERE id = ?", (self.job_id,))
+                    f"SELECT stop FROM Job WHERE {self.fence.job_clause}", self.fence.params())
                 stop = cursor.fetchone()
-                return False if stop is None else stop[0] == 1
+                return self.fence.flag(stop, stop=True)
 
         return _check_stop()
     
@@ -121,22 +127,23 @@ class UITrainer(SDTrainer):
             with self._db_connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT return_to_queue FROM Job WHERE id = ?", (self.job_id,))
+                    f"SELECT return_to_queue FROM Job WHERE {self.fence.job_clause}", self.fence.params())
                 return_to_queue = cursor.fetchone()
-                return False if return_to_queue is None else return_to_queue[0] == 1
+                return self.fence.flag(return_to_queue, stop=False)
 
         return _check_return_to_queue()
 
     def maybe_stop(self):
         if self.should_stop():
+            # before the blocking write: the stop watcher must not interrupt this graceful shutdown
+            self.is_stopping = True
             self._run_async_operation(
                 self._update_status("stopped", "Job stopped"))
-            self.is_stopping = True
             raise Exception("Job stopped")
         if self.should_return_to_queue():
+            self.is_stopping = True
             self._run_async_operation(
                 self._update_status("queued", "Job queued"))
-            self.is_stopping = True
             raise Exception("Job returning to queue")
 
     async def _update_key(self, key, value):
@@ -155,9 +162,10 @@ class UITrainer(SDTrainer):
                         value_to_insert = str(value)
 
                     # Use parameterized query for both the column name and value
-                    update_query = f"UPDATE Job SET {key} = ? WHERE id = ?"
+                    update_query = f"UPDATE Job SET {key} = ? WHERE {self.fence.job_clause}"
                     cursor.execute(
-                        update_query, (value_to_insert, self.job_id))
+                        update_query, self.fence.params(value_to_insert))
+                    self.fence.wrote(cursor)
                 finally:
                     cursor.execute("COMMIT")
 
@@ -184,14 +192,16 @@ class UITrainer(SDTrainer):
                 try:
                     if info is not None:
                         cursor.execute(
-                            "UPDATE Job SET status = ?, info = ? WHERE id = ?",
-                            (status, info, self.job_id)
+                            f"UPDATE Job SET status = ?, info = ? WHERE {self.fence.job_clause}",
+                            self.fence.params(status, info)
                         )
+                        self.fence.wrote(cursor)
                     else:
                         cursor.execute(
-                            "UPDATE Job SET status = ? WHERE id = ?",
-                            (status, self.job_id)
+                            f"UPDATE Job SET status = ? WHERE {self.fence.job_clause}",
+                            self.fence.params(status)
                         )
+                        self.fence.wrote(cursor)
                 finally:
                     cursor.execute("COMMIT")
 

@@ -78,6 +78,8 @@ class EncodedAnchor:
 
 
 class TrainSliderProcessOld(BaseSDTrainProcess):
+    # hook_train_loop zeroes gradients and steps every iteration (docs/STATE_MACHINES.md M27)
+    supports_gradient_accumulation_steps = False
     def __init__(self, process_id: int, job, config: OrderedDict):
         super().__init__(process_id, job, config)
         self.step_num = 0

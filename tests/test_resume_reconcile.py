@@ -58,8 +58,9 @@ def test_unsupported_mode_still_warns():
 
 def trainer_for_save(snr):
     p = torch.nn.Parameter(torch.zeros(2))
+    # a periodic save at step 4 with gradient_accumulation_steps 1: the loop reset the counter to 0 for the update
     return SimpleNamespace(train_config=SimpleNamespace(gradient_accumulation_steps=1, gradient_accumulation=1),
-                           grad_accumulation_step=1, step_num=4, optimizer=torch.optim.SGD([p], lr=0.1),
+                           grad_accumulation_step=0, step_num=4, optimizer=torch.optim.SGD([p], lr=0.1),
                            snr_gos=snr, _rawr_stochastic=None)
 
 
@@ -109,7 +110,8 @@ def test_identity_follows_the_caption_source_actually_read(tmp_path):
 @pytest.mark.parametrize('rawr', [True, False])
 def test_ui_save_keeps_unfinished_microbatches_for_rawr(rawr):
     # A UI "save now" mid-window (legacy gradient_accumulation_steps) must checkpoint the pending gradients, not
-    # zero them first; other schedulers keep upstream's clearing.
+    # zero them first. Since 6 Nov 2026 every scheduler keeps them: upstream's clearing dropped the unfinished
+    # window from the uninterrupted run too (docs/STATE_MACHINES.md, SM-03).
     from extensions_built_in.sd_trainer.DiffusionTrainer import DiffusionTrainer
     p = torch.nn.Parameter(torch.zeros(2))
     p.grad = torch.ones(2)
@@ -123,7 +125,4 @@ def test_ui_save_keeps_unfinished_microbatches_for_rawr(rawr):
     t.ensure_params_requires_grad = lambda *args, **kwargs: None
     t.save = lambda step: seen.append(None if p.grad is None else p.grad.clone())
     t.maybe_save()
-    if rawr:
-        assert seen[0] is not None and torch.equal(seen[0], torch.ones(2)) and torch.equal(p.grad, torch.ones(2))
-    else:
-        assert seen[0] is None or not seen[0].any()
+    assert seen[0] is not None and torch.equal(seen[0], torch.ones(2)) and torch.equal(p.grad, torch.ones(2))

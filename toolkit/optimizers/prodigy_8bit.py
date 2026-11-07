@@ -3,9 +3,10 @@ import torch
 import torch.distributed as dist
 from torch.optim import Optimizer
 from toolkit.optimizers.optimizer_utils import copy_stochastic, Auto8bitTensor, stochastic_grad_accummulation
+from toolkit.optimizers.pending_grads import PendingGradZeroGradMixin
 
 
-class Prodigy8bit(Optimizer):
+class Prodigy8bit(PendingGradZeroGradMixin, Optimizer):
     r"""
     Implements Adam with Prodigy step-sizes.
     Handles stochastic rounding for various precisions as well as stochastic gradient accumulation.

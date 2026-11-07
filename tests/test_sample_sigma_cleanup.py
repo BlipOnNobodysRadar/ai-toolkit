@@ -3,6 +3,9 @@
 Execute the actual install/use/cleanup region from each generate_images method,
 with lightweight CPU objects, and inject failure after the real per-image sigma
 assignment. Heavy model-loading setup is outside this regression's scope.
+Since 6 Nov 2026 that region lives in _generate_images_borrowed (generate_images
+borrows and returns training state around it), and the step-hook unwrap is in
+the same finally as the sigma override's.
 """
 import ast
 import copy
@@ -15,9 +18,9 @@ import torch
 from toolkit.sample_sigmas import install_sample_sigma_override
 
 
-def _sample_region(relative_path):
+def _sample_region(relative_path, unwrap_step_hooks=lambda: None):
     tree = ast.parse((Path(__file__).resolve().parents[1] / relative_path).read_text(encoding='utf-8'))
-    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'generate_images')
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == '_generate_images_borrowed')
     start = next(i for i, n in enumerate(fn.body) if isinstance(n, ast.Assign)
                  and any(isinstance(t, ast.Name) and t.id == 'unwrap_sigma_override' for t in n.targets))
     end = next(i for i in range(start + 1, len(fn.body))
@@ -27,7 +30,7 @@ def _sample_region(relative_path):
     region.body = copy.deepcopy(fn.body[start:end + 1])
     namespace = {'torch': torch, 'tqdm': lambda it, **kwargs: it,
                  'install_sample_sigma_override': install_sample_sigma_override,
-                 'unwrap_step_hooks': lambda: None}
+                 'unwrap_step_hooks': unwrap_step_hooks}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[region], type_ignores=[])), relative_path, 'exec'), namespace)
     return namespace['probe']
 
@@ -70,9 +73,12 @@ def test_failed_preview_restores_scheduler_class(relative_path, inherited):
         def __exit__(self, *args):
             return False
 
+    unwrapped = []
     try:
         with pytest.raises(RuntimeError, match='preview failure'):
-            _sample_region(relative_path)(holder, SimpleNamespace(scheduler=scheduler), [BadPreview()], Network())
+            _sample_region(relative_path, lambda: unwrapped.append(True))(
+                holder, SimpleNamespace(scheduler=scheduler), [BadPreview()], Network())
+        assert unwrapped == [True]  # the step-hook wrappers are removed on failure too
         assert cls.set_timesteps is original
         assert cls.__dict__.get('set_timesteps') is own_method
         assert holder.sample_sigmas is None

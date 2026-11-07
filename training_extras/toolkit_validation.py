@@ -57,6 +57,8 @@ def validate(trainer, phase='periodic'):
     network = trainer.network
     was_training = trainer.sd.unet.training
     old_multiplier = network.multiplier if network is not None else None
+    # `with network` below forces is_active True then False; give back the entry value instead
+    was_active = network.is_active if network is not None else None
     results = []
     try:
         trainer.sd.unet.eval()
@@ -98,5 +100,7 @@ def validate(trainer, phase='periodic'):
         with path.open('a',encoding='utf-8') as f:
             f.write(json.dumps({'step':trainer.step_num,'phase':phase,'raw_metrics':results})+'\n')
     finally:
-        if network is not None: network.multiplier = old_multiplier
+        if network is not None:
+            network.multiplier = old_multiplier
+            network.is_active = was_active
         trainer.sd.unet.train(was_training)

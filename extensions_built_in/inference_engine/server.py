@@ -15,8 +15,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from toolkit.models.registry import describe_archs
+from toolkit.sampling_state import settle
 
-from .engine import END, Engine
+from .engine import END, Engine, EngineBusy, EngineClosed
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -57,9 +58,12 @@ def create_app(engine: Engine, token: Optional[str] = None) -> FastAPI:
     @app.post("/unload")
     async def unload(request: Request):
         check_auth(request)
-        if engine.current is not None:
+        # the engine decides busy under the lock its generations hold; a check here could go stale before the
+        # unload runs on its worker thread
+        try:
+            await asyncio.to_thread(engine.unload)
+        except EngineBusy:
             raise HTTPException(status_code=409, detail="busy")
-        await asyncio.to_thread(engine.unload)
         return {"ok": True}
 
     @app.post("/assets")
@@ -93,22 +97,35 @@ def create_app(engine: Engine, token: Optional[str] = None) -> FastAPI:
         body = await request.json()
         model = body.get("model")
         sample = body.get("sample") or {}
-        if not isinstance(model, dict) or not model.get("arch"):
-            raise HTTPException(status_code=400, detail="model.arch is required")
+        if not isinstance(model, dict) or not isinstance(model.get("arch"), str) or not model.get("arch"):
+            raise HTTPException(status_code=400, detail="model.arch is required (a string)")
+        if not isinstance(sample, dict):
+            raise HTTPException(status_code=400, detail="sample must be an object")
         if body.get("wait"):
             # plain JSON mode for scripts: block until the job is done, drop frames
-            job = engine.submit(model, sample, {"latents": "none"})
+            job = _submit(model, sample, {"latents": "none"})
             q = job.subscribe(replay=False)
-            while True:
-                frame = await asyncio.to_thread(q.get)
-                if frame is END:
-                    break
+            try:
+                while True:
+                    frame = await asyncio.to_thread(q.get)
+                    if frame is END:
+                        break
+            finally:
+                job.unsubscribe(q)
             return JSONResponse(job.info(), status_code=200 if job.status == "done" else 500)
 
-        job = engine.submit(model, sample, body.get("stream"))
+        job = _submit(model, sample, body.get("stream"))
         # a dropped connection (page reload) must not cancel: the client
         # reattaches via /stream/{id}; cancelling is explicit (/cancel)
         return _stream_job(job, cancel_on_disconnect=False)
+
+    def _submit(model, sample, stream):
+        try:
+            return engine.submit(model, sample, stream)
+        except EngineClosed:
+            raise HTTPException(status_code=503, detail="engine stopped")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     @app.get("/stream/{request_id}")
     async def stream(request: Request, request_id: str):
@@ -132,6 +149,9 @@ def create_app(engine: Engine, token: Optional[str] = None) -> FastAPI:
                         break
                     yield frame
             finally:
+                # a disconnected reader stops receiving frames, and the worker thread blocked on q.get is woken
+                # instead of waiting for the job's next frame; the job keeps running
+                job.unsubscribe(q)
                 if cancel_on_disconnect and job.status in ("queued", "running"):
                     engine.cancel(job.request_id)
 
@@ -152,19 +172,30 @@ def serve_in_thread(app, host: str = "127.0.0.1", port: int = 0, timeout: float 
     import uvicorn
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((host, port))
-    sock.listen(64)
-    host, port = sock.getsockname()[:2]
-    config = uvicorn.Config(app, log_level="warning", access_log=False, timeout_keep_alive=600)
-    server = uvicorn.Server(config)
-    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True, name="engine-http")
-    thread.start()
-    deadline = time.time() + timeout
-    while not server.started and time.time() < deadline:
-        if not thread.is_alive():
-            raise RuntimeError("engine http server died on startup")
-        time.sleep(0.05)
-    if not server.started:
-        raise RuntimeError("engine http server failed to start")
+    server = thread = None
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((host, port))
+        sock.listen(64)
+        host, port = sock.getsockname()[:2]
+        config = uvicorn.Config(app, log_level="warning", access_log=False, timeout_keep_alive=600)
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True, name="engine-http")
+        thread.start()
+        deadline = time.time() + timeout
+        while not server.started and time.time() < deadline:
+            if not thread.is_alive():
+                raise RuntimeError("engine http server died on startup")
+            time.sleep(0.05)
+        if not server.started:
+            raise RuntimeError("engine http server failed to start")
+    except BaseException as primary:
+        # nothing was handed to the caller: stop what started here (a timeout, or a stop during the wait)
+        def stop_thread():
+            if server is not None:
+                server.should_exit = True
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=10)
+        settle([stop_thread, sock.close], primary, 'the engine http server')
+        raise
     return server, thread, host, port

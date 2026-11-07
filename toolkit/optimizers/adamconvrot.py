@@ -53,7 +53,8 @@ accumulation. Default is the traditional unfused step, where low-precision
 post-accumulate-grad hook that sums in fp32 and stochastically rounds back
 into the param's dtype (optimizer_utils.stochastic_grad_accummulation), so
 small per-micro-batch grads are not lost to round-to-nearest; .step()
-consumes that buffer. Note the trainer's grad clipping does not see it.
+consumes that buffer. The trainer moves the buffer back into .grad before grad
+clipping (toolkit.optimizers.pending_grads).
 """
 
 import math
@@ -64,6 +65,7 @@ from toolkit.optimizers.optimizer_utils import (
     copy_stochastic,
     stochastic_grad_accummulation,
 )
+from toolkit.optimizers.pending_grads import PendingGradZeroGradMixin
 from toolkit.util.convrot_quant import (
     _import_triton,
     _triton_available,
@@ -363,7 +365,7 @@ def _get_kernel():
 # ------------------------------------------------------------------ optimizer
 
 
-class AdamConvRot(torch.optim.Optimizer):
+class AdamConvRot(PendingGradZeroGradMixin, torch.optim.Optimizer):
     def __init__(
         self,
         params,
@@ -411,6 +413,11 @@ class AdamConvRot(torch.optim.Optimizer):
                             stochastic_grad_accummulation
                         )
                     )
+
+    @property
+    def steps_in_backward(self):
+        # fused updates happen inside backward; the trainer refuses multi-backward accumulation for them
+        return self.fused
 
     def _rebuild_group_index(self):
         # the hooks cannot rely on group-dict identity: load_state_dict

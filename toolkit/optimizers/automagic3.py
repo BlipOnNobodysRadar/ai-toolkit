@@ -5,8 +5,10 @@ NOTE: This is experimental and under active development; expect breaking changes
 from typing import List
 import torch
 
+from toolkit.optimizers.pending_grads import PendingGradZeroGradMixin
 
-class Automagic3(torch.optim.Optimizer):
+
+class Automagic3(PendingGradZeroGradMixin, torch.optim.Optimizer):
     """
     Automagic v3.
 
@@ -236,6 +238,11 @@ class Automagic3(torch.optim.Optimizer):
 
         total = sum(p.numel() for g in self.param_groups for p in g["params"])
         print(f"Total training paramiters: {total:,}")
+
+    @property
+    def steps_in_backward(self) -> bool:
+        # fused updates happen inside backward; the trainer refuses multi-backward accumulation for them
+        return bool(self.fused)
 
     # ------------------------------------------------------------------ utils
 

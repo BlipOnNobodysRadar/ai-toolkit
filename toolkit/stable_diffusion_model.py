@@ -68,6 +68,7 @@ from toolkit.util.quantize import quantize, get_qtype
 from toolkit.accelerator import get_accelerator, unwrap_model
 from typing import TYPE_CHECKING
 from toolkit.print import print_acc
+from toolkit import sampling_state
 from diffusers import FluxFillPipeline
 from transformers import AutoModel, AutoTokenizer, Gemma2Model, Qwen2Model, LlamaModel
 from toolkit.basic import flush
@@ -1151,6 +1152,8 @@ class StableDiffusion:
                 # invert and disable during training
                 self.assistant_lora.multiplier = -1.0
                 self.assistant_lora.is_active = False
+                # parked off the device until sampling borrows it (toolkit/sampling_state.py)
+                self.assistant_lora.force_to('cpu', self.torch_dtype)
                 
         if self.model_config.inference_lora_path is not None:
             print_acc("Loading inference lora")
@@ -1158,6 +1161,8 @@ class StableDiffusion:
                 self.model_config.inference_lora_path, self)
             # disable during training
             self.assistant_lora.is_active = False
+            # parked off the device until sampling borrows it (toolkit/sampling_state.py)
+            self.assistant_lora.force_to('cpu', self.torch_dtype)
 
         if self.is_pixart and self.vae_scale_factor == 16:
             # TODO make our own pipeline?
@@ -1243,46 +1248,14 @@ class StableDiffusion:
             sampler=None,
             pipeline: Union[None, StableDiffusionPipeline, StableDiffusionXLPipeline] = None,
     ):
-        network = unwrap_model(self.network)
-        merge_multiplier = 1.0
         flush()
-        # if using assistant, unfuse it
-        if self.model_config.assistant_lora_path is not None:
-            print_acc("Unloading assistant lora")
-            if self.invert_assistant_lora:
-                self.assistant_lora.is_active = True
-                # move weights on to the device
-                self.assistant_lora.force_to(self.device_torch, self.torch_dtype)
-            else:
-                self.assistant_lora.is_active = False
-                
-        if self.model_config.inference_lora_path is not None:
-            print_acc("Loading inference lora")
-            self.assistant_lora.is_active = True
-            # move weights on to the device
-            self.assistant_lora.force_to(self.device_torch, self.torch_dtype)
+        # the training state generation borrows (assistant lora, network mode/multiplier/merge, device preset, rng)
+        # is given back even when generation fails (toolkit/sampling_state.py)
+        with sampling_state.borrowed(self, image_configs, BlankNetwork(), move_unet_before_merge=True) as sampling:
+            self._generate_images_borrowed(image_configs, sampler, pipeline, sampling.network)
+        flush()
 
-        if network is not None:
-            network.eval()
-            # check if we have the same network weight for all samples. If we do, we can merge in th
-            # the network to drastically speed up inference
-            unique_network_weights = set([x.network_multiplier for x in image_configs])
-            if len(unique_network_weights) == 1 and network.can_merge_in:
-                # make sure it is on device before merging. 
-                self.unet.to(self.device_torch)
-                can_merge_in = True
-                merge_multiplier = unique_network_weights.pop()
-                network.merge_in(merge_weight=merge_multiplier)
-        else:
-            network = BlankNetwork()
-
-        self.save_device_state()
-        self.set_device_state_preset('generate')
-
-        # save current seed state for training
-        rng_state = torch.get_rng_state()
-        cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-
+    def _generate_images_borrowed(self, image_configs: List[GenerateImageConfig], sampler, pipeline, network):
         if pipeline is None:
             noise_scheduler = self.noise_scheduler
             if sampler is not None:
@@ -1472,9 +1445,6 @@ class StableDiffusion:
                 refiner_pipeline.set_progress_bar_config(disable=True)
                 flush()
 
-            start_multiplier = 1.0
-            if network is not None:
-                start_multiplier = network.multiplier
 
             # pipeline.to(self.device_torch)
 
@@ -1830,47 +1800,15 @@ class StableDiffusion:
                     if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):
                         self.adapter.clear_memory()
 
-            unwrap_step_hooks()
         finally:
+            # instance-level scheduler wrappers must not outlive a failed preview either
+            unwrap_step_hooks()
             unwrap_sigma_override()
         # clear pipeline and cache to reduce vram usage
         del pipeline
         if refiner_pipeline is not None:
             del refiner_pipeline
         torch.cuda.empty_cache()
-
-        # restore training state
-        torch.set_rng_state(rng_state)
-        if cuda_rng_state is not None:
-            torch.cuda.set_rng_state(cuda_rng_state)
-
-        self.restore_device_state()
-        if network is not None:
-            network.train()
-            network.multiplier = start_multiplier
-
-        self.unet.to(self.device_torch, dtype=self.torch_dtype)
-        if network.is_merged_in:
-            network.merge_out(merge_multiplier)
-        # self.tokenizer.to(original_device_dict['tokenizer'])
-
-        # refuse loras
-        if self.model_config.assistant_lora_path is not None:
-            print_acc("Loading assistant lora")
-            if self.invert_assistant_lora:
-                self.assistant_lora.is_active = False
-                # move weights off the device
-                self.assistant_lora.force_to('cpu', self.torch_dtype)
-            else:
-                self.assistant_lora.is_active = True
-                
-        if self.model_config.inference_lora_path is not None:
-            print_acc("Unloading inference lora")
-            self.assistant_lora.is_active = False
-            # move weights off the device
-            self.assistant_lora.force_to('cpu', self.torch_dtype)
-
-        flush()
 
     def get_latent_noise(
             self,

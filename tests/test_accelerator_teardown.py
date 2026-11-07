@@ -38,5 +38,5 @@ def test_release_drops_prepared_objects():
 
 def test_run_releases_after_done_hook():
     base = importlib.import_module('jobs.process.BaseSDTrainProcess').BaseSDTrainProcess
-    source = inspect.getsource(base.run)
+    source = inspect.getsource(base._run_training)  # run() is the observer-cleanup wrapper (R01)
     assert source.rindex('self.release_accelerator_state()') > source.rindex('self.done_hook()')

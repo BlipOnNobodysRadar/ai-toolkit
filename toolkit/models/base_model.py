@@ -44,6 +44,7 @@ from toolkit.accelerator import get_accelerator, unwrap_model
 from typing import TYPE_CHECKING
 from toolkit.print import print_acc
 from toolkit.basic import flush
+from toolkit import sampling_state
 
 if TYPE_CHECKING:
     from toolkit.lora_special import LoRASpecialNetwork
@@ -459,47 +460,14 @@ class BaseModel:
             pipeline: Union[None, StableDiffusionPipeline,
                             StableDiffusionXLPipeline] = None,
     ):
-        network = self.network
-        merge_multiplier = 1.0
         flush()
-        # if using assistant, unfuse it
-        if self.model_config.assistant_lora_path is not None:
-            print_acc("Unloading assistant lora")
-            if self.invert_assistant_lora:
-                self.assistant_lora.is_active = True
-                # move weights on to the device
-                self.assistant_lora.force_to(
-                    self.device_torch, self.torch_dtype)
-            else:
-                self.assistant_lora.is_active = False
+        # the training state generation borrows (assistant lora, network mode/multiplier/merge, device preset, rng)
+        # is given back even when generation fails (toolkit/sampling_state.py)
+        with sampling_state.borrowed(self, image_configs, BlankNetwork()) as sampling:
+            self._generate_images_borrowed(image_configs, pipeline, sampling.network)
+        flush()
 
-        if self.model_config.inference_lora_path is not None:
-            print_acc("Loading inference lora")
-            self.assistant_lora.is_active = True
-            # move weights on to the device
-            self.assistant_lora.force_to(self.device_torch, self.torch_dtype)
-
-        if network is not None:
-            network = unwrap_model(self.network)
-            network.eval()
-            # check if we have the same network weight for all samples. If we do, we can merge in th
-            # the network to drastically speed up inference
-            unique_network_weights = set(
-                [x.network_multiplier for x in image_configs])
-            if len(unique_network_weights) == 1 and network.can_merge_in:
-                can_merge_in = True
-                merge_multiplier = unique_network_weights.pop()
-                network.merge_in(merge_weight=merge_multiplier)
-        else:
-            network = BlankNetwork()
-
-        self.save_device_state()
-        self.set_device_state_preset('generate')
-
-        # save current seed state for training
-        rng_state = torch.get_rng_state()
-        cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-
+    def _generate_images_borrowed(self, image_configs: List[GenerateImageConfig], pipeline, network):
         if pipeline is None:
             pipeline = self.get_generation_pipeline()
             try:
@@ -511,10 +479,6 @@ class BaseModel:
         from toolkit.sample_sigmas import install_sample_sigma_override
         unwrap_sigma_override = install_sample_sigma_override(self, pipeline, image_configs)
         try:
-
-            start_multiplier = 1.0
-            if network is not None:
-                start_multiplier = network.multiplier
 
             # pipeline.to(self.device_torch)
 
@@ -790,44 +754,13 @@ class BaseModel:
                     if self.adapter is not None and isinstance(self.adapter, ReferenceAdapter):
                         self.adapter.clear_memory()
 
-            unwrap_step_hooks()
         finally:
+            # instance-level scheduler wrappers must not outlive a failed preview either
+            unwrap_step_hooks()
             unwrap_sigma_override()
         # clear pipeline and cache to reduce vram usage
         del pipeline
         torch.cuda.empty_cache()
-
-        # restore training state
-        torch.set_rng_state(rng_state)
-        if cuda_rng_state is not None:
-            torch.cuda.set_rng_state(cuda_rng_state)
-
-        self.restore_device_state()
-        if network is not None:
-            network.train()
-            network.multiplier = start_multiplier
-
-        self.unet.to(self.device_torch, dtype=self.torch_dtype)
-        if network.is_merged_in:
-            network.merge_out(merge_multiplier)
-        # self.tokenizer.to(original_device_dict['tokenizer'])
-
-        # refuse loras
-        if self.model_config.assistant_lora_path is not None:
-            print_acc("Loading assistant lora")
-            if self.invert_assistant_lora:
-                self.assistant_lora.is_active = False
-                # move weights off the device
-                self.assistant_lora.force_to('cpu', self.torch_dtype)
-            else:
-                self.assistant_lora.is_active = True
-
-        if self.model_config.inference_lora_path is not None:
-            print_acc("Unloading inference lora")
-            self.assistant_lora.is_active = False
-            # move weights off the device
-            self.assistant_lora.force_to('cpu', self.torch_dtype)
-        flush()
 
     def get_latent_noise(
             self,

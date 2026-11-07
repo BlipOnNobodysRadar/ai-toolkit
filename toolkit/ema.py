@@ -237,8 +237,8 @@ class ExponentialMovingAverage:
         """
         parameters = self._get_parameters(parameters)
         self.store(parameters)
-        self.copy_to(parameters)
         try:
+            self.copy_to(parameters)  # inside the try: a partial copy is restored too
             yield
         finally:
             self.restore(parameters)
@@ -333,15 +333,31 @@ class ExponentialMovingAverage:
             )
 
     def eval(self):
+        # training (raw weights, nothing stored) -> evaluating (EMA weights, raw weights stored). A copy that fails
+        # part way leaves some parameters holding EMA weights: put the raw ones back and stay in training mode.
         if self._is_train_mode:
             with torch.no_grad():
                 self.store()
-                self.copy_to()
+                try:
+                    self.copy_to()
+                except BaseException as primary:
+                    try:
+                        self.restore()
+                    except BaseException as rollback:
+                        # weights are mixed and the raw copies are still stored: claim evaluation mode so that
+                        # train() retries the restore instead of treating the mixed weights as raw
+                        self._is_train_mode = False
+                        primary.add_note(f"restoring the raw weights also failed: {rollback!r}; call train() to "
+                                         f"retry")
+                        raise primary
+                    self.collected_params = None
+                    raise
                 self._is_train_mode = False
 
     def train(self):
         if not self._is_train_mode:
             with torch.no_grad():
+                # a restore that fails part way keeps evaluation mode and the stored raw weights, so it can be retried
                 self.restore()
                 # The stored raw weights are back in the params; don't keep a full clone alive for the whole run.
                 self.collected_params = None

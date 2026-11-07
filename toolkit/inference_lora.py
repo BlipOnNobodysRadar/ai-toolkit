@@ -18,6 +18,7 @@ The holder's convert_lora_weights_before_load hook runs first, so archs with
 their own conversions (anima, ltx2, hidream_o1) keep working.
 """
 
+import math
 import os
 from typing import Dict, List, Optional, Tuple
 
@@ -216,6 +217,16 @@ class InferenceLoRA:
             ks = e.kron_shape()
             if ks is not None and w_shape is not None and len(w_shape) == 2 and tuple(ks) != tuple(w_shape):
                 self.unmatched.append(f"{base} (lokr shape {ks} vs {tuple(w_shape)})")
+                continue
+            # full-weight diffs: merge reshapes to the weight, hooks multiply by it as (out, in); refuse a mismatch
+            # here rather than fail half way through merging
+            if e.diff is not None and w_shape is not None and (
+                    e.diff.numel() != math.prod(w_shape) or (len(w_shape) == 2 and tuple(e.diff.shape) != tuple(w_shape))):
+                self.unmatched.append(f"{base} (diff shape {tuple(e.diff.shape)} vs {tuple(w_shape)})")
+                continue
+            b_shape = getattr(getattr(module, "bias", None), "shape", None)
+            if e.diff_b is not None and b_shape is not None and tuple(e.diff_b.shape) != tuple(b_shape):
+                self.unmatched.append(f"{base} (diff_b shape {tuple(e.diff_b.shape)} vs {tuple(b_shape)})")
                 continue
             if e.A is None and e.kron is None and e.diff is None and e.diff_b is None:
                 continue

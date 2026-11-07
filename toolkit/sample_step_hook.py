@@ -10,11 +10,15 @@ BaseModel and the legacy StableDiffusion monolith.
 
 from typing import Callable, List
 
+_MISSING = object()
+
 
 def install_sample_step_hooks(holder, pipeline) -> Callable[[], None]:
     """Wrap scheduler.step on the sampling scheduler(s). Returns an unwrap
     callable. No-op without a hook. Instance-level wrap: the class method is
-    untouched and a stale wrapper is replaced rather than stacked."""
+    untouched and a stale wrapper is replaced rather than stacked. Unwrap puts
+    back whatever instance attribute the scheduler had before (a caller's own
+    step survives), and leaves alone a wrapper someone installed over ours."""
     if getattr(holder, "sample_step_hook", None) is None:
         return lambda: None
     schedulers: List = []
@@ -29,6 +33,9 @@ def install_sample_step_hooks(holder, pipeline) -> Callable[[], None]:
     for scheduler in schedulers:
         current = scheduler.step
         orig = getattr(current, "_aitk_orig_step", None) or current
+        # the instance attribute to restore on unwrap; a stale wrapper of ours stands for what it replaced
+        prev_own = vars(scheduler).get("step", _MISSING)
+        prev_own = getattr(prev_own, "_aitk_prev_own", prev_own)
 
         def make(orig, scheduler):
             def step(*args, **kwargs):
@@ -58,13 +65,19 @@ def install_sample_step_hooks(holder, pipeline) -> Callable[[], None]:
                 return out
 
             step._aitk_orig_step = orig
+            step._aitk_prev_own = prev_own
             return step
 
-        scheduler.step = make(orig, scheduler)
+        wrapper = make(orig, scheduler)
+        scheduler.step = wrapper
 
-        def unwrap(scheduler=scheduler):
-            if "step" in scheduler.__dict__:
+        def unwrap(scheduler=scheduler, wrapper=wrapper, prev_own=prev_own):
+            if vars(scheduler).get("step") is not wrapper:
+                return  # already unwrapped, or another wrapper now owns the attribute
+            if prev_own is _MISSING:
                 del scheduler.__dict__["step"]
+            else:
+                scheduler.__dict__["step"] = prev_own
 
         unwraps.append(unwrap)
     return lambda: [u() for u in unwraps]

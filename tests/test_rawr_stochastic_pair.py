@@ -188,6 +188,22 @@ def test_unsupported_save_mode_cannot_leave_a_stale_commit_pointer(tmp_path):
     assert pair.select(str(tmp_path), 'tiny') == original
 
 
+def test_a_refused_save_mode_never_swaps_in_ema_weights(tmp_path):
+    # a real EMA is an unsupported RAWR save mode: refused before its weights are evaluated or copied
+    from toolkit.ema import ExponentialMovingAverage
+    f, p, _ = paired_trainer(tmp_path)
+    advance(f, 0)
+    f.save(0)
+    original = pair.select(str(tmp_path), 'tiny')
+    f.ema = ExponentialMovingAverage([p])
+    transitions = []
+    f.ema.eval = lambda: transitions.append('eval')
+    f.ema.train = lambda: transitions.append('train')
+    with pytest.raises(ValueError, match='unsupported save mode'):
+        f.save(1)
+    assert transitions == [] and pair.select(str(tmp_path), 'tiny') == original
+
+
 @pytest.mark.parametrize('mode', ['workers', 'generator'])
 def test_unavailable_loader_state_is_explicit_and_cannot_downgrade_supported_resume(mode):
     from extensions_built_in.sd_trainer.SDTrainer import SDTrainer

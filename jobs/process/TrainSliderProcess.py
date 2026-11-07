@@ -37,6 +37,9 @@ adapter_transforms = transforms.Compose([
 
 
 class TrainSliderProcess(BaseSDTrainProcess):
+    # hook_train_loop zeroes gradients and steps every iteration (docs/STATE_MACHINES.md M27)
+    supports_gradient_accumulation_steps = False
+    supports_gradient_accumulation_batches = False  # hook_train_loop uses batch[0]
     def __init__(self, process_id: int, job, config: OrderedDict):
         super().__init__(process_id, job, config)
         self.prompt_txt_list = None

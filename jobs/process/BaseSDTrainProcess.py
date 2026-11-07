@@ -46,6 +46,7 @@ from toolkit.progress_bar import ToolkitProgressBar
 from toolkit.prompt_utils import concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.sampler import get_sampler
+from toolkit import sampling_state
 from toolkit.saving import save_t2i_from_diffusers, load_t2i_model, save_ip_adapter_from_diffusers, \
     load_ip_adapter_model, load_custom_adapter_model
 
@@ -79,9 +80,51 @@ import hashlib
 from toolkit.util.blended_blur_noise import get_blended_blur_noise
 from toolkit.util.get_model import get_model_class
 from toolkit.basic import flush
+from toolkit.optimizers import pending_grads
+
+
+def mark_update_commit(trainer, reason):
+    """From here on this loop iteration may be changing parameters or update state (optimizer.step(), a fused
+    backward, the scheduler step). An OOM after this point cannot be skipped like a forward OOM
+    (docs/STATE_MACHINES.md, M1 invariant W5)."""
+    if getattr(trainer, '_update_commit_stage', None) is None:
+        trainer._update_commit_stage = reason
+
+
+_SAVE_STEP = re.compile(r'_(\d{9})(?!.*_\d{9})')
+
+
+def save_write_rank(path):
+    """Sort key for this run's checkpoints, newest last: when the save was last written, then its step.
+
+    NTFS keeps a file's creation time when it is rewritten in place (torch.save over an existing .pt, a Diffusers
+    folder whose files are overwritten), so ranking by getctime picked an older periodic save over a re-saved final
+    one on Windows, for resume and for pruning (docs/STATE_MACHINES.md, OPUS-11/P-07). A Diffusers folder is ranked
+    by its aitk_meta.yaml, which every save writes last; overwriting nested files does not touch the folder's own
+    time. Equal times (coarse filesystem clocks) fall back to the step, and a save without one (the final save) last.
+    """
+    written = None
+    if os.path.isdir(path):
+        meta = os.path.join(path, 'aitk_meta.yaml')
+        if os.path.exists(meta):
+            written = os.path.getmtime(meta)
+    if written is None:
+        written = os.path.getmtime(path)
+    step = _SAVE_STEP.search(os.path.basename(path))
+    return written, int(step.group(1)) if step else float('inf')
+
+
+def _is_cuda_oom(e):
+    # torch.cuda.OutOfMemoryError is a RuntimeError; older paths only carry the message
+    return isinstance(e, torch.cuda.OutOfMemoryError) or "CUDA out of memory" in str(e)
 
 
 class BaseSDTrainProcess(BaseTrainProcess):
+    # What this trainer's hook_train_loop implements (docs/STATE_MACHINES.md M27). Trainers that zero gradients and
+    # step in every hook call cannot accumulate across iterations; one that uses only the first batch of the list
+    # cannot take gradient_accumulation > 1.
+    supports_gradient_accumulation_steps = True
+    supports_gradient_accumulation_batches = True
 
     def __init__(self, process_id: int, job, config: OrderedDict, custom_pipeline=None):
         super().__init__(process_id, job, config)
@@ -371,23 +414,28 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # post process
         gen_img_config_list = self.post_process_generate_image_config_list(gen_img_config_list)
 
-        # if we have an ema, set it to validation mode
+        # if we have an ema, set it to validation mode (and give the raw weights back even if sampling fails)
+        ema_was_training = self.ema is not None and self.ema._is_train_mode
         if self.ema is not None:
             self.ema.eval()
 
         # let adapter know we are sampling
-        if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
+        is_custom_adapter = self.adapter is not None and isinstance(self.adapter, CustomAdapter)
+        was_sampling = getattr(self.adapter, 'is_sampling', False) if is_custom_adapter else None
+        if is_custom_adapter:
             self.adapter.is_sampling = True
-        
-        # send to be generated
-        self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
-
-        
-        if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
-            self.adapter.is_sampling = False
-
-        if self.ema is not None:
-            self.ema.train()
+        give_back = []
+        if is_custom_adapter:
+            give_back.append(lambda: setattr(self.adapter, 'is_sampling', was_sampling))
+        if ema_was_training:
+            give_back.append(self.ema.train)
+        try:
+            # send to be generated
+            self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+        except BaseException as primary:
+            sampling_state.settle(give_back, primary)
+            raise
+        sampling_state.settle(give_back)
         print_acc("") # add a line break
 
     def update_training_metadata(self):
@@ -446,21 +494,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
             critic_pattern = f"CRITIC_{self.job.name}_*"
             critic_items = glob.glob(os.path.join(self.save_root, critic_pattern))
 
-            # Sort the lists by creation time if they are not empty
+            # Sort the lists by when each save was last written (not creation time, see save_write_rank)
             if safetensors_files:
-                safetensors_files.sort(key=os.path.getctime)
+                safetensors_files.sort(key=save_write_rank)
             if pt_files:
-                pt_files.sort(key=os.path.getctime)
+                pt_files.sort(key=save_write_rank)
             if directories:
-                directories.sort(key=os.path.getctime)
+                directories.sort(key=save_write_rank)
             if embed_files:
-                embed_files.sort(key=os.path.getctime)
+                embed_files.sort(key=save_write_rank)
             if critic_items:
-                critic_items.sort(key=os.path.getctime)
+                critic_items.sort(key=save_write_rank)
 
             # Combine and sort the lists
             combined_items = safetensors_files + directories + pt_files
-            combined_items.sort(key=os.path.getctime)
+            combined_items.sort(key=save_write_rank)
             
             num_saves_to_keep = self.save_config.max_step_saves_to_keep
             
@@ -518,17 +566,305 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def end_step_hook(self):
         pass
 
+    # Accumulation window and OOM protocol (docs/STATE_MACHINES.md, M1). run() calls these once per loop iteration.
+
+    def _cleanup_batch_list(self, batch_list):
+        for fetched in batch_list:
+            if isinstance(fetched, DataLoaderBatchDTO):
+                with self.timer('batch_cleanup'):
+                    fetched.cleanup()
+
+    def _main_loader_has_batches(self):
+        try:
+            self._main_epoch_len = len(self.data_loader) if self.data_loader is not None else 0
+        except TypeError:  # an iterable loader with no length
+            self._main_epoch_len = 0
+        return self._main_epoch_len > 0
+
+    def _setup_accumulation_iteration(self):
+        """Decide whether this iteration runs the window's last microbatch (and so steps the optimizer).
+        Whole-epoch accumulation (-1) is decided by the epoch rollover in the batch fetch instead."""
+        if self.train_config.gradient_accumulation_steps == -1:
+            if self.step_num >= self.train_config.steps - 1:
+                # the run's last iteration applies the final (possibly partial) epoch window instead of dropping it
+                self.is_grad_accumulation_step = False
+                self.grad_accumulation_step = 0
+            return
+        # since optimizer step happens in the loop, we trigger it a step early
+        # since we cannot reprocess it before them
+        is_optimizer_step = self.grad_accumulation_step >= self.train_config.gradient_accumulation_steps
+        self.is_grad_accumulation_step = not is_optimizer_step
+        if is_optimizer_step:
+            self.grad_accumulation_step = 0
+
+    def _fetch_batch_list(self, step, dataloader, dataloader_iterator, dataloader_reg, dataloader_iterator_reg,
+                          is_save_step, is_sample_step):
+        """One loop iteration's batches (gradient_accumulation of them; regularization batches interleaved on even
+        steps). Returns (batch_list, dataloader_iterator, dataloader_iterator_reg); an epoch end replaces an iterator.
+        With whole-epoch accumulation (gradient_accumulation_steps -1) the iteration that fetches an epoch's last main
+        batch is the update, counted against the loader's length (docs/STATE_MACHINES.md M1, C13)."""
+        batch_list = []
+        epoch_complete = False
+
+        for b in range(self.train_config.gradient_accumulation):
+            # keep track to alternate on an accumulation step for reg
+            batch_step = step
+            # don't do a reg step on sample or save steps as we dont want to normalize on those
+            if batch_step % 2 == 0 and dataloader_reg is not None and not is_save_step and not is_sample_step:
+                try:
+                    with self.timer('get_batch:reg'):
+                        batch = next(dataloader_iterator_reg)
+                except StopIteration:
+                    with self.timer('reset_batch:reg'):
+                        # hit the end of an epoch, reset
+                        self._seed_epoch_sampler(dataloader_reg, 2, step)
+                        dataloader_iterator_reg = iter(dataloader_reg)
+                        trigger_dataloader_setup_epoch(dataloader_reg)
+
+                    with self.timer('get_batch:reg'):
+                        batch = next(dataloader_iterator_reg)
+                is_reg_step = True
+            elif dataloader is not None:
+                try:
+                    with self.timer('get_batch'):
+                        batch = next(dataloader_iterator)
+                except StopIteration:
+                    with self.timer('reset_batch'):
+                        # hit the end of an epoch, reset
+                        self._data_epoch += 1
+                        self._seed_epoch_sampler(dataloader, 1, self._data_epoch)
+                        dataloader_iterator = iter(dataloader)
+                        trigger_dataloader_setup_epoch(dataloader)
+                        self.epoch_num += 1
+                        if (self.train_config.gradient_accumulation_steps == -1
+                                and self._epoch_cursor < self._main_epoch_len):
+                            raise RuntimeError(
+                                f"The dataloader ended its epoch after {self._epoch_cursor} of the "
+                                f"{self._main_epoch_len} batches its length reports; whole-epoch accumulation "
+                                f"(gradient_accumulation_steps: -1) needs an accurate length")
+                        self._epoch_cursor = 0
+                        if self.train_config.gradient_accumulation_steps == -1:
+                            # setup_epoch may rebuild the buckets, and with them the number of batches
+                            self._main_loader_has_batches()
+                    with self.timer('get_batch'):
+                        batch = next(dataloader_iterator)
+                self._epoch_cursor += 1
+                if (self.train_config.gradient_accumulation_steps == -1
+                        and self._epoch_cursor >= self._main_epoch_len):
+                    # this batch completes the epoch: this iteration is the window's update (C13). (TrainConfig refuses
+                    # gradient_accumulation > 1 with -1, so the list cannot hold more; the break only guards that.)
+                    self.is_grad_accumulation_step = False
+                    self.grad_accumulation_step = 0
+                    epoch_complete = True
+            else:
+                batch = None
+            batch_list.append(batch)
+            batch_step += 1
+            if epoch_complete:
+                break
+        return batch_list, dataloader_iterator, dataloader_iterator_reg
+
+    def _install_update_commit_observers(self, optimizer):
+        """Note when an iteration starts changing parameters, for any trainer's hook_train_loop.
+        The handles are recorded as they are made, so run()'s finally removes them even after a partial install."""
+        self._remove_update_commit_observers()
+        self._update_commit_observable = False
+        handles = self._update_commit_handles
+        fused = pending_grads.steps_in_backward(optimizer)
+        if fused:
+            # a fused optimizer updates each parameter inside backward; the first gradient marks the commit
+            for group in optimizer.param_groups:
+                for p in group['params']:
+                    if p.requires_grad:
+                        handles.append(p.register_hook(
+                            lambda grad: mark_update_commit(self, 'a fused backward update')))
+        register = getattr(getattr(optimizer, 'optimizer', optimizer), 'register_step_pre_hook', None)
+        if register is not None:
+            handles.append(register(lambda *args: mark_update_commit(self, 'optimizer.step()')))
+        self._update_commit_observable = fused or register is not None
+
+    def _remove_update_commit_observers(self):
+        handles = getattr(self, '_update_commit_handles', None) or []
+        self._update_commit_handles = []
+        for handle in handles:
+            handle.remove()  # RemovableHandle.remove only drops a dict entry
+
+    def _discard_accumulation_window(self, optimizer):
+        """Drop the whole unfinished window, hidden low-precision buffers included; the next iteration starts a
+        fresh one, so no update averages a partial window."""
+        optimizer.zero_grad(set_to_none=True)
+        pending_grads.discard(optimizer)
+        if getattr(self, 'training_extras', None) is not None:
+            self.training_extras.edm.zero_grad()
+        if self.train_config.gradient_accumulation_steps == -1:
+            print_acc("OOM discarded the gradients accumulated so far this epoch; the next update covers only the "
+                      "batches after it")
+        # the end-of-iteration increment makes this 1: a window with no pending microbatches
+        self.grad_accumulation_step = 0
+
+    def _run_train_step(self, step, batch_list, optimizer):
+        """Run hook_train_loop under the OOM protocol; returns (loss_dict, did_oom).
+
+        An OOM before any update began skips the iteration and its whole accumulation window. The skipped loop step
+        still counts as completed: it consumed its batch and per-step seeds exactly as the uninterrupted run did, so
+        a save at this step resumes at the next one. An OOM after an update began cannot be skipped or retried; it
+        aborts before anything is saved.
+        """
+        self._update_commit_stage = None
+        try:
+            with self.accelerator.accumulate(self.modules_being_trained):
+                loss_dict = self.hook_train_loop(batch_list)
+        except RuntimeError as e:
+            if not _is_cuda_oom(e):
+                raise  # not an OOM; surface real errors
+            oom = e
+        else:
+            self._checkpoint_completed_step = step + 1
+            self.num_consecutive_oom = 0
+            return loss_dict, False
+        stage = self._update_commit_stage
+        if stage is None and not self.is_grad_accumulation_step and not getattr(self, '_update_commit_observable', False):
+            stage = 'an optimizer update this trainer cannot observe'
+        if stage is not None:
+            raise RuntimeError(f"OOM at step {step} after {stage} began changing parameters; the step cannot be "
+                               f"skipped or retried. Resume from the last saved checkpoint.") from oom
+        self.num_consecutive_oom += 1
+        if self.num_consecutive_oom > 3:
+            raise RuntimeError("OOM during training step 3 times in a row, aborting training") from oom
+        del oom  # its traceback pins the failed step's activations; release them before flushing
+        self._discard_accumulation_window(optimizer)
+        self._checkpoint_completed_step = step + 1
+        flush()
+        if torch.cuda.is_available():
+            torch.cuda.ipc_collect()
+        # skip this step and keep going
+        print_acc("")
+        print_acc("################################################")
+        print_acc(f"# OOM during training step, skipping batch {self.num_consecutive_oom}/3 #")
+        print_acc("################################################")
+        print_acc("")
+        return None, True
+
+    def _end_loop_iteration(self, step):
+        self.step_num = step + 1
+        self.grad_accumulation_step += 1
+
+    def _save_at_loop_step(self):
+        # print above the progress bar
+        if self.progress_bar is not None:
+            self.progress_bar.pause()
+        print_acc(f"\nSaving at step {self.step_num}")
+        self.save(self.step_num)
+        self.ensure_params_requires_grad()
+        # Saving must not discard the unfinished accumulation window, for any scheduler (RAWR checkpoints also
+        # carry it). With gradient_accumulation_steps 1 nothing is pending here.
+        flush()
+        if self.progress_bar is not None:
+            self.progress_bar.unpause()
+
+    def _load_optimizer_state(self, optimizer, rawr_resume_enabled):
+        """Load optimizer.pt (RAWR: the one paired with the selected model). Returns the RAWR capture or None."""
+        from training_extras import rawr_checkpoint
+        rawr_resume = None
+        # check if it exists
+        optimizer_state_filename = f'optimizer.pt'
+        optimizer_state_file_path = os.path.join(self.save_root, optimizer_state_filename)
+        if rawr_resume_enabled:
+            optimizer_state_file_path = getattr(self, '_rawr_paired_optimizer_path', optimizer_state_file_path)
+        if rawr_resume_enabled and self.step_num > 0 and not os.path.exists(optimizer_state_file_path):
+            raise RuntimeError('RAWR resume requires the optimizer.pt paired with the selected model; start a new run for weights-only training')
+        if os.path.exists(optimizer_state_file_path):
+            # try to load
+            # previous param groups
+            # previous_params = copy.deepcopy(optimizer.param_groups)
+            previous_lrs = []
+            for group in optimizer.param_groups:
+                previous_lrs.append(group['lr'])
+
+            load_optimizer = True
+            if self.network is not None:
+                if self.network.did_change_weights:
+                    # do not load optimizer if the network changed, it will result in
+                    # a double state that will oom.
+                    load_optimizer = False
+
+            if load_optimizer:
+                try:
+                    print_acc(f"Loading optimizer state from {optimizer_state_file_path}")
+                    optimizer_state_dict = torch.load(optimizer_state_file_path, weights_only=True,
+                                                     map_location='cpu' if rawr_resume_enabled else None)
+                    optimizer.load_state_dict(optimizer_state_dict)
+                    if rawr_resume_enabled:
+                        rawr_resume = rawr_checkpoint.capture(optimizer_state_dict)
+                    del optimizer_state_dict
+                    flush()
+                except Exception as e:
+                    if rawr_resume_enabled:
+                        raise RuntimeError('Could not load RAWR optimizer/scheduler checkpoint; refusing a partial resume') from e
+                    print_acc(f"Failed to load optimizer state from {optimizer_state_file_path}")
+                    print_acc(e)
+
+            # update the optimizer LR from the params
+            print_acc(f"Updating optimizer LR from params")
+            if len(previous_lrs) > 0:
+                for i, group in enumerate(optimizer.param_groups):
+                    group['lr'] = previous_lrs[i]
+                    group['initial_lr'] = previous_lrs[i]
+
+            # Update the learning rates if they changed
+            # optimizer.param_groups = previous_params
+
+        if rawr_resume_enabled and self.step_num > 0 and rawr_resume is None:
+            # e.g. a changed LoRA rank (network.did_change_weights) skipped the load above: RAWR would silently
+            # restart its cycle and moments at this step (docs/STATE_MACHINES.md, SM-04)
+            raise RuntimeError('RAWR resume requires the optimizer state paired with the selected model, but it was '
+                               'not loaded (the network shape changed since that checkpoint); start a new run '
+                               'for weights-only training')
+        return rawr_resume
+
+    def _check_accumulation_support(self, optimizer):
+        """Refuse accumulation the optimizer setup cannot do (before training starts)."""
+        gas = self.train_config.gradient_accumulation_steps
+        if getattr(self.train_config, 'do_paramiter_swapping', False) and gas != 1:
+            # swap_paramiters() reselects the trained parameters at the top of every loop step and clears their grads
+            raise ValueError(
+                f"do_paramiter_swapping reselects the trained parameters (clearing their gradients) every step, so it "
+                f"cannot accumulate over gradient_accumulation_steps={gas}; use 1 (gradient_accumulation batches "
+                f"within a step are fine)")
+        if pending_grads.steps_in_backward(optimizer) and (gas != 1 or self.train_config.gradient_accumulation > 1):
+            # each backward would apply its own update at 1/(window) scale instead of accumulating one
+            raise ValueError(
+                f"Optimizer '{self.train_config.optimizer}' updates parameters inside backward (fused), so it cannot "
+                f"accumulate gradients over several backward passes (gradient_accumulation_steps={gas}, "
+                f"gradient_accumulation={self.train_config.gradient_accumulation}). Use 1 for both, or an unfused "
+                f"optimizer (e.g. automagic3 with optimizer_params fused: false).")
+
     def save(self, step=None):
         if not self.accelerator.is_main_process:
             return
         from training_extras import rawr_pair
+        # first, as before: a refused save mode must not touch anything
         rawr_pair_save = rawr_pair.begin(self)
-        rawr_model_alias = None
-        rawr_model_export = None
-        flush()
+        # the EMA weights are installed only while saving, also when the save fails (docs/STATE_MACHINES.md, P-04)
+        ema_was_training = self.ema is not None and self.ema._is_train_mode
         if self.ema is not None:
             # always save params as ema
             self.ema.eval()
+        give_back = [self.ema.train] if ema_was_training else []
+        try:
+            # through the class: callers (and tests) may run save() unbound on a trainer-like namespace
+            BaseSDTrainProcess._save_checkpoint(self, step, rawr_pair_save)
+        except BaseException as primary:
+            sampling_state.settle(give_back, primary, 'the raw weights after saving EMA weights')
+            raise
+        sampling_state.settle(give_back)
+        flush()
+
+    def _save_checkpoint(self, step, rawr_pair_save):
+        from training_extras import rawr_pair
+        rawr_model_alias = None
+        rawr_model_export = None
+        flush()
 
         if not os.path.exists(self.save_root):
             os.makedirs(self.save_root, exist_ok=True)
@@ -581,22 +917,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     file_path = rawr_pair_save['model']
                 prev_multiplier = self.network.multiplier
                 self.network.multiplier = 1.0
-
-                # if we are doing embedding training as well, add that
-                embedding_dict = self.embedding.state_dict() if self.embedding else None
-                self.network.save_weights(
-                    file_path,
-                    # Preserve training precision in the committed resume pair.
-                    dtype=None if rawr_pair_save is not None else get_torch_dtype(self.save_config.dtype),
-                    metadata=save_meta,
-                    extra_state_dict=embedding_dict
-                )
+                try:
+                    # if we are doing embedding training as well, add that
+                    embedding_dict = self.embedding.state_dict() if self.embedding else None
+                    self.network.save_weights(
+                        file_path,
+                        # Preserve training precision in the committed resume pair.
+                        dtype=None if rawr_pair_save is not None else get_torch_dtype(self.save_config.dtype),
+                        metadata=save_meta,
+                        extra_state_dict=embedding_dict
+                    )
+                finally:
+                    self.network.multiplier = prev_multiplier
                 if rawr_pair_save is not None:
                     def rawr_model_export(path):
                         self.network.save_weights(
                             path, dtype=get_torch_dtype(self.save_config.dtype),
                             metadata=save_meta, extra_state_dict=embedding_dict)
-                self.network.multiplier = prev_multiplier
                 # if we have an embedding as well, pair it with the network
 
             # even if added to lora, still save the trigger version
@@ -661,17 +998,24 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     # move it to the new dtype and cpu
                     orig_device = self.adapter.device
                     orig_dtype = self.adapter.dtype
+
+                    def adapter_back():
+                        self.adapter = self.adapter.to(orig_device, dtype=orig_dtype)
                     self.adapter = self.adapter.to(torch.device('cpu'), dtype=get_torch_dtype(self.save_config.dtype))
-                    self.adapter.save_pretrained(
-                        name_or_path,
-                        dtype=get_torch_dtype(self.save_config.dtype),
-                        safe_serialization=True
-                    )
-                    meta_path = os.path.join(name_or_path, 'aitk_meta.yaml')
-                    with open(meta_path, 'w') as f:
-                        yaml.dump(self.meta, f)
+                    try:
+                        self.adapter.save_pretrained(
+                            name_or_path,
+                            dtype=get_torch_dtype(self.save_config.dtype),
+                            safe_serialization=True
+                        )
+                        meta_path = os.path.join(name_or_path, 'aitk_meta.yaml')
+                        with open(meta_path, 'w') as f:
+                            yaml.dump(self.meta, f)
+                    except BaseException as primary:
+                        sampling_state.settle([adapter_back], primary, 'the adapter placement')
+                        raise
                     # move it back
-                    self.adapter = self.adapter.to(orig_device, dtype=orig_dtype)
+                    adapter_back()
                 else:
                     direct_save = False
                     if self.adapter_config.train_only_image_encoder:
@@ -789,10 +1133,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                             step=self.meta['training_info']['completed_steps'])
         self.clean_up_saves()
         self.post_save_hook(file_path)
-
-        if self.ema is not None:
-            self.ema.train()
-        flush()
 
     # Called before the model is loaded
     def hook_before_model_load(self):
@@ -943,14 +1283,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
             for pattern in patterns:
                 paths.extend(glob.glob(os.path.join(self.save_root, pattern)))
 
-            # Filter out non-existent paths and sort by creation time
+            # Filter out non-existent paths and pick the most recently written (RAWR pairs were selected above)
             if paths:
                 # the exact-name match also drops the _LoRA/_refiner/_t2i/_cn siblings the old substring filters
                 # removed, without misfiring when those strings appear in the folder path
                 paths = [p for p in paths if os.path.exists(p) and save_name.fullmatch(os.path.basename(p))]
 
                 if len(paths) > 0:
-                    latest_path = max(paths, key=os.path.getctime)
+                    latest_path = max(paths, key=save_write_rank)
         
         if include_pretrained_lora and latest_path is None and self.network_config is not None and self.network_config.pretrained_lora_path is not None:
             # set pretrained lora path as load path if we do not have a checkpoint to resume from
@@ -1886,14 +2226,42 @@ class BaseSDTrainProcess(BaseTrainProcess):
             sampler.generator = torch.Generator().manual_seed(seed)
 
     def run(self):
+        try:
+            self._run_training()
+        finally:
+            # the loop's commit observers hold this trainer; an error, KeyboardInterrupt or failed save/sample must
+            # not leave them on an optimizer a later job in this process may reuse (docs/STATE_MACHINES.md, R01)
+            self._remove_update_commit_observers()
+
+    def _check_trainer_accumulation_capability(self):
+        """Refuse accumulation settings this trainer's hook_train_loop does not implement, before any model loads.
+        Such a setting never worked: the trainer silently trained at a different effective batch size."""
+        name = type(self).__name__
+        gas = self.train_config.gradient_accumulation_steps
+        if gas != 1 and not self.supports_gradient_accumulation_steps:
+            raise ValueError(
+                f"{name} steps the optimizer on every iteration, so gradient_accumulation_steps={gas} would be ignored; "
+                f"use 1 (and a larger batch_size if you need a bigger effective batch)")
+        batches = self.train_config.gradient_accumulation
+        if batches > 1 and not self.supports_gradient_accumulation_batches:
+            raise ValueError(
+                f"{name} trains on the first batch of each iteration only, so gradient_accumulation={batches} would "
+                f"fetch batches it never uses; use 1")
+
+    def _run_training(self):
         # torch.autograd.set_detect_anomaly(True)
         # run base process run
         BaseTrainProcess.run(self)
+        self._check_trainer_accumulation_capability()
         # process-wide, so set it both ways: run.py runs several jobs in one process
         torch.set_float32_matmul_precision('high' if self.train_config.allow_tf32 else 'highest')
         if self.train_config.allow_tf32:
             print_acc("TF32 matmuls enabled (train.allow_tf32)")
         params = []
+        from training_extras import rawr_checkpoint, rawr_pair
+        if not rawr_checkpoint.is_rawr_name(self.train_config.lr_scheduler):
+            # before resuming or writing anything: a committed pair here would stay the resume point
+            rawr_pair.refuse_stale_manifest(self.save_root)
 
         ### HOOK ###
         self.hook_before_model_load()
@@ -2168,6 +2536,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.model_config.quantize or self.model_config.layer_offloading or model_is_prequantized:
                     # todo find a way around this
                     self.network.can_merge_in = False
+                # Training samples run the network through its hooks. A merge_in/merge_out round trip rounds the
+                # frozen base weights through their dtype, so in bf16/fp16 every sample event would move them
+                # (docs/STATE_MACHINES.md, SM-06). merge_network_on_save still merges.
+                self.sd.merge_network_for_sampling = False
 
                 if is_lorm:
                     self.network.is_lorm = True
@@ -2355,7 +2727,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         optimizer = get_optimizer(self.params, optimizer_type, learning_rate=self.train_config.lr,
                                   optimizer_params=optimizer_params)
         self.optimizer = optimizer
-        
+        self._check_accumulation_support(optimizer)
+
         # set it to do paramiter swapping
         if self.train_config.do_paramiter_swapping:
             # only works for adafactor, but it should have thrown an error prior to this otherwise
@@ -2366,56 +2739,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self._rawr_checkpoint_config = (rawr_checkpoint.configuration(
             optimizer, self.train_config.steps, self.train_config.lr_scheduler_params)
             if rawr_resume_enabled else None)
-        rawr_resume = None
         self._rawr_scheduler_restored = False
 
-        # check if it exists
-        optimizer_state_filename = f'optimizer.pt'
-        optimizer_state_file_path = os.path.join(self.save_root, optimizer_state_filename)
-        if rawr_resume_enabled:
-            optimizer_state_file_path = getattr(self, '_rawr_paired_optimizer_path', optimizer_state_file_path)
-        if rawr_resume_enabled and self.step_num > 0 and not os.path.exists(optimizer_state_file_path):
-            raise RuntimeError('RAWR resume requires the optimizer.pt paired with the selected model; start a new run for weights-only training')
-        if os.path.exists(optimizer_state_file_path):
-            # try to load
-            # previous param groups
-            # previous_params = copy.deepcopy(optimizer.param_groups)
-            previous_lrs = []
-            for group in optimizer.param_groups:
-                previous_lrs.append(group['lr'])
-
-            load_optimizer = True
-            if self.network is not None:
-                if self.network.did_change_weights:
-                    # do not load optimizer if the network changed, it will result in
-                    # a double state that will oom.
-                    load_optimizer = False
-
-            if load_optimizer:
-                try:
-                    print_acc(f"Loading optimizer state from {optimizer_state_file_path}")
-                    optimizer_state_dict = torch.load(optimizer_state_file_path, weights_only=True,
-                                                     map_location='cpu' if rawr_resume_enabled else None)
-                    optimizer.load_state_dict(optimizer_state_dict)
-                    if rawr_resume_enabled:
-                        rawr_resume = rawr_checkpoint.capture(optimizer_state_dict)
-                    del optimizer_state_dict
-                    flush()
-                except Exception as e:
-                    if rawr_resume_enabled:
-                        raise RuntimeError('Could not load RAWR optimizer/scheduler checkpoint; refusing a partial resume') from e
-                    print_acc(f"Failed to load optimizer state from {optimizer_state_file_path}")
-                    print_acc(e)
-
-            # update the optimizer LR from the params
-            print_acc(f"Updating optimizer LR from params")
-            if len(previous_lrs) > 0:
-                for i, group in enumerate(optimizer.param_groups):
-                    group['lr'] = previous_lrs[i]
-                    group['initial_lr'] = previous_lrs[i]
-
-            # Update the learning rates if they changed
-            # optimizer.param_groups = previous_params
+        rawr_resume = self._load_optimizer_state(optimizer, rawr_resume_enabled)
+        # schedule-free optimizers start in eval mode and refuse to step until train() (docs/STATE_MACHINES.md, C12)
+        from training_extras.optim import enter_training_mode
+        enter_training_mode(optimizer)
 
         # set up the ema now that the optimizer (and its params) are ready
         self.setup_ema()
@@ -2736,9 +3065,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
                           "crops) can land on different items, and an epoch-boundary resume can shift that step's "
                           "noise and timesteps; with a reg dataset the image order restarts fresh. For an exact "
                           "continuation use num_workers: 0, batch_load_threads: 1 and no reg dataset.")
+        if (self.step_num > 0 and self.train_config.gradient_accumulation_steps != 1
+                and not getattr(self, '_rawr_scheduler_restored', False)):
+            print_acc("Resume: this checkpoint does not store an unfinished gradient accumulation window. Unless it was "
+                      "saved right after an optimizer update, the first update after this resume covers fewer "
+                      "microbatches than the uninterrupted run would (a partial epoch with "
+                      "gradient_accumulation_steps: -1). RAWR pairs carry the window for fixed-size accumulation.")
+        if self.train_config.gradient_accumulation_steps == -1 and not self._main_loader_has_batches():
+            raise ValueError("gradient_accumulation_steps: -1 accumulates over one epoch of the main dataset, which "
+                             "needs a dataset with a known, nonzero number of batches")
+        self._epoch_cursor = 0
         if self.data_loader is not None:
             dataloader = self.data_loader
             skip = 0
+            cursor = None  # main batches already taken from the current epoch (whole-epoch accumulation)
             if self.step_num > 0 and self.data_loader_reg is None and self._rng_seed(1, 0) is not None:
                 # resumed: continue in the epoch, and at the batch, an uninterrupted run would be at
                 per_epoch = len(dataloader)
@@ -2750,6 +3090,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # it here instead would shift that step's noise and timesteps)
                 self._data_epoch -= 1
                 dataloader_iterator = iter(())
+                cursor = len(dataloader)  # at that epoch's end: the first fetch takes the reset
             else:
                 if self.step_num > 0 and self.data_loader_reg is not None:
                     # with reg batches interleaved the position can't be reconstructed: take a fresh order for
@@ -2758,6 +3099,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 else:
                     self._seed_epoch_sampler(dataloader, 1, self._data_epoch)
                 dataloader_iterator = iter(dataloader)
+            self._epoch_cursor = skip if cursor is None else cursor
             for _ in range(skip):
                 if dataloader.num_workers == 0 and hasattr(dataloader_iterator, '_next_index'):
                     dataloader_iterator._next_index()  # advance the sampler without loading the batch
@@ -2813,6 +3155,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         start_step_num = self.step_num
         self._checkpoint_completed_step = self.step_num
+        self._install_update_commit_observers(optimizer)
         did_first_flush = False
         flush_next = False
         for step in range(start_step_num, self.train_config.steps):
@@ -2847,97 +3190,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.train_config.disable_sampling:
                     is_sample_step = False
 
-                batch_list = []
-
-                for b in range(self.train_config.gradient_accumulation):
-                    # keep track to alternate on an accumulation step for reg   
-                    batch_step = step
-                    # don't do a reg step on sample or save steps as we dont want to normalize on those
-                    if batch_step % 2 == 0 and dataloader_reg is not None and not is_save_step and not is_sample_step:
-                        try:
-                            with self.timer('get_batch:reg'):
-                                batch = next(dataloader_iterator_reg)
-                        except StopIteration:
-                            with self.timer('reset_batch:reg'):
-                                # hit the end of an epoch, reset
-                                self._seed_epoch_sampler(dataloader_reg, 2, step)
-                                dataloader_iterator_reg = iter(dataloader_reg)
-                                trigger_dataloader_setup_epoch(dataloader_reg)
-
-                            with self.timer('get_batch:reg'):
-                                batch = next(dataloader_iterator_reg)
-                        is_reg_step = True
-                    elif dataloader is not None:
-                        try:
-                            with self.timer('get_batch'):
-                                batch = next(dataloader_iterator)
-                        except StopIteration:
-                            with self.timer('reset_batch'):
-                                # hit the end of an epoch, reset
-                                self._data_epoch += 1
-                                self._seed_epoch_sampler(dataloader, 1, self._data_epoch)
-                                dataloader_iterator = iter(dataloader)
-                                trigger_dataloader_setup_epoch(dataloader)
-                                self.epoch_num += 1
-                                if self.train_config.gradient_accumulation_steps == -1:
-                                    # if we are accumulating for an entire epoch, trigger a step
-                                    self.is_grad_accumulation_step = False
-                                    self.grad_accumulation_step = 0
-                            with self.timer('get_batch'):
-                                batch = next(dataloader_iterator)
-                    else:
-                        batch = None
-                    batch_list.append(batch)
-                    batch_step += 1
+                batch_list, dataloader_iterator, dataloader_iterator_reg = self._fetch_batch_list(
+                    step, dataloader, dataloader_iterator, dataloader_reg, dataloader_iterator_reg,
+                    is_save_step, is_sample_step)
 
                 # setup accumulation
-                if self.train_config.gradient_accumulation_steps == -1:
-                    # epoch is handling the accumulation, dont touch it
-                    pass
-                else:
-                    # determine if we are accumulating or not
-                    # since optimizer step happens in the loop, we trigger it a step early
-                    # since we cannot reprocess it before them
-                    optimizer_step_at = self.train_config.gradient_accumulation_steps
-                    is_optimizer_step = self.grad_accumulation_step >= optimizer_step_at
-                    self.is_grad_accumulation_step = not is_optimizer_step
-                    if is_optimizer_step:
-                        self.grad_accumulation_step = 0
+                self._setup_accumulation_iteration()
 
             # flush()
             ### HOOK ###
             if self.torch_profiler is not None:
                 self.torch_profiler.start()
-            did_oom = False
-            loss_dict = None
-            try:
-                with self.accelerator.accumulate(self.modules_being_trained):
-                    loss_dict = self.hook_train_loop(batch_list)
-                self._checkpoint_completed_step = step + 1
-            except torch.cuda.OutOfMemoryError:
-                did_oom = True
-            except RuntimeError as e:
-                if "CUDA out of memory" in str(e):
-                    did_oom = True
-                else:
-                    raise  # not an OOM; surface real errors
-            if did_oom:
-                self.num_consecutive_oom += 1
-                if self.num_consecutive_oom > 3:
-                    raise RuntimeError("OOM during training step 3 times in a row, aborting training")
-                optimizer.zero_grad(set_to_none=True)
-                if getattr(self, 'training_extras', None) is not None:
-                    self.training_extras.edm.zero_grad()
-                flush()
-                torch.cuda.ipc_collect()
-                # skip this step and keep going
-                print_acc("")
-                print_acc("################################################")
-                print_acc(f"# OOM during training step, skipping batch {self.num_consecutive_oom}/3 #")
-                print_acc("################################################")
-                print_acc("")
-            else:
-                self.num_consecutive_oom = 0
+            loss_dict, did_oom = self._run_train_step(step, batch_list, optimizer)
             if self.torch_profiler is not None:
                 torch.cuda.synchronize()  # Make sure all CUDA ops are done
                 self.torch_profiler.stop()
@@ -2990,10 +3254,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     if self.progress_bar is not None:
                         self.progress_bar.set_postfix_str(prog_bar_string)
 
-                # if the batch is a DataLoaderBatchDTO, then we need to clean it up
-                if isinstance(batch, DataLoaderBatchDTO):
-                    with self.timer('batch_cleanup'):
-                        batch.cleanup()
+                # if the batch is a DataLoaderBatchDTO, then we need to clean it up (every batch of the list: the
+                # loop used to clean only the last one it fetched)
+                self._cleanup_batch_list(batch_list)
 
                 # don't do on first step
                 if self.step_num != self.start_step:
@@ -3001,22 +3264,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         self.accelerator.wait_for_everyone()
                         
                     if is_save_step:
-                        self.accelerator
-                        # print above the progress bar
-                        if self.progress_bar is not None:
-                            self.progress_bar.pause()
-                        print_acc(f"\nSaving at step {self.step_num}")
-                        self.save(self.step_num)
-                        self.ensure_params_requires_grad()
-                        # RAWR checkpoints retain unfinished microbatches. Saving
-                        # must not discard them from the uninterrupted run either.
-                        if self._rawr_checkpoint_config is None:
-                            optimizer.zero_grad()
-                        flush()
+                        self._save_at_loop_step()
                         flush_next = True
-                        if self.progress_bar is not None:
-                            self.progress_bar.unpause()
-                            
+
                     if is_sample_step:
                         if self.progress_bar is not None:
                             self.progress_bar.pause()
@@ -3097,14 +3347,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 #############################
 
                 # update various steps
-                self.step_num = step + 1
-                self.grad_accumulation_step += 1
+                self._end_loop_iteration(step)
                 self.end_step_hook()
 
 
         ###################################################################
         ##  END TRAIN LOOP
         ###################################################################
+        self._remove_update_commit_observers()
         self.accelerator.wait_for_everyone()
         if self.progress_bar is not None:
             self.progress_bar.close()

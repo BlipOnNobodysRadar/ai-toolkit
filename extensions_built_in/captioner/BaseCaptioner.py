@@ -2,8 +2,10 @@ import asyncio
 from collections import OrderedDict
 
 import sqlite3
+from toolkit.ui_run_fence import RunFence
 import os
 import re
+import tempfile
 from typing import Literal, Optional
 import threading
 import time
@@ -71,6 +73,9 @@ class BaseCaptioner(BaseExtensionProcess):
         self.sqlite_db_path = self.config.get("sqlite_db_path", "./aitk_db.db")
         self.job_id = os.environ.get("AITK_JOB_ID", None)
         self.job_id = self.job_id.strip() if self.job_id is not None else None
+        # a UI run id fences every Job read/write to this launch; a fenced run must own its row to start
+        self.fence = RunFence(self.job_id)
+        self.fence.require_owned(self.sqlite_db_path)
         self.is_ui_captioner = True
         if not os.path.exists(self.sqlite_db_path):
             self.is_ui_captioner = False
@@ -182,11 +187,23 @@ class BaseCaptioner(BaseExtensionProcess):
     def save_caption_for_file(self, file_path: str, caption: str):
         filename_no_ext = os.path.splitext(file_path)[0]
         caption_file_path = f"{filename_no_ext}.{self.caption_config.caption_extension}"
-        # delete it if it already exists
-        if os.path.exists(caption_file_path):
-            os.remove(caption_file_path)
-        with open(caption_file_path, "w", encoding="utf-8") as f:
-            f.write(caption)
+        # Write a new file and swap the name: a failed write (disk full, a kill, a locked file) must leave the
+        # existing caption, which with recaption may be the user's own, rather than none. The loop moves on.
+        temp = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=os.path.dirname(caption_file_path) or ".",
+                prefix=".", suffix=".caption.tmp", delete=False
+            ) as f:
+                temp = f.name
+                f.write(caption)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp, caption_file_path)
+            temp = None
+        finally:
+            if temp is not None and os.path.exists(temp):
+                os.unlink(temp)
 
     def get_caption_for_file(self, file_path: str) -> str:
         raise NotImplementedError("Captioning not implemented for this captioner")
@@ -413,13 +430,15 @@ class BaseCaptioner(BaseExtensionProcess):
     def should_stop(self):
         if not self.is_ui_captioner:
             return False
+        if self.fence.superseded:  # a fenced write matched no row: this run no longer owns the job
+            return True
 
         def _check_stop():
             with self._db_connect() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT stop FROM Job WHERE id = ?", (self.job_id,))
+                cursor.execute(f"SELECT stop FROM Job WHERE {self.fence.job_clause}", self.fence.params())
                 stop = cursor.fetchone()
-                return False if stop is None else stop[0] == 1
+                return self.fence.flag(stop, stop=True)
 
         return self._retry_db_operation(_check_stop)
 
@@ -431,10 +450,10 @@ class BaseCaptioner(BaseExtensionProcess):
             with self._db_connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT return_to_queue FROM Job WHERE id = ?", (self.job_id,)
+                    f"SELECT return_to_queue FROM Job WHERE {self.fence.job_clause}", self.fence.params()
                 )
                 return_to_queue = cursor.fetchone()
-                return False if return_to_queue is None else return_to_queue[0] == 1
+                return self.fence.flag(return_to_queue, stop=False)
 
         return self._retry_db_operation(_check_return_to_queue)
 
@@ -442,12 +461,13 @@ class BaseCaptioner(BaseExtensionProcess):
         if not self.is_ui_captioner:
             return
         if self.should_stop():
-            self._run_async_operation(self._update_status("stopped", "Job stopped"))
+            # before the blocking write: the stop watcher must not interrupt this graceful shutdown
             self.is_stopping = True
+            self._run_async_operation(self._update_status("stopped", "Job stopped"))
             raise Exception("Job stopped")
         if self.should_return_to_queue():
-            self._run_async_operation(self._update_status("queued", "Job queued"))
             self.is_stopping = True
+            self._run_async_operation(self._update_status("queued", "Job queued"))
             raise Exception("Job returning to queue")
 
     async def _update_key(self, key, value):
@@ -463,8 +483,9 @@ class BaseCaptioner(BaseExtensionProcess):
                         value_to_insert = str(value)
 
                     # Use parameterized query for both the column name and value
-                    update_query = f"UPDATE Job SET {key} = ? WHERE id = ?"
-                    cursor.execute(update_query, (value_to_insert, self.job_id))
+                    update_query = f"UPDATE Job SET {key} = ? WHERE {self.fence.job_clause}"
+                    cursor.execute(update_query, self.fence.params(value_to_insert))
+                    self.fence.wrote(cursor)
                 finally:
                     cursor.execute("COMMIT")
 
@@ -491,14 +512,15 @@ class BaseCaptioner(BaseExtensionProcess):
                 try:
                     if info is not None:
                         cursor.execute(
-                            "UPDATE Job SET status = ?, info = ? WHERE id = ?",
-                            (status, info, self.job_id),
+                            f"UPDATE Job SET status = ?, info = ? WHERE {self.fence.job_clause}",
+                            self.fence.params(status, info),
                         )
                     else:
                         cursor.execute(
-                            "UPDATE Job SET status = ? WHERE id = ?",
-                            (status, self.job_id),
+                            f"UPDATE Job SET status = ? WHERE {self.fence.job_clause}",
+                            self.fence.params(status),
                         )
+                    self.fence.wrote(cursor)
                 finally:
                     cursor.execute("COMMIT")
 
