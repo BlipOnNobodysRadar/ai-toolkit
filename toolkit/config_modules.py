@@ -812,6 +812,9 @@ class ModelConfig:
         # 0 is off and 1.0 is 100% of the layers
         self.layer_offloading_transformer_percent = kwargs.get("layer_offloading_transformer_percent", 1.0)
         self.layer_offloading_text_encoder_percent = kwargs.get("layer_offloading_text_encoder_percent", 1.0)
+        # with gradient checkpointing, keep each transformer block's saved input in CPU RAM between forward and
+        # backward (toolkit/memory_management/activation_offload.py). Models opt in; currently MiniMax-H3.
+        self.activation_offloading = kwargs.get("activation_offloading", False)
 
         # can be used to load the extras like text encoder or vae from here
         # only setup for some models but will prevent having to download the te for
@@ -834,6 +837,10 @@ class ModelConfig:
         self.compile_mode = kwargs.get("compile_mode", "default")
         self.compile_fullgraph = kwargs.get("compile_fullgraph", False)
         self.compile_dynamic = kwargs.get("compile_dynamic", True)
+        if self.activation_offloading and self.compile:
+            # activation offloading frees and refills storages and registers hooks from Python between blocks,
+            # which compiled graphs can neither capture nor be trusted around
+            raise ValueError("activation_offloading is eager-only; turn off model.compile to use it")
         self.cache_size_limit = kwargs.get("cache_size_limit", None)
         
         # kwargs to pass to the model

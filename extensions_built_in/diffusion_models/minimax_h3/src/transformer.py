@@ -30,6 +30,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+from toolkit.memory_management.activation_offload import ActivationOffloader
 from toolkit.models.v2._mixin import OstrisModelMixin
 
 import torch
@@ -479,6 +480,9 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
         self.final_layer = MiniMaxH3FinalLayer(p)
 
         self.gradient_checkpointing = False
+        # model.activation_offloading: with gradient checkpointing, keep each
+        # block's saved input in CPU RAM between forward and backward
+        self.activation_offloading = False
         # None = dense attention. Set by the FastH3 model wrapper; only takes
         # effect on gate_compress checkpoints when the caller passes the grid.
         self.vsa_sparsity: Optional[float] = None
@@ -604,9 +608,13 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
                 )
             )
 
+        checkpointing = torch.is_grad_enabled() and self.gradient_checkpointing
+        offloader = (
+            ActivationOffloader() if checkpointing and self.activation_offloading else None
+        )
         for block in self.blocks:
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                x = checkpoint(
+            if checkpointing:
+                block_out = checkpoint(
                     block,
                     x,
                     temb,
@@ -616,8 +624,15 @@ class MiniMaxH3Transformer(nn.Module, OstrisModelMixin):
                     vsa_ctx,
                     use_reentrant=False,
                 )
+                if offloader is not None:
+                    # x (this block's saved input) is not read again until
+                    # this block's recompute
+                    offloader.stash(x, block_out)
+                x = block_out
             else:
                 x = block(x, temb, adaln_indices, rotary_emb, attn_mask, vsa_ctx)
+        if offloader is not None:
+            offloader.log_once()
 
         return self.final_layer(
             x, temb, inverse, video_indices, audio_indices, pdd_weights
