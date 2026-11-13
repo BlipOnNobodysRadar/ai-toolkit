@@ -621,6 +621,17 @@ class TrainConfig:
         if not 0 < self.logit_normal_cutoff <= 1:
             raise ValueError('logit_normal_cutoff must be in (0, 1]')
 
+        self.logit_normal_clean_schedule = kwargs.get('logit_normal_clean_schedule', None)
+        if self.logit_normal_clean_schedule is not None:
+            from toolkit.clean_share_curriculum import CleanShareSchedule
+            CleanShareSchedule(self.logit_normal_clean_schedule)
+            if (self.noise_scheduler != 'flowmatch' or self.timestep_type != 'logit_normal'
+                    or self.content_or_style != 'balanced' or self.min_denoising_steps != 0
+                    or self.max_denoising_steps < self.num_train_timesteps - 1
+                    or kwargs.get('first_timestep_chance', 0) != 0
+                    or kwargs.get('linear_timesteps', False) or kwargs.get('linear_timesteps2', False)):
+                raise ValueError('clean-share curriculum requires full-range balanced logit_normal flowmatch sampling')
+
         self.first_timestep_chance = kwargs.get('first_timestep_chance', 0.0)
         
         self.next_sample_timesteps = kwargs.get('next_sample_timesteps', 8)

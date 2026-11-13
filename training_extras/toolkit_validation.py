@@ -40,6 +40,8 @@ def setup(trainer):
             loader = get_dataloader_from_datasets(configs, 1, trainer.sd)
             for i, batch in enumerate(loader):
                 if i >= cfg.max_batches: break
+                # Validation uses explicit fixed sigmas below, never advances curriculum.
+                batch._clean_share_validation = True
                 _, noise, _, prompts, _ = trainer.process_general_training_batch(batch)
                 trainer.sd.text_encoder_to(device)
                 embeds = trainer.sd.encode_prompt(prompts).detach().to('cpu', dtype=torch.float32)

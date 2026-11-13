@@ -418,6 +418,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             'step': self.step_num,
             'epoch': self.epoch_num,
         })
+        cursor = getattr(self, '_clean_share_cursor', None)
+        if cursor is not None:
+            info['clean_share_curriculum'] = cursor.state_dict()
         return info
 
     def clean_up_saves(self):
@@ -987,6 +990,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.step_num = meta['training_info'].get('completed_steps', meta['training_info']['step'])
             if 'epoch' in meta['training_info']:
                 self.epoch_num = meta['training_info']['epoch']
+            self._clean_share_saved = meta['training_info'].get('clean_share_curriculum')
             self.start_step = self.step_num
             print_acc(f"Found step {self.step_num} in metadata, starting from there")
 
@@ -1044,6 +1048,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.step_num = meta['training_info'].get('completed_steps', meta['training_info']['step'])
                 if 'epoch' in meta['training_info']:
                     self.epoch_num = meta['training_info']['epoch']
+                self._clean_share_saved = meta['training_info'].get('clean_share_curriculum')
                 self.start_step = self.step_num
                 print_acc(f"Found step {self.step_num} in metadata, starting from there")
 
@@ -1327,13 +1332,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     elif hasattr(self.sd.unet, 'config') and hasattr(self.sd.unet.config, 'patch_size'):
                         patch_size = self.sd.unet.config.patch_size
                     
+                    flow_kwargs = self.train_config.flow_timestep_kwargs(timestep_type)
+                    if (self.train_config.logit_normal_clean_schedule is not None
+                            and not getattr(batch, '_clean_share_validation', False)):
+                        from toolkit.clean_share_curriculum import scheduled_mean
+                        epoch = getattr(batch, '_clean_share_epoch', None)
+                        if epoch is None:
+                            raise ValueError('clean-share curriculum batch is missing epoch provenance')
+                        flow_kwargs['logit_mean'] = scheduled_mean(
+                            self.train_config.logit_normal_clean_schedule, epoch,
+                            flow_kwargs['logit_std'], flow_kwargs['cutoff'], flow_kwargs['uniform_mix'])
                     self.sd.noise_scheduler.set_train_timesteps(
                         num_train_timesteps,
                         device=self.device_torch,
                         timestep_type=timestep_type,
                         latents=latents,
                         patch_size=patch_size,
-                        **self.train_config.flow_timestep_kwargs(timestep_type),
+                        **flow_kwargs,
                     )
                 else:
                     self.sd.noise_scheduler.set_timesteps(
@@ -2726,6 +2741,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 rawr_stochastic_saved = rawr_resume['payload'].get('training_state', {}).get('stochastic')
             self._rawr_stochastic = StochasticResume(self, rawr_stochastic_saved)
 
+        curriculum_cursor = None
+        if self.train_config.logit_normal_clean_schedule is not None:
+            from toolkit.clean_share_curriculum import prepare_curriculum
+            from training_extras.rawr_stochastic import loader_identities
+            curriculum_cursor = prepare_curriculum(self, loader_identities(self))
+
         self._data_epoch = 0
         if self.step_num > 0 and self._rng_seed(0, 0) is not None:
             concurrent = [d.folder_path for d in (self.datasets or []) + (self.datasets_reg or [])
@@ -2744,6 +2765,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 per_epoch = len(dataloader)
                 if per_epoch:
                     self._data_epoch, skip = divmod(self.step_num * self.train_config.gradient_accumulation, per_epoch)
+            if curriculum_cursor is not None:
+                self._data_epoch, skip = curriculum_cursor.position
             if skip == 0 and self._data_epoch > 0:
                 # resumed exactly on an epoch boundary: let the first fetch take the in-loop epoch reset, like an
                 # uninterrupted run (creating an iterator draws a worker base seed from the global RNG, so creating
@@ -2848,6 +2871,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     is_sample_step = False
 
                 batch_list = []
+                if curriculum_cursor is not None:
+                    curriculum_cursor.begin()
 
                 for b in range(self.train_config.gradient_accumulation):
                     # keep track to alternate on an accumulation step for reg   
@@ -2887,6 +2912,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 batch = next(dataloader_iterator)
                     else:
                         batch = None
+                    if curriculum_cursor is not None:
+                        if len(dataloader) != curriculum_cursor.contract['batches_per_epoch']:
+                            raise ValueError('primary loader length changed during clean-share curriculum')
+                        curriculum_cursor.stamp(batch)
                     batch_list.append(batch)
                     batch_step += 1
 
@@ -2913,6 +2942,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
             try:
                 with self.accelerator.accumulate(self.modules_being_trained):
                     loss_dict = self.hook_train_loop(batch_list)
+                if curriculum_cursor is not None:
+                    curriculum_cursor.commit()
                 self._checkpoint_completed_step = step + 1
             except torch.cuda.OutOfMemoryError:
                 did_oom = True
@@ -2922,6 +2953,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 else:
                     raise  # not an OOM; surface real errors
             if did_oom:
+                if curriculum_cursor is not None:
+                    raise RuntimeError('OOM during clean-share curriculum; aborting rather than skipping curriculum data')
                 self.num_consecutive_oom += 1
                 if self.num_consecutive_oom > 3:
                     raise RuntimeError("OOM during training step 3 times in a row, aborting training")
