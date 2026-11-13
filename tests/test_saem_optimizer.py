@@ -150,10 +150,12 @@ def counting_compile(monkeypatch):
         return real_compile(fn, **kwargs)
 
     torch._dynamo.reset()
-    monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 8)
     monkeypatch.setattr(torch, "compile", compile_with_counter)
     monkeypatch.setattr(utils, "_compiled_fns", {})
-    yield counter
+    # torch's own config.patch, not monkeypatch.setattr: pytest 9.2 undoes an instance attribute it did not find in
+    # __dict__ by deleting it, and torch's config module then hides the setting for the rest of the process
+    with torch._dynamo.config.patch(recompile_limit=8):
+        yield counter
     torch._dynamo.reset()
 
 
