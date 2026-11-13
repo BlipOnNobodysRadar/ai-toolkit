@@ -2,12 +2,22 @@
 
 Hugging Face Hub still owns repository metadata, cache layout, authentication,
 and final file placement. This module only replaces the byte-transfer layer so
-large model downloads get aria2's segmented transfers, visible progress, and
-reliable continuation from the Hub's existing ``.incomplete`` files.
+large model downloads get aria2's segmented transfers and visible progress.
+
+Opt-in. run.py installs the patch at startup when AITK_HF_DOWNLOADER=aria2;
+without it Hugging Face's native downloader (Xet) is used, which is what every
+run did before 13 Nov 2026: the patch used to live in a repo-root
+sitecustomize.py, which Python never imports for ``python run.py``.
+
+Resuming across runs depends on the Hub version. huggingface_hub 1.23 (the
+pinned version) writes each download to a uniquely named temporary file and
+deletes it on failure, so an interrupted download restarts from zero there;
+aria2 still retries and resumes within a run.
 
 Environment variables:
-    AITK_HF_DOWNLOADER=hf
-        Disable this patch and use Hugging Face's native downloader.
+    AITK_HF_DOWNLOADER=aria2
+        Use this patch. Anything else (default: hf) keeps Hugging Face's native
+        downloader. Turning it on disables Xet transfers for the process.
     AITK_ARIA2_BIN=/path/to/aria2c
         Override aria2c executable discovery.
     AITK_ARIA2_AUTO_INSTALL=0
@@ -348,18 +358,27 @@ def aria2_http_get(
     )
 
 
+def aria2_requested() -> bool:
+    """True when AITK_HF_DOWNLOADER asks for aria2 (opt-in; the default is Hugging Face's own downloader)."""
+    return os.environ.get("AITK_HF_DOWNLOADER", "hf").strip().lower() == "aria2"
+
+
 def patch_huggingface_downloads() -> bool:
-    """Patch Hugging Face Hub's regular HTTP transfer function once."""
+    """Patch Hugging Face Hub's regular HTTP transfer function once. Returns whether the patch is active."""
     global _ORIGINAL_HTTP_GET
 
-    if os.environ.get("AITK_HF_DOWNLOADER", "aria2").strip().lower() != "aria2":
+    if not aria2_requested():
         return False
 
-    # Must be set before huggingface_hub imports its constants. sitecustomize
-    # calls us early enough for normal ai-toolkit startup.
+    # Xet transfers bypass http_get, so turn them off. The environment variable covers child processes and a
+    # huggingface_hub that is not imported yet; the constant covers one that already is (importing the toolkit
+    # package imports it, so by the time run.py calls this the variable alone would be read too late).
     os.environ["HF_HUB_DISABLE_XET"] = "1"
 
+    import huggingface_hub.constants as hub_constants
     import huggingface_hub.file_download as file_download
+
+    hub_constants.HF_HUB_DISABLE_XET = True
 
     current = file_download.http_get
     if getattr(current, "_aitk_aria2_patch", False):

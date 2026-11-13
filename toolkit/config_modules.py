@@ -1210,6 +1210,9 @@ class DatasetConfig:
         self.do_audio: bool = kwargs.get('do_audio', False) # load audio from video files for models that support it
         self.audio_preserve_pitch: bool = kwargs.get('audio_preserve_pitch', False) # preserve pitch when stretching audio to fit num_frames
         self.audio_normalize: bool = kwargs.get('audio_normalize', False) # normalize audio volume levels when loading
+        # LTX-2: run this dataset's batches with the audio and video streams isolated from each other
+        # (extensions_built_in/diffusion_models/ltx2/__init__.py passes isolate_modalities to the transformer)
+        self.isolate_modalities: bool = bool(kwargs.get('isolate_modalities', False))
 
 
 def preprocess_dataset_raw_config(raw_config: List[dict]) -> List[dict]:
