@@ -1182,7 +1182,10 @@ def apply_weight_decay(
     if (not cautious_weight_decay and not isinstance(weight_decay, torch.Tensor)
             and weight_decay == 0.0):
         return
-    if torch_compile:
+    # Coupled decay (grad += wd * p) stays eager: the compiled kernel's `weight_decay > 0.0` test on a tensor is a
+    # data-dependent branch, which fullgraph compile rejects (Unsupported at step 2). Only decoupled and cautious
+    # decay are compiled.
+    if torch_compile and (cautious_weight_decay or weight_decouple):
         lr_t = torch.tensor(lr, device=p.device, dtype=p.dtype) if not isinstance(lr, torch.Tensor) else lr
         wd_t = torch.tensor(weight_decay, device=p.device, dtype=p.dtype) if not isinstance(weight_decay, torch.Tensor) else weight_decay
         ratio_t = torch.tensor(ratio, device=p.device, dtype=p.dtype) if (ratio is not None and not isinstance(ratio, torch.Tensor)) else ratio
@@ -1192,7 +1195,7 @@ def apply_weight_decay(
     elif weight_decouple:
         p.mul_(1.0 - weight_decay * (1.0 if fixed_decay else lr) * (ratio if ratio is not None else 1.0))
     elif weight_decay > 0.0 and grad is not None:
-        grad.add_(p, alpha=weight_decay)
+        grad.add_(p, alpha=weight_decay.item() if isinstance(weight_decay, torch.Tensor) else weight_decay)
 
 def apply_cautious_weight_decay(
     p: torch.Tensor,

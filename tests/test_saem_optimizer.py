@@ -150,10 +150,12 @@ def counting_compile(monkeypatch):
         return real_compile(fn, **kwargs)
 
     torch._dynamo.reset()
-    monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 8)
     monkeypatch.setattr(torch, "compile", compile_with_counter)
     monkeypatch.setattr(utils, "_compiled_fns", {})
-    yield counter
+    # torch's own config.patch, not monkeypatch.setattr: pytest 9.2 undoes an instance attribute it did not find in
+    # __dict__ by deleting it, and torch's config module then hides the setting for the rest of the process
+    with torch._dynamo.config.patch(recompile_limit=8):
+        yield counter
     torch._dynamo.reset()
 
 
@@ -246,3 +248,24 @@ def test_compiled_state_dict_round_trip(counting_compile):
     for a, b in zip(params, resumed_params):
         assert torch.equal(a, b)
     assert counting_compile.frame_count == len(SHAPES)
+
+
+def test_coupled_weight_decay_runs_with_torch_compile(counting_compile):
+    """weight_decouple=False with weight_decay > 0 and torch_compile=True (the default for SimplifiedAdEMAMixExM):
+    the compiled kernel's `weight_decay > 0.0` branch on a tensor is data-dependent, so dynamo (fullgraph) raised at
+    step 2 (Astra, PR #8 review, 14 Nov). Coupled decay runs eagerly instead; results match torch_compile=False."""
+    def run(torch_compile):
+        params = _params()
+        opt = SimplifiedAdEMAMixExM(
+            params, lr=1e-3, weight_decay=0.05, weight_decouple=False, torch_compile=torch_compile,
+            use_stable_spam_clipping=False, use_newton_schulz=False,
+        )
+        for step in range(4):
+            _set_grads(params, step)
+            opt.step()
+        return params
+
+    compiled = run(True)
+    eager = run(False)
+    for a, b in zip(compiled, eager):
+        torch.testing.assert_close(a, b, rtol=1e-6, atol=1e-7)

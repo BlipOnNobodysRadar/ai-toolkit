@@ -269,9 +269,11 @@ def test_dynamo_previews_stay_eager_and_recompile_limit_falls_back(monkeypatch):
     with torch.no_grad():
         model(*_batch((7,)))
     assert counts == trained
-    monkeypatch.setattr(torch._dynamo.config, "recompile_limit", 1)
-    _step(model, (8,))  # batch 1 specializes: new variants, over the forced limit
-    _step(model, (9, 3, 3, 6))
+    # torch's own config.patch, not monkeypatch.setattr: pytest 9.2 undoes an instance attribute it did not find in
+    # __dict__ by deleting it, and torch's config module then hides the setting for the rest of the process
+    with torch._dynamo.config.patch(recompile_limit=1):
+        _step(model, (8,))  # batch 1 specializes: new variants, over the forced limit
+        _step(model, (9, 3, 3, 6))
     torch._dynamo.reset()
 
 

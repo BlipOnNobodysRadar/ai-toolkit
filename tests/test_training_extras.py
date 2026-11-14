@@ -367,3 +367,28 @@ def test_profiles_usual_mapped_warmup_matches_steps():
                                                  "datasets": [{"folder_path": "x"}], "train": {"steps": 750}}]}}
     usual = dict(generate(doc))["usual_mapped"]["config"]["process"][0]["train"]["optimizer_params"]
     assert usual["beta1_warmup"] == 750
+
+
+@pytest.mark.parametrize("name", ["simplifiedademamixexm", "simplified_ademamix_exm", "ademamixexm",
+                                  "SimplifiedAdEMAMixExM", "easy:SimplifiedAdEMAMixExM"])
+def test_every_saem_name_builds_the_one_maintained_class(name):
+    """The short names used to load a second, older copy under toolkit/optimizers that missed later fixes."""
+    import inspect
+    from pathlib import Path
+    from toolkit.optimizer import get_optimizer
+    from training_extras.optim import resolve
+
+    p = torch.nn.Parameter(torch.zeros(4, 2))
+    # "1e-4" is how PyYAML reads an exponent written without a dot; the short names have always accepted it
+    lr = "1e-4" if not name.startswith("easy:") else 1e-4
+    opt = get_optimizer([{"params": [p], "lr": 1e-4}], name, learning_rate=lr,
+                        optimizer_params={"torch_compile": False, "weight_decay": 0.01})
+    assert type(opt) is resolve("easy:SimplifiedAdEMAMixExM")
+    source = Path(inspect.getsourcefile(type(opt))).as_posix()
+    assert source.endswith("training_extras/vendor/LoraEasyCustomOptimizer/ademamix.py")
+    assert opt.defaults["lr"] == pytest.approx(1e-4) and opt.param_groups[0]["weight_decay"] == 0.01
+
+
+def test_no_second_saem_copy_in_toolkit_optimizers():
+    import importlib.util
+    assert importlib.util.find_spec("toolkit.optimizers.simplified_ademamix") is None

@@ -187,6 +187,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
             dataset.cache_text_embeddings for dataset in self.dataset_configs
         )
 
+        # name config keys that nothing reads (typos, options under the wrong section) instead of dropping them
+        from toolkit.config_key_check import check_train_process
+        self.unknown_config_keys = check_train_process(self)
+
         self.embed_config = None
         embedding_raw = self.get_conf('embedding', None)
         if embedding_raw is not None:

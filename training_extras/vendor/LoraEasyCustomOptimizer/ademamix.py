@@ -1510,7 +1510,7 @@ class SimplifiedAdEMAMixExM(BaseOptimizer):
                     update.clamp_(-adopt_clip, adopt_clip)
 
                     wd_lr, wd = group['lr'], group['weight_decay']
-                    if torch_compile and wd != 0.0:
+                    if torch_compile and wd != 0.0 and group['weight_decouple']:  # coupled decay runs eagerly
                         # Same values apply_weight_decay would build per param
                         # (fp32 on p_fp32's device), but one blocking H2D per
                         # step instead of two per parameter.
