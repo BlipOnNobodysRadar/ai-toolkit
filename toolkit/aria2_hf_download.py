@@ -252,6 +252,21 @@ def _remove_orphaned_control_files(folder: Path) -> None:
         pass
 
 
+_LONG_PREFIX = chr(92) * 2 + "?" + chr(92)
+
+
+def _plain_path(target: Path) -> str:
+    s = str(target)
+    return s[len(_LONG_PREFIX):] if s.startswith(_LONG_PREFIX) else s
+
+
+def _too_long_for_aria2(target: Path, windows: Optional[bool] = None) -> bool:
+    """True when aria2c (no long-path support on Windows) can't open target or its .aria2 control file."""
+    if windows is None:
+        windows = os.name == "nt"
+    return windows and len(_plain_path(target)) + len(".aria2") >= 260
+
+
 def aria2_http_get(
     url: str,
     temp_file: BinaryIO,
@@ -293,6 +308,26 @@ def aria2_http_get(
         )
 
     target = Path(os.fsdecode(os.fspath(target_name))).resolve()
+    if _too_long_for_aria2(target):
+        # aria2c on Windows can't open a path past MAX_PATH; Hugging Face reaches those through the long-path prefix.
+        # Seen 14 Nov 2026: aria2 exit 16 on a 279-character cache temp path under a deep worktree's models folder.
+        # Download this file with the hub's own code instead of failing the job.
+        if _ORIGINAL_HTTP_GET is None:
+            raise RuntimeError(f"Path too long for aria2c on Windows: {target}")
+        print(
+            f"[ai-toolkit/aria2] Path too long for aria2c on Windows ({len(_plain_path(target))} characters); "
+            f"using the Hugging Face downloader for {displayed_filename or target.name}",
+            flush=True,
+        )
+        return _ORIGINAL_HTTP_GET(
+            url,
+            temp_file,
+            resume_size=resume_size,
+            headers=headers,
+            expected_size=expected_size,
+            displayed_filename=displayed_filename,
+            _tqdm_bar=_tqdm_bar,
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
     _remove_orphaned_control_files(target.parent)
 
