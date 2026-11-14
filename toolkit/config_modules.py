@@ -627,6 +627,7 @@ class TrainConfig:
             CleanShareSchedule(self.logit_normal_clean_schedule)
             if (self.noise_scheduler != 'flowmatch' or self.timestep_type != 'logit_normal'
                     or self.content_or_style != 'balanced' or self.min_denoising_steps != 0
+                    or self.loss_type == 'mean_flow'
                     or self.max_denoising_steps < self.num_train_timesteps - 1
                     or kwargs.get('first_timestep_chance', 0) != 0
                     or kwargs.get('linear_timesteps', False) or kwargs.get('linear_timesteps2', False)):

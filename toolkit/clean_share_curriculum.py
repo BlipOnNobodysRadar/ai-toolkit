@@ -69,7 +69,7 @@ class CleanShareSchedule:
                 float(parts[0]) / 100, int(parts[1]), float(parts[2]) / 100,
                 int(parts[3]), int(parts[4]))
         except (ValueError, TypeError):
-            raise ValueError('logit_normal_clean_schedule must be start%:hold_epoch:end%:end_epoch:refresh_period') from None
+            raise ValueError('logit_normal_clean_schedule must be a quoted string: "start%:hold_epoch:end%:end_epoch:refresh_period"') from None
         if not (0 < self.start < 1 and 0 < self.end < 1 and
                 self.hold >= 1 and self.finish > self.hold and self.refresh >= 0):
             raise ValueError('invalid clean-share curriculum percentages or epochs')
@@ -156,6 +156,8 @@ def prepare_curriculum(trainer, data_identity):
         raise ValueError('clean-share curriculum currently supports single-process training only')
     if getattr(trainer.sd, 'is_multistage', False) or trainer.model_config.refiner_name_or_path is not None:
         raise ValueError('clean-share curriculum does not support multistage/refiner timestep ranges')
+    if getattr(trainer.sd.noise_scheduler, 'fixed_train_sigmas', None) is not None:
+        raise ValueError('clean-share curriculum cannot override fixed_train_sigmas')
     stochastic = getattr(trainer, '_rawr_stochastic', None)
     if stochastic is not None and not stochastic.reason:
         raise ValueError('clean-share curriculum cannot combine with recorded stochastic iterator resume')

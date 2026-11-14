@@ -4,6 +4,8 @@ Original implementation of the published Fizgig 8.8.1 epoch curriculum for
 MOSS flow-matching training. This implements the schedule, not a claim of
 training-quality parity with Fizgig or a recommendation to change all runs.
 Algorithm reference: [Fizgig 8.8.1 announcement](https://www.reddit.com/r/StableDiffusion/comments/1xazk0f/fizgig_881_a_new_mossimage_training_technique/).
+The hold/ramp/refresh boundaries follow the
+[pinned algorithm](https://github.com/shootthesound/Fizgig/blob/f0640faf68f163c28ebc5554dd83ea87d6dfb2d8/src/fizgig/moss_image/driver.py#L207-L237).
 This is an independent implementation; no Fizgig source code was copied.
 
 Existing configurations remain unchanged unless this field is set:
@@ -18,6 +20,9 @@ train:
   logit_normal_cutoff: 0.95
   logit_normal_uniform: 0.01
 ```
+
+Keep the schedule string quoted: YAML 1.1 can interpret an unquoted colon-separated
+value as a base-60 integer.
 
 The five fields mean start-percent, hold-through-epoch, end-percent,
 ramp-end-epoch, refresh-period. Epochs are one-based primary dataloader passes:
@@ -47,7 +52,8 @@ Use `gradient_accumulation` for microbatch accumulation; legacy
 
 Currently supported: one nonempty fixed-length primary loader, single process,
 full-range balanced logit-normal flowmatch selection, no regularization loader,
-no multistage/refiner, no first-timestep override or linear timestep overrides.
+no multistage/refiner, no fixed-sigma scheduler (such as H3 Image), no
+`loss_type: mean_flow`, no first-timestep override or linear timestep overrides.
 Unsupported combinations fail rather than silently misrepresent percentages.
 Recorded stochastic-iterator exact resume is not supported together with this
 feature; ordinary RAWR optimizer/scheduler checkpointing is not prohibited.
@@ -66,8 +72,10 @@ separate `max_grad_norm` setting; this feature does not change clipping defaults
 
 ## Review evidence
 
-The 14 November CPU validation includes 68 targeted tests and three uninterrupted
-versus save/resume comparisons through the real trainer (nine executions total).
+The 14 November CPU validation includes 95 targeted regression tests and three
+uninterrupted versus save/resume comparisons through the real trainer (nine
+executions). A further three executions on the reviewed fixes verify the actual
+scheduled means, matching seeded draws and bit-identical final RAWR tensors.
 All runtime probes reported CUDA uninitialized. The sampler tests cover 200,000
 draws per case for hold, ramp, end and refresh targets with and without cutoff.
 Shared-board independent review is recorded separately from these test results.

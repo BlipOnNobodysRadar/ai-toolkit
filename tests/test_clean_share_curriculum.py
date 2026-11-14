@@ -54,13 +54,17 @@ class CurriculumTests(unittest.TestCase):
                               flow_timestep_kwargs=lambda _: SAMPLER)
         trainer = SimpleNamespace(train_config=cfg, data_loader=[1,2,3],
             data_loader_reg=None, accelerator=SimpleNamespace(num_processes=1),
-            sd=SimpleNamespace(is_multistage=False),
+            sd=SimpleNamespace(is_multistage=False, noise_scheduler=SimpleNamespace(fixed_train_sigmas=None)),
             model_config=SimpleNamespace(refiner_name_or_path=None), step_num=0)
         self.assertEqual(module.prepare_curriculum(trainer, [['dataset'], None]).position, (0,0))
         for field, value in [('data_loader_reg', [1]), ('data_loader', None)]:
             old = getattr(trainer, field); setattr(trainer, field, value)
             with self.assertRaises(ValueError): module.prepare_curriculum(trainer, [['dataset'], None])
             setattr(trainer, field, old)
+        trainer.sd.noise_scheduler.fixed_train_sigmas = [1., .5]
+        with self.assertRaisesRegex(ValueError, 'fixed_train_sigmas'):
+            module.prepare_curriculum(trainer, [['dataset'], None])
+        trainer.sd.noise_scheduler.fixed_train_sigmas = None
         trainer.accelerator.num_processes = 2
         with self.assertRaises(ValueError): module.prepare_curriculum(trainer, [['dataset'], None])
         cfg.logit_normal_clean_schedule = None
@@ -69,7 +73,7 @@ class CurriculumTests(unittest.TestCase):
     def test_sampler_wiring_with_validation_exemption(self):
         import ast
         path = Path(__file__).parents[1] / 'jobs/process/BaseSDTrainProcess.py'
-        tree = ast.parse(path.read_text())
+        tree = ast.parse(path.read_text(encoding='utf-8'))
         node = next(n for n in ast.walk(tree) if isinstance(n, ast.If)
                     and isinstance(n.test, ast.BoolOp)
                     and 'logit_normal_clean_schedule' in ast.unparse(n.test)
@@ -87,19 +91,19 @@ class CurriculumTests(unittest.TestCase):
     def test_config_incompatible_selection_rejected(self):
         import ast
         path = Path(__file__).parents[1] / 'toolkit/config_modules.py'
-        tree = ast.parse(path.read_text())
+        tree = ast.parse(path.read_text(encoding='utf-8'))
         node = next(n for n in ast.walk(tree) if isinstance(n, ast.If)
                     and ast.unparse(n.test) == 'self.logit_normal_clean_schedule is not None')
         node.body = [n for n in node.body if not isinstance(n, ast.ImportFrom)]
         code = compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), str(path), 'exec')
         cfg = SimpleNamespace(logit_normal_clean_schedule=SPEC, noise_scheduler='flowmatch',
             timestep_type='logit_normal', content_or_style='balanced', min_denoising_steps=0,
-            max_denoising_steps=999, num_train_timesteps=1000)
+            max_denoising_steps=999, num_train_timesteps=1000, loss_type='mse')
         def run(kwargs=None): exec(code, dict(self=cfg, kwargs=kwargs or {}, CleanShareSchedule=CleanShareSchedule))
         run()
         for field, value in [('noise_scheduler','ddpm'), ('timestep_type','linear'),
                              ('content_or_style','content'), ('min_denoising_steps',1),
-                             ('max_denoising_steps',998)]:
+                             ('max_denoising_steps',998), ('loss_type','mean_flow')]:
             old = getattr(cfg,field); setattr(cfg,field,value)
             with self.assertRaises(ValueError): run()
             setattr(cfg,field,old)
