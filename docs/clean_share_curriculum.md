@@ -56,15 +56,20 @@ a curriculum cursor. Native held-out validation retains its explicit fixed
 sigmas and never advances the training curriculum.
 
 No GPU training-quality validation has been performed for this addition.
-CPU tests cover phase boundaries, probability inversion, accumulation provenance
-and resume guards. Run a short new-output training/resume smoke test before a
-long experiment. Gradient clipping remains a separate `max_grad_norm` setting.
+CPU tests cover phase boundaries, probability inversion against the real Torch
+sampler, accumulation provenance and resume guards. Real tiny-model CPU trainer
+runs also preserve curriculum phase through seeded mid-epoch, unseeded
+epoch-boundary and seeded RAWR save/resume paths. These fixtures do not establish
+MOSS quality, GPU behavior or bitwise continuation. Run a short new-output MOSS
+training/resume smoke test before a long experiment. Gradient clipping remains a
+separate `max_grad_norm` setting; this feature does not change clipping defaults.
 
 ## Review evidence
 
-An independent implementation review checked epoch provenance across accumulation,
-resume offsets including exact epoch boundaries and JSON metadata roundtrips,
-validation bypass, probability inversion and unsupported-mode guards. Eight CPU
-unit/AST integration tests passed. Full PyTorch/GPU validation remains pending.
-Project-required shared-board review and owner merge approval remain pending;
-this review record is not a substitute for those gates.
+The 14 November CPU validation includes 68 targeted tests and three uninterrupted
+versus save/resume comparisons through the real trainer (nine executions total).
+All runtime probes reported CUDA uninitialized. The sampler tests cover 200,000
+draws per case for hold, ramp, end and refresh targets with and without cutoff.
+Shared-board independent review is recorded separately from these test results.
+There is no PR-triggered CI workflow in this checkout; absent checks are not a
+passing CI result.
