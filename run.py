@@ -22,6 +22,11 @@ sys.path.insert(0, os.getcwd())
 from toolkit.win_console import suppress_child_consoles
 suppress_child_consoles()
 
+# aria2 transfers for Hugging Face downloads, on by default (AITK_HF_DOWNLOADER=hf turns them off).
+# Installed here, before any model code runs: a repo-root sitecustomize.py is never imported for `python run.py`.
+from toolkit.aria2_hf_download import patch_huggingface_downloads
+patch_huggingface_downloads()
+
 # must come before ANY torch or fastai imports
 # import toolkit.cuda_malloc
 

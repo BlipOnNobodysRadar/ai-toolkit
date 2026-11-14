@@ -107,14 +107,14 @@ def get_optimizer(
         from toolkit.optimizers.automagic3 import Automagic3
         optimizer = Automagic3(params, lr=float(learning_rate), **optimizer_params)
     elif lower_type in {"simplifiedademamixexm", "simplified_ademamix_exm", "ademamixexm"}:
-        from toolkit.optimizers.simplified_ademamix import SimplifiedAdEMAMixExM
+        # One implementation under every name: the maintained copy that easy:SimplifiedAdEMAMixExM uses. These
+        # names used to load a second, June 2026 copy (toolkit/optimizers/simplified_ademamix.py) that never got the
+        # later fixes (resume precision, CPU-state transfers, compiled StableSPAM), so the same optimizer ran
+        # different code depending on how a config spelled it.
+        from training_extras.optim import create_optimizer
 
         print("Using SimplifiedAdEMAMixExM optimizer")
-        optimizer = SimplifiedAdEMAMixExM(
-            params,
-            lr=float(learning_rate),
-            **optimizer_params,
-        )
+        optimizer = create_optimizer(params, "easy:SimplifiedAdEMAMixExM", float(learning_rate), optimizer_params)
     elif lower_type == 'automagic4':
         from toolkit.optimizers.automagic4 import Automagic4
         optimizer = Automagic4(params, lr=float(learning_rate), **optimizer_params)
