@@ -164,7 +164,14 @@ def test_every_typed_set_train_timesteps_call_forwards_the_options():
                     break
             call = src[start:end]
             if "timestep_type=" in call:
-                assert "flow_timestep_kwargs(timestep_type)" in call, f"{rel}: {call[:80]}"
+                # The curriculum overrides one entry in this same kwargs mapping
+                # before forwarding it; other callers still expand it inline.
+                direct = "flow_timestep_kwargs(timestep_type)" in call
+                prepared = (
+                    "**flow_kwargs" in call
+                    and "flow_kwargs = self.train_config.flow_timestep_kwargs(timestep_type)" in src[:start]
+                )
+                assert direct or prepared, f"{rel}: {call[:80]}"
                 checked += 1
             start = src.find("set_train_timesteps(", end)
     assert checked == 3
