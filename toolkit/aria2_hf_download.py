@@ -4,10 +4,15 @@ Hugging Face Hub still owns repository metadata, cache layout, authentication,
 and final file placement. This module only replaces the byte-transfer layer so
 large model downloads get aria2's segmented transfers and visible progress.
 
-Opt-in. run.py installs the patch at startup when AITK_HF_DOWNLOADER=aria2;
-without it Hugging Face's native downloader (Xet) is used, which is what every
-run did before 13 Nov 2026: the patch used to live in a repo-root
-sitecustomize.py, which Python never imports for ``python run.py``.
+On by default (Ryan's call, 13 Nov 2026): run.py installs the patch at startup
+unless AITK_HF_DOWNLOADER says otherwise. Before that date the patch lived in a
+repo-root sitecustomize.py, which Python never imports for ``python run.py``,
+so jobs were in fact using Hugging Face's native downloader (Xet).
+
+What on-by-default means in practice: Xet transfers are off for the process;
+on Windows a missing aria2c is downloaded once (see AITK_ARIA2_AUTO_INSTALL);
+on Linux without aria2c and without root, the first download stops with an
+error that says to install aria2 or set AITK_HF_DOWNLOADER=hf.
 
 Resuming across runs depends on the Hub version. huggingface_hub 1.23 (the
 pinned version) writes each download to a uniquely named temporary file and
@@ -15,9 +20,9 @@ deletes it on failure, so an interrupted download restarts from zero there;
 aria2 still retries and resumes within a run.
 
 Environment variables:
-    AITK_HF_DOWNLOADER=aria2
-        Use this patch. Anything else (default: hf) keeps Hugging Face's native
-        downloader. Turning it on disables Xet transfers for the process.
+    AITK_HF_DOWNLOADER=hf
+        Turn this patch off and use Hugging Face's native downloader (Xet).
+        Any value other than aria2 does the same.
     AITK_ARIA2_BIN=/path/to/aria2c
         Override aria2c executable discovery.
     AITK_ARIA2_AUTO_INSTALL=0
@@ -225,6 +230,28 @@ def _update_aggregate_bar(bar: Any, delta: int) -> None:
         update(delta)
 
 
+# Whether a failed download can be continued is huggingface_hub's decision, not this module's.
+_PARTIAL_FILE_NOTE = (
+    "Whether the next run continues this file depends on huggingface_hub: 1.23 deletes "
+    "the partial file, so there the download starts over."
+)
+
+
+def _remove_orphaned_control_files(folder: Path) -> None:
+    """Delete aria2 control files (<file>.aria2) whose data file is gone.
+
+    huggingface_hub 1.23 deletes a failed download's temporary file but knows nothing about aria2's sidecar,
+    and its temporary names are unique per attempt, so each failure would otherwise leave one behind for good.
+    A control file without its data file is useless under any Hub version.
+    """
+    try:
+        for control in folder.glob("*.aria2"):
+            if not control.with_suffix("").exists():
+                control.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def aria2_http_get(
     url: str,
     temp_file: BinaryIO,
@@ -267,6 +294,7 @@ def aria2_http_get(
 
     target = Path(os.fsdecode(os.fspath(target_name))).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
+    _remove_orphaned_control_files(target.parent)
 
     # Hugging Face normally opens this path in append mode and derives
     # resume_size from it. Keep the path and partial bytes intact on resume.
@@ -325,11 +353,11 @@ def aria2_http_get(
         if completed.returncode != 0:
             raise RuntimeError(
                 f"aria2c exited with code {completed.returncode} while downloading "
-                f"{label}. The partial file was kept and will be resumed next run."
+                f"{label}. {_PARTIAL_FILE_NOTE}"
             )
     except KeyboardInterrupt:
         print(
-            f"\n[ai-toolkit/aria2] Interrupted {label}; partial download kept for resume.",
+            f"\n[ai-toolkit/aria2] Interrupted {label}. {_PARTIAL_FILE_NOTE}",
             flush=True,
         )
         raise
@@ -347,8 +375,7 @@ def aria2_http_get(
     if expected_size is not None and actual_size != expected_size:
         raise OSError(
             f"aria2 download size mismatch for {label}: expected "
-            f"{expected_size} bytes, got {actual_size} bytes. The partial file "
-            "was kept so the next run can continue it."
+            f"{expected_size} bytes, got {actual_size} bytes. {_PARTIAL_FILE_NOTE}"
         )
 
     _update_aggregate_bar(_tqdm_bar, max(0, actual_size - resume_size))
@@ -359,8 +386,8 @@ def aria2_http_get(
 
 
 def aria2_requested() -> bool:
-    """True when AITK_HF_DOWNLOADER asks for aria2 (opt-in; the default is Hugging Face's own downloader)."""
-    return os.environ.get("AITK_HF_DOWNLOADER", "hf").strip().lower() == "aria2"
+    """True unless AITK_HF_DOWNLOADER is set to something other than aria2 (on by default)."""
+    return os.environ.get("AITK_HF_DOWNLOADER", "aria2").strip().lower() == "aria2"
 
 
 def patch_huggingface_downloads() -> bool:

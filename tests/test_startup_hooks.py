@@ -1,6 +1,6 @@
 """The two features that used to hang off a repo-root sitecustomize.py, which Python never imports for
 `python run.py` (the script directory joins sys.path after the site module has run): the aria2 Hugging Face
-downloader and the LTX-2 isolate_modalities dataset option."""
+downloader (on by default, AITK_HF_DOWNLOADER=hf turns it off) and the LTX-2 isolate_modalities dataset option."""
 import ast
 import os
 import subprocess
@@ -53,32 +53,47 @@ def hub_download_state():
             os.environ[name] = value
 
 
-@pytest.mark.parametrize("value", [None, "hf", "HF", ""])
-def test_aria2_is_off_unless_asked_for(hub_download_state, value):
+@pytest.mark.parametrize("value", ["hf", "HF", "", "xet"])
+def test_any_other_downloader_value_turns_aria2_off(hub_download_state, value):
     aria2, file_download, constants = hub_download_state
     native, xet_disabled = file_download.http_get, constants.HF_HUB_DISABLE_XET
-    if value is None:
-        os.environ.pop("AITK_HF_DOWNLOADER", None)
-    else:
-        os.environ["AITK_HF_DOWNLOADER"] = value
+    os.environ["AITK_HF_DOWNLOADER"] = value
     assert aria2.patch_huggingface_downloads() is False
     assert file_download.http_get is native and constants.HF_HUB_DISABLE_XET == xet_disabled
 
 
-def test_aria2_opt_in_replaces_http_get_and_turns_xet_off_after_the_hub_is_imported(hub_download_state):
+@pytest.mark.parametrize("value", [None, "aria2", " Aria2 "])
+def test_aria2_is_on_by_default_and_turns_xet_off_after_the_hub_is_imported(hub_download_state, value):
     aria2, file_download, constants = hub_download_state
     from huggingface_hub.utils._runtime import is_xet_available
 
     # run.py's order: huggingface_hub is already imported (the toolkit package imports it) with Xet enabled
     constants.HF_HUB_DISABLE_XET = False
     native = file_download.http_get
-    os.environ["AITK_HF_DOWNLOADER"] = " Aria2 "
+    if value is None:
+        os.environ.pop("AITK_HF_DOWNLOADER", None)
+    else:
+        os.environ["AITK_HF_DOWNLOADER"] = value
     assert aria2.patch_huggingface_downloads() is True
     assert file_download.http_get is aria2.aria2_http_get and aria2._ORIGINAL_HTTP_GET is native
     # Xet downloads bypass http_get, so the hub has to see it as unavailable from now on
     assert is_xet_available() is False and os.environ["HF_HUB_DISABLE_XET"] == "1"
     assert aria2.patch_huggingface_downloads() is True  # idempotent
     assert aria2._ORIGINAL_HTTP_GET is native
+
+
+def test_orphaned_aria2_control_files_are_removed_and_live_ones_kept(tmp_path):
+    """huggingface_hub 1.23 deletes a failed download's temp file but not aria2's <file>.aria2 sidecar."""
+    from toolkit.aria2_hf_download import _remove_orphaned_control_files
+
+    (tmp_path / "abc.1234.incomplete").write_bytes(b"partial")          # a download in progress
+    (tmp_path / "abc.1234.incomplete.aria2").write_bytes(b"control")
+    (tmp_path / "def.5678.incomplete.aria2").write_bytes(b"control")    # its data file was deleted
+    (tmp_path / "finished-blob").write_bytes(b"done")
+    _remove_orphaned_control_files(tmp_path)
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "abc.1234.incomplete", "abc.1234.incomplete.aria2", "finished-blob"]
+    _remove_orphaned_control_files(tmp_path / "does-not-exist")  # never raises
 
 
 def test_dataset_config_carries_isolate_modalities():

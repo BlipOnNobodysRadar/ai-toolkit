@@ -22,7 +22,7 @@ sys.path.insert(0, os.getcwd())
 from toolkit.win_console import suppress_child_consoles
 suppress_child_consoles()
 
-# Opt-in aria2 transfers for Hugging Face downloads (AITK_HF_DOWNLOADER=aria2). A no-op otherwise.
+# aria2 transfers for Hugging Face downloads, on by default (AITK_HF_DOWNLOADER=hf turns them off).
 # Installed here, before any model code runs: a repo-root sitecustomize.py is never imported for `python run.py`.
 from toolkit.aria2_hf_download import patch_huggingface_downloads
 patch_huggingface_downloads()
