@@ -1172,7 +1172,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         return noise
 
-    def process_general_training_batch(self, batch: 'DataLoaderBatchDTO'):
+    def process_general_training_batch(self, batch: 'DataLoaderBatchDTO', *, shared_pair_noise=False):
         if (self.train_config.multires_noise_iterations or self.train_config.ip_noise_gamma) and not getattr(self, '_disable_noise_augmentation', False):
             from toolkit.noise_augmentation import begin_noise_augmentation_batch
             begin_noise_augmentation_batch(self)
@@ -1461,7 +1461,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 
             with self.timer('prepare_noise'):
                 # get noise
-                noise = self.get_noise(latents, batch_size, dtype=dtype, batch=batch, timestep=timesteps)
+                # A preference batch has B captions and 2B latents, ordered chosen then rejected.
+                noise_latents = latents[:batch_size] if shared_pair_noise else latents
+                noise = self.get_noise(noise_latents, batch_size, dtype=dtype, batch=batch, timestep=timesteps)
 
                 # add dynamic noise offset. Dynamic noise is offsetting the noise to the same channelwise mean as the latents
                 # this will negate any noise offsets
@@ -1556,6 +1558,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                                self.step_num, self.grad_accumulation_step, 2,
                                                batch_index=getattr(self, '_noise_augmentation_batch_index', 0)),
                     )
+                if shared_pair_noise:
+                    timesteps = torch.cat((timesteps, timesteps))
+                    if input_noise is noise:
+                        noise = input_noise = torch.cat((noise, noise))
+                    else:
+                        input_noise = torch.cat((input_noise, input_noise))
+                        noise = torch.cat((noise, noise))
                 noisy_latents = self.sd.add_noise(latents, input_noise, timesteps)
 
                 # determine scaled noise

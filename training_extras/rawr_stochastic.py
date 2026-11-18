@@ -90,8 +90,16 @@ def dataset_identity(dataset):
         # (CaptionProcessingDTOMixin.load_caption), whose dot DatasetConfig normalizes.
         from_dict = 'caption' in (captions.get(item.path) or {})
         caption = os.path.splitext(item.path)[0] + item.dataset_config.caption_ext
-        files.append([_file_stamp(item.path), None if from_dict else _file_stamp(caption), item.flip_x, item.flip_y])
-    configs = [vars(c) for c in dataset.source_configs]
+        entry = [_file_stamp(item.path), None if from_dict else _file_stamp(caption), item.flip_x, item.flip_y]
+        if getattr(item, 'rejected_path', None):
+            entry.append(_file_stamp(item.rejected_path))
+            entry.append(getattr(item, 'dpo_pair_signature', None))
+        files.append(entry)
+    configs = [vars(c).copy() for c in dataset.source_configs]
+    for config in configs:
+        # Preserve identities recorded by versions predating preference datasets.
+        if not config.get('rejected_path'):
+            config.pop('rejected_path', None)
     encoded = json.dumps({'files': files, 'configs': configs, 'captions': dataset.caption_dict},
                          sort_keys=True, default=lambda obj: vars(obj)).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -117,6 +125,8 @@ def _restore_dataset(dataset, state):
         for key in ITEM_FIELDS:
             if key in saved:
                 setattr(item, key, saved[key])
+        if getattr(item, 'rejected_item', None) is not None:
+            dataset.sync_dpo_geometry(item)
     dataset.epoch_num = state['epoch']
 
 

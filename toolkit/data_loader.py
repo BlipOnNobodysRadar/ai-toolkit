@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import math
 import os
@@ -41,6 +42,75 @@ if TYPE_CHECKING:
 image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
 video_extensions = ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']
 audio_extensions = ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a']
+
+
+def _dpo_relative_key(path: str, root: str) -> str:
+    return os.path.normcase(os.path.normpath(os.path.relpath(path, root)))
+
+
+def validate_dpo_roots(folder_path: str, rejected_path: str):
+    """Validate the chosen/rejected roots before any file is read.
+
+    The two trees must be separate. Pointing rejected_path at the chosen root
+    (or anywhere above/below it) would make a file its own preference mate.
+    """
+    if folder_path is None or not str(folder_path).strip():
+        raise ValueError("DPO dataset requires dataset.folder_path for the chosen images")
+    if rejected_path is None or not str(rejected_path).strip():
+        raise ValueError("DPO dataset requires dataset.rejected_path for the rejected images")
+
+    folder = os.path.realpath(os.path.abspath(folder_path))
+    rejected = os.path.realpath(os.path.abspath(rejected_path))
+    if os.path.normcase(folder) == os.path.normcase(rejected):
+        raise ValueError(
+            f"dataset.rejected_path must not be the same as dataset.folder_path: {rejected}"
+        )
+    try:
+        common = os.path.commonpath([folder, rejected])
+    except ValueError:
+        # Different drives are disjoint.
+        common = None
+    if common is not None and os.path.normcase(common) in (os.path.normcase(folder), os.path.normcase(rejected)):
+        raise ValueError(
+            "dataset.rejected_path must be a separate sibling tree, not nested inside "
+            f"dataset.folder_path or vice versa: chosen={folder}, rejected={rejected}"
+        )
+    if not os.path.isdir(folder):
+        raise ValueError(f"DPO chosen folder does not exist or is not a directory: {folder}")
+    if not os.path.isdir(rejected):
+        raise ValueError(f"DPO rejected folder does not exist or is not a directory: {rejected}")
+    return folder, rejected
+
+
+def validate_dpo_config_options(dataset_config: 'DatasetConfig'):
+    """Only shared bucket geometry and text conditioning apply to both arms."""
+    if not dataset_config.buckets:
+        raise ValueError('DPO requires buckets so both images share one crop')
+    single_arm_options = ('augments', 'augmentations', 'control_path', 'controls', 'inpaint_path',
+                          'mask_path', 'unconditional_path', 'clip_image_path', 'alpha_mask',
+                          'control_from_same_folder', 'clip_image_from_same_folder', 'prior_reg')
+    unsupported = [key for key in single_arm_options if getattr(dataset_config, key, None)]
+    if unsupported:
+        raise ValueError(
+            "DPO rejected arms currently support paired images only; unsupported "
+            f"dataset option(s): {', '.join(unsupported)}. Offending dataset: "
+            f"{dataset_config.folder_path or dataset_config.dataset_path}"
+        )
+
+
+def _list_image_files(root: str, extensions):
+    paths = []
+    for walk_root, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        for name in files:
+            if name.startswith('.'):
+                continue
+            path = os.path.join(walk_root, name)
+            if os.path.basename(os.path.dirname(path)) == '_controls':
+                continue
+            if name.lower().endswith(tuple(extensions)):
+                paths.append(path)
+    return paths
 
 
 class RescaleTransform:
@@ -416,6 +486,19 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         self.is_audio_model = hasattr(sd, 'is_audio_model') and sd.is_audio_model if sd is not None else False
         # text-generating multimodal models take audio, image and video files in one dataset
         self.is_multimodal_llm = getattr(sd, 'is_multimodal_llm', False) if sd is not None else False
+        self.is_dpo = any(getattr(c, 'rejected_path', None) for c in self.source_configs)
+        if self.is_dpo:
+            if not all(getattr(c, 'rejected_path', None) for c in self.source_configs):
+                raise ValueError(
+                    "Cannot pool DPO and non-DPO datasets: every source in a pooled loader must have "
+                    "a rejected_path, otherwise a batch would mix preference pairs with ordinary items"
+                )
+            if self.is_video or self.is_audio_model or self.is_multimodal_llm:
+                raise ValueError(
+                    "DPO preference pairs are supported only for still-image datasets (not video/audio/multimodal)"
+                )
+            for config in self.source_configs:
+                validate_dpo_config_options(config)
         super().__init__()
         folder_path = dataset_config.folder_path
         self.dataset_path = dataset_config.dataset_path
@@ -488,35 +571,61 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         transform = self.transform if dataset_config is self.dataset_config else self._build_transform(dataset_config)
         caption_dict = None
 
-        # check if dataset_path is a folder or json
-        if os.path.isdir(dataset_path):
-            extensions = image_extensions
-            if self.is_audio_model:
-                # only look for audio files
-                extensions = audio_extensions
-            elif self.is_multimodal_llm:
-                extensions = audio_extensions + image_extensions + (video_extensions if self.is_video else [])
-            elif self.is_video:
-                # look for videos and images. Video models can train on both;
-                # images are bucketed separately as single-frame items
-                extensions = video_extensions + image_extensions
-            # prune hidden dirs (.thumbs, .tmp) so their contents never train
-            file_list = []
-            for root, dirs, files in os.walk(dataset_path):
-                dirs[:] = [d for d in dirs if not d.startswith('.')]
-                file_list.extend(os.path.join(root, file) for file in files if file.lower().endswith(tuple(extensions)) and not file.startswith('.'))
-        else:
-            # assume json
-            with open(dataset_path, 'r') as f:
-                caption_dict = json.load(f)
-                # keys are file paths
-                file_list = list(caption_dict.keys())
-            if self.caption_dict is None:
-                self.caption_dict = {}
-            self.caption_dict.update(caption_dict)
+        extensions = image_extensions
+        if self.is_audio_model:
+            # only look for audio files
+            extensions = audio_extensions
+        elif self.is_multimodal_llm:
+            extensions = audio_extensions + image_extensions + (video_extensions if self.is_video else [])
+        elif self.is_video:
+            # look for videos and images. Video models can train on both;
+            # images are bucketed separately as single-frame items
+            extensions = video_extensions + image_extensions
 
-        # remove items in the _controls_ folder
-        file_list = [x for x in file_list if not os.path.basename(os.path.dirname(x)) == "_controls"]
+        is_dpo = bool(getattr(dataset_config, 'rejected_path', None))
+        rejected_root = None
+        rejected_by_chosen_path = {}
+        if is_dpo:
+            if not os.path.isdir(dataset_path):
+                raise ValueError(
+                    f"DPO datasets must use a folder_path (not a JSON caption file): {dataset_path}"
+                )
+            dataset_path, rejected_root = validate_dpo_roots(
+                dataset_config.folder_path or dataset_path,
+                dataset_config.rejected_path,
+            )
+            # Match the exact relative filename including its extension. Both
+            # trees are walked with the same extension filter so a JPG cannot
+            # silently stand in for a PNG.
+            file_list = _list_image_files(dataset_path, extensions)
+            rejected_files = _list_image_files(rejected_root, extensions)
+            chosen_by_rel = {_dpo_relative_key(p, dataset_path): p for p in file_list}
+            rejected_by_rel = {_dpo_relative_key(p, rejected_root): p for p in rejected_files}
+            if len(chosen_by_rel) != len(file_list) or len(rejected_by_rel) != len(rejected_files):
+                raise ValueError('Duplicate relative filenames in preference dataset')
+            for key, chosen_file in chosen_by_rel.items():
+                if key not in rejected_by_rel:
+                    raise ValueError(f"Missing rejected mate for {chosen_file}: {os.path.join(rejected_root, key)}")
+                rejected_by_chosen_path[chosen_file] = rejected_by_rel[key]
+            for key in rejected_by_rel.keys() - chosen_by_rel.keys():
+                raise ValueError(f"Rejected image has no chosen mate: {rejected_by_rel[key]}")
+        else:
+            # check if dataset_path is a folder or json
+            if os.path.isdir(dataset_path):
+                # prune hidden dirs (.thumbs, .tmp) so their contents never train
+                file_list = _list_image_files(dataset_path, extensions)
+            else:
+                # assume json
+                with open(dataset_path, 'r') as f:
+                    caption_dict = json.load(f)
+                    # keys are file paths
+                    file_list = list(caption_dict.keys())
+                if self.caption_dict is None:
+                    self.caption_dict = {}
+                self.caption_dict.update(caption_dict)
+
+            # remove items in the _controls_ folder
+            file_list = [x for x in file_list if not os.path.basename(os.path.dirname(x)) == "_controls"]
 
         if dataset_config.num_repeats > 1:
             # repeat the list
@@ -566,28 +675,74 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         
         source_items: List['FileItemDTO'] = []
         bad_count = 0
+
+        # The same rendering can appear as hard links in several preference pairs.
+        # Hash its bytes once per scan to distinguish even same-size replacements.
+        source_digests = {}
+
+        def source_digest(path):
+            stat = os.stat(path)
+            key = (stat.st_dev, stat.st_ino or path, stat.st_size, stat.st_mtime_ns)
+            if key not in source_digests:
+                digest = hashlib.sha256()
+                with open(path, 'rb') as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b''):
+                        digest.update(block)
+                source_digests[key] = digest.hexdigest()
+            return source_digests[key]
+
+        def make_file_item(file_path, dataset_root, latent_cache_role='chosen'):
+            return FileItemDTO(
+                sd=self.sd,
+                path=file_path,
+                is_audio_model=self.is_audio_model or (self.is_multimodal_llm and file_path.lower().endswith(tuple(audio_extensions))),
+                dataset_config=dataset_config,
+                dataloader_transforms=transform,
+                size_database=size_database,
+                dataset_root=dataset_root,
+                encode_control_in_text_embeddings=self.sd.encode_control_in_text_embeddings if self.sd else False,
+                encode_first_frame_in_text_embeddings=getattr(self.sd, 'encode_first_frame_in_text_embeddings', False) if self.sd else False,
+                dopsd_self_ref=getattr(self.sd, 'dopsd_self_ref', False) if self.sd else False,
+                text_embedding_space_version=text_embedding_space_version,
+                text_embedding_uses_target_size=getattr(self.sd, 'text_embedding_uses_target_size', False) if self.sd else False,
+                te_padding_side=self.sd.te_padding_side if self.sd else "right",
+                latent_space_version=latent_space_version,
+                temporal_compression=temporal_compression,
+                sample_rate=self.sd.sample_rate if (self.is_audio_model or self.is_multimodal_llm) and self.sd is not None else 48000,
+                latent_cache_role=latent_cache_role,
+                dpo_source_digest=source_digest(file_path) if is_dpo else None,
+            )
+
         for file in tqdm(file_list):
+            rejected_file = rejected_by_chosen_path.get(file)
             try:
-                file_item = FileItemDTO(
-                    sd=self.sd,
-                    path=file,
-                    is_audio_model=self.is_audio_model or (self.is_multimodal_llm and file.lower().endswith(tuple(audio_extensions))),
-                    dataset_config=dataset_config,
-                    dataloader_transforms=transform,
-                    size_database=size_database,
-                    dataset_root=dataset_folder,
-                    encode_control_in_text_embeddings=self.sd.encode_control_in_text_embeddings if self.sd else False,
-                    encode_first_frame_in_text_embeddings=getattr(self.sd, 'encode_first_frame_in_text_embeddings', False) if self.sd else False,
-                    dopsd_self_ref=getattr(self.sd, 'dopsd_self_ref', False) if self.sd else False,
-                    text_embedding_space_version=text_embedding_space_version,
-                    text_embedding_uses_target_size=getattr(self.sd, 'text_embedding_uses_target_size', False) if self.sd else False,
-                    te_padding_side=self.sd.te_padding_side if self.sd else "right",
-                    latent_space_version=latent_space_version,
-                    temporal_compression=temporal_compression,
-                    sample_rate=self.sd.sample_rate if (self.is_audio_model or self.is_multimodal_llm) and self.sd is not None else 48000,
-                )
+                file_item = make_file_item(file, dataset_folder, 'chosen')
+                if is_dpo:
+                    rejected_item = make_file_item(rejected_file, rejected_root, 'rejected')
+                    if (file_item.width, file_item.height) != (rejected_item.width, rejected_item.height):
+                        raise ValueError(
+                            "Chosen/rejected EXIF-oriented dimensions differ: "
+                            f"chosen={file_item.width}x{file_item.height}, "
+                            f"rejected={rejected_item.width}x{rejected_item.height}"
+                        )
+                    rel_key = _dpo_relative_key(file, dataset_folder)
+                    pair_signature = "|".join([
+                        rel_key,
+                        file_item.dpo_source_digest,
+                        rejected_item.dpo_source_digest,
+                    ])
+                    file_item.dpo_pair_signature = pair_signature
+                    rejected_item.dpo_pair_signature = pair_signature
+                    file_item.rejected_path = rejected_file
+                    file_item.rejected_item = rejected_item
                 source_items.append(file_item)
             except Exception as e:
+                # A DPO pair is atomic. Never continue with the chosen half alone
+                # and never let the legacy corrupt-file skip substitute a pair.
+                if is_dpo:
+                    raise ValueError(
+                        f"Invalid DPO pair: chosen={file}, rejected={rejected_file}: {e}"
+                    ) from e
                 print_acc(traceback.format_exc())
                 if self.is_video:
                     print_acc(f"Error processing video: {file}")
@@ -620,6 +775,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 # create a copy that is flipped on the x axis
                 new_file_item = copy.deepcopy(file_item)
                 new_file_item.flip_x = True
+                if new_file_item.rejected_item is not None:
+                    new_file_item.rejected_item.flip_x = True
                 source_items.append(new_file_item)
 
         # handle y axis flips
@@ -630,6 +787,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 # create a copy that is flipped on the y axis
                 new_file_item = copy.deepcopy(file_item)
                 new_file_item.flip_y = True
+                if new_file_item.rejected_item is not None:
+                    new_file_item.rejected_item.flip_y = True
                 source_items.append(new_file_item)
 
         if dataset_config.flip_x or dataset_config.flip_y:
@@ -693,19 +852,36 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         if getattr(item_config, 'random_crop_percent', 0) <= 0 or getattr(file_item, 'crop_width', None) is None:
             return
         self.roll_random_crop(file_item)
+        if getattr(file_item, 'rejected_item', None) is not None:
+            self.sync_dpo_geometry(file_item)
 
     def _get_single_item(self, index, _attempts=0) -> 'FileItemDTO':
         file_item: 'FileItemDTO' = copy.deepcopy(self.file_list[index])
         self._roll_crop_on_access(file_item)
+        is_dpo_pair = getattr(file_item, 'rejected_item', None) is not None
         try:
             file_item.load_and_process_image(file_item.dataloader_transforms or self.transform)
+            if is_dpo_pair:
+                # The rejected arm shares the chosen item's bucket scale/crop/
+                # flip, but is decoded and transformed independently.
+                file_item.rejected_item.load_and_process_image(
+                    file_item.rejected_item.dataloader_transforms or self.transform
+                )
         except Exception as e:
+            if is_dpo_pair:
+                # DPO pairs are atomic at load time too: raising is safer than
+                # training a chosen image against a substituted random pair.
+                raise RuntimeError(
+                    f"DPO pair failed to load: chosen={file_item.path}, "
+                    f"rejected={getattr(getattr(file_item, 'rejected_item', None), 'path', None)}: {e}"
+                ) from e
             print(f"Error loading image, skipping and loading a different one: {file_item.path} ({e})")
             if _attempts >= 10:
                 # avoid infinite recursion if many files are corrupt
                 raise
             new_index = self._get_replacement_index(index)
             return self._get_single_item(new_index, _attempts=_attempts + 1)
+        # Captions/prompt caches are exclusively from the chosen item.
         file_item.load_caption(self.caption_dict)
         return file_item
 

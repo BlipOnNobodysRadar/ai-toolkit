@@ -283,6 +283,24 @@ class BucketsMixin:
         file_item.crop_x = random.randint(0, max_x) if max_x > 0 else 0
         file_item.crop_y = random.randint(0, max_y) if max_y > 0 else 0
 
+    def sync_dpo_geometry(self: 'AiToolkitDataset', file_item: 'FileItemDTO'):
+        """Mirror the chosen arm's final bucket geometry onto its rejected mate.
+
+        The bucket is always chosen from the chosen image. The rejected image
+        must be resized/cropped/flipped by exactly the same numbers; otherwise
+        preference pairs could silently train on different framing.
+        """
+        rejected = getattr(file_item, 'rejected_item', None)
+        if rejected is None:
+            return
+        for attr in (
+            'scale_to_width', 'scale_to_height', 'base_scale_to_width',
+            'base_scale_to_height', 'crop_x', 'crop_y', 'crop_width',
+            'crop_height', 'flip_x', 'flip_y',
+        ):
+            if hasattr(file_item, attr):
+                setattr(rejected, attr, getattr(file_item, attr))
+
     def setup_buckets(self: 'AiToolkitDataset', quiet=False):
         if not hasattr(self, 'file_list'):
             raise Exception(f'file_list not found on class instance {self.__class__.__name__}')
@@ -384,6 +402,9 @@ class BucketsMixin:
 
                 if file_item.crop_y < 0 or file_item.crop_x < 0:
                     print_acc('debug')
+
+            # DPO rejected arm always follows the chosen arm's chosen bucket.
+            self.sync_dpo_geometry(file_item)
 
             # check if bucket exists, if not, create it
             bucket_key = f'{file_item.crop_width}x{file_item.crop_height}'
@@ -1990,6 +2011,13 @@ class LatentCachingFileItemDTOMixin:
             # the encoded alpha changes the latent; only added when on so caches
             # made before this existed stay valid for models that do not use it
             item["load_rgba"] = True
+        # DPO cache identity is independent per arm and binds both source files.
+        # Ordinary items deliberately keep the legacy hash unchanged.
+        if getattr(self, "dpo_pair_signature", None):
+            item["dpo_pair_signature"] = self.dpo_pair_signature
+            item["dpo_arm"] = self.latent_cache_role
+            if self.dataset_config.standardize_images:
+                item["standardize_images"] = True
         return item
 
     def get_latent_path(self: 'FileItemDTO', recalculate=False):
@@ -2104,20 +2132,34 @@ class LatentCachingMixin:
                     # not saved to disk, load the image/video/audio
                     prep_item.load_and_process_image(prep_item.dataloader_transforms or self.transform, only_load_latents=True)
                 except Exception as e:
+                    if getattr(prep_item, 'dpo_pair_signature', None):
+                        # Cached preference pairs are atomic too: silently dropping
+                        # half a pair would train on mismatched or stale arms.
+                        raise RuntimeError(
+                            f"DPO latent-cache prep failed for {prep_item.path}: {e}"
+                        ) from e
                     print_acc(f"Error processing image: {prep_item.path}")
                     print_acc(f"Error: {str(e)}")
                     print_acc(" - Skipping file and removing it from the dataset")
                     return prep_item, None, None, False
                 return prep_item, prep_latent_path, None, True
 
+            # Cache both preference arms independently. The rejected arm has its
+            # own role-qualified cache key and its own sibling _latent_cache tree.
+            work_items = []
+            for item in self.file_list:
+                work_items.append(item)
+                if getattr(item, 'rejected_item', None) is not None:
+                    work_items.append(item.rejected_item)
+
             # use tqdm to show progress
             i = 0
             failed_items = []
-            pbar = tqdm(total=len(self.file_list), desc=f'Caching latents{" to disk" if to_disk else ""}')
+            pbar = tqdm(total=len(work_items), desc=f'Caching latents{" to disk" if to_disk else ""}')
             executor = ThreadPoolExecutor(max_workers=num_workers)
             try:
                 pending = deque()
-                file_iter = iter(self.file_list)
+                file_iter = iter(work_items)
                 for queued_item in itertools.islice(file_iter, num_workers + 2):
                     pending.append(executor.submit(_prep, queued_item))
                 while pending:
@@ -2137,6 +2179,10 @@ class LatentCachingMixin:
                     try:
                         self._cache_one_latent(file_item, latent_path, cached_state_dict, needs_encode, to_disk, to_memory)
                     except UnusableFileError as e:
+                        if getattr(file_item, 'dpo_pair_signature', None):
+                            raise RuntimeError(
+                                f"DPO latent-cache encode failed for {file_item.path}: {e}"
+                            ) from e
                         pbar.write(f"Skipping unusable file {file_item.path}: {e}")
                         failed_items.append(file_item)
                         pbar.update(1)

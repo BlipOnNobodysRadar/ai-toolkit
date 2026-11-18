@@ -106,6 +106,25 @@ def test_identity_follows_the_caption_source_actually_read(tmp_path):
     assert rs.dataset_identity(dataset) != without
 
 
+def test_dpo_resume_tracks_rejected_image_and_preserves_legacy_identity(tmp_path):
+    chosen = tmp_path / 'chosen.png'
+    rejected = tmp_path / 'rejected.png'
+    chosen.touch()
+    rejected.touch()
+    config = DatasetConfig(folder_path=str(tmp_path))
+    item = SimpleNamespace(path=str(chosen), dataset_config=config, flip_x=False, flip_y=False)
+    dataset = SimpleNamespace(file_list=[item], source_configs=[config], caption_dict=None)
+    current = rs.dataset_identity(dataset)
+    del config.rejected_path  # configuration serialized by the pre-DPO trainer
+    assert rs.dataset_identity(dataset) == current
+    config.rejected_path = str(tmp_path)
+    item.rejected_path = str(rejected)
+    paired = rs.dataset_identity(dataset)
+    assert paired != current
+    rejected.write_bytes(b'new mate')
+    assert rs.dataset_identity(dataset) != paired
+
+
 @pytest.mark.parametrize('rawr', [True, False])
 def test_ui_save_keeps_unfinished_microbatches_for_rawr(rawr):
     # A UI "save now" mid-window (legacy gradient_accumulation_steps) must checkpoint the pending gradients, not

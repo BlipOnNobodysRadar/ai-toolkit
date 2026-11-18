@@ -87,6 +87,8 @@ class SDTrainer(BaseSDTrainProcess):
 
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
         super().__init__(process_id, job, config, **kwargs)
+        from toolkit.diffusion_dpo import validate_dpo_config
+        validate_dpo_config(self)
         self.assistant_adapter: Union['T2IAdapter', 'ControlNetModel', None]
         self.do_prior_prediction = False
         self.do_long_prompts = False
@@ -1522,6 +1524,9 @@ class SDTrainer(BaseSDTrainProcess):
         # accum_scale: 1 / number of micro-batches accumulated per optimizer step, so the
         # summed gradients equal the mean over the effective batch. Applied to the backward
         # only; the returned loss stays unscaled for logging.
+        if self.train_config.loss_type == 'dpo':
+            from toolkit.diffusion_dpo import train_dpo_accumulation
+            return train_dpo_accumulation(self, batch, accum_scale)
         if getattr(self.sd, 'is_llm', False):
             return self.train_llm_accumulation(batch, accum_scale=accum_scale)
         with torch.no_grad():

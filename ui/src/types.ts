@@ -110,6 +110,7 @@ export interface SaveConfig {
 export interface DatasetConfig {
   batch_size?: number;
   folder_path: string;
+  rejected_path?: string | null;
   mask_path: string | null;
   mask_min_value: number;
   default_caption: string;
@@ -189,7 +190,8 @@ export interface TrainConfig {
   blank_prompt_preservation?: boolean;
   blank_prompt_preservation_multiplier?: number;
   switch_boundary_every: number;
-  loss_type: 'mse' | 'mae' | 'wavelet' | 'stepped';
+  loss_type: 'mse' | 'mae' | 'wavelet' | 'stepped' | 'dpo';
+  dpo_beta?: number;
   do_differential_guidance?: boolean;
   differential_guidance_scale?: number;
   pool_datasets?: boolean;

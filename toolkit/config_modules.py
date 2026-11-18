@@ -572,6 +572,11 @@ class TrainConfig:
         self.correct_pred_norm_multiplier = kwargs.get('correct_pred_norm_multiplier', 1.0)
 
         self.loss_type = kwargs.get('loss_type', 'mse') # mse, mae, wavelet, band, pixelspace, mean_flow, pseudo_huber
+        self.dpo_beta = kwargs.get('dpo_beta', 100.0)
+        if self.loss_type == 'dpo':
+            if (isinstance(self.dpo_beta, bool) or not isinstance(self.dpo_beta, (int, float))
+                    or not math.isfinite(self.dpo_beta) or self.dpo_beta <= 0):
+                raise ValueError('dpo_beta must be a finite positive number')
         self.training_extras = kwargs.get('training_extras', None)
         if self.training_extras is not None and not isinstance(self.training_extras, dict):
             raise ValueError('training_extras must be a mapping')
@@ -1025,6 +1030,11 @@ class DatasetConfig:
         self.folder_path: str = kwargs.get('folder_path', None)
         # can be json or folder path
         self.dataset_path: str = kwargs.get('dataset_path', None)
+        # DPO preference data: chosen images live in folder_path, rejected images
+        # live in a separate sibling tree with the same relative names/extensions.
+        self.rejected_path: Union[str, None] = kwargs.get('rejected_path', None)
+        if self.rejected_path == '':
+            self.rejected_path = None
 
         self.default_caption: str = kwargs.get('default_caption', None)
         # trigger word for just this dataset
