@@ -44,6 +44,11 @@ def hub_download_state():
 
     saved = (file_download.http_get, constants.HF_HUB_DISABLE_XET, aria2._ORIGINAL_HTTP_GET,
              os.environ.get("HF_HUB_DISABLE_XET"), os.environ.get("AITK_HF_DOWNLOADER"))
+    # Other entry-point tests can import run.py during collection. Start these
+    # startup tests at the same pre-install boundary as a new interpreter.
+    if file_download.http_get is aria2.aria2_http_get and aria2._ORIGINAL_HTTP_GET is not None:
+        file_download.http_get = aria2._ORIGINAL_HTTP_GET
+        aria2._ORIGINAL_HTTP_GET = None
     yield aria2, file_download, constants
     file_download.http_get, constants.HF_HUB_DISABLE_XET, aria2._ORIGINAL_HTTP_GET = saved[:3]
     for name, value in (("HF_HUB_DISABLE_XET", saved[3]), ("AITK_HF_DOWNLOADER", saved[4])):

@@ -42,6 +42,9 @@ class FakeSd:
     def get_text_embedding_space_version(self):
         return "fake-te"
 
+    def save_device_state(self):
+        pass
+
     def set_device_state_preset(self, *args, **kwargs):
         pass
 

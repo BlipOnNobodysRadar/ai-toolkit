@@ -1553,7 +1553,7 @@ class SDTrainer(BaseSDTrainProcess):
         # accum_scale: 1 / number of micro-batches accumulated per optimizer step, so the
         # summed gradients equal the mean over the effective batch. Applied to the backward
         # only; the returned loss stays unscaled for logging.
-        if self.train_config.loss_type == 'dpo':
+        if self.train_config.loss_type == 'dpo' or getattr(batch, '_feedback_pair_id', None):
             from toolkit.diffusion_dpo import train_dpo_accumulation
             return train_dpo_accumulation(self, batch, accum_scale)
         if getattr(self.sd, 'is_llm', False):
@@ -2479,7 +2479,7 @@ class SDTrainer(BaseSDTrainProcess):
             with self.timer('optimizer_step'):
                 mark_update_commit(self, 'optimizer.step()')
                 self.optimizer.step()
-                if getattr(self, 'training_extras', None) is not None:
+                if getattr(self, 'training_extras', None) is not None and not getattr(batch, '_feedback_pair_id', None):
                     self.training_extras.step()
 
                 self.optimizer.zero_grad(set_to_none=True)

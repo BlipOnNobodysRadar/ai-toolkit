@@ -550,6 +550,8 @@ class OstrisModelMixin:
                 name_or_path, subfolder=subfolder, dtype=dtype, **kwargs
             )
 
+        model._aitk_weight_source = file_path if name_or_path.endswith(".safetensors") else name_or_path
+
         # quantize_on_load=False: qtype was only a comfy-candidate ranking
         # hint (the .load() path quantizes in aitk_post_load instead)
         if qtype is not None and quantize_on_load:

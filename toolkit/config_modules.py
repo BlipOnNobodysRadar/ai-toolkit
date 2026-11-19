@@ -572,8 +572,19 @@ class TrainConfig:
         self.correct_pred_norm_multiplier = kwargs.get('correct_pred_norm_multiplier', 1.0)
 
         self.loss_type = kwargs.get('loss_type', 'mse') # mse, mae, wavelet, band, pixelspace, mean_flow, pseudo_huber
+        self.dpo_feedback = kwargs.get('dpo_feedback')
+        if self.dpo_feedback is not None:
+            if not isinstance(self.dpo_feedback, dict) or self.dpo_feedback.keys() - {'every', 'start_after'}:
+                raise ValueError('train.dpo_feedback accepts a mapping with every and start_after')
+            every = self.dpo_feedback.get('every', 10)
+            warmup = self.dpo_feedback.get('start_after', 0)
+            if type(every) is not int or every < 1 or type(warmup) is not int or warmup < 0:
+                raise ValueError('dpo_feedback.every must be a positive integer and start_after a nonnegative integer')
+            self.dpo_feedback = {'every': every, 'start_after': warmup}
+            if self.loss_type == 'dpo':
+                raise ValueError('Use an ordinary loss_type for interleaved DPO feedback')
         self.dpo_beta = kwargs.get('dpo_beta', 100.0)
-        if self.loss_type == 'dpo':
+        if self.loss_type == 'dpo' or self.dpo_feedback is not None:
             if (isinstance(self.dpo_beta, bool) or not isinstance(self.dpo_beta, (int, float))
                     or not math.isfinite(self.dpo_beta) or self.dpo_beta <= 0):
                 raise ValueError('dpo_beta must be a finite positive number')

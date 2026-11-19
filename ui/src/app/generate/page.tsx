@@ -11,6 +11,7 @@ import {
   OctagonX,
   Play,
   Plus,
+  Power,
   Square,
   Sparkles,
   Trash2,
@@ -137,6 +138,7 @@ function GeneratePageInner() {
   const persisted = useMemo(loadPersisted, []);
   const [gpuId, setGpuId] = useState<string>(persisted.gpuId || '0');
   const [engineBusy, setEngineBusy] = useState(false);
+  const [unloadBusy, setUnloadBusy] = useState(false);
   // job ids we are waiting on: the button stays disabled from the click until
   // the engine is actually up (or the job row reports a failure)
   const [startingJobId, setStartingJobId] = useState<string | null>(null);
@@ -257,6 +259,28 @@ function GeneratePageInner() {
       alert(`Failed to stop the engine: ${e?.response?.data?.error || e?.message || e}`);
     } finally {
       setEngineBusy(false);
+    }
+  };
+
+  // Unload frees the active model and component pool without stopping the engine process.
+  const unloadModel = async () => {
+    setUnloadBusy(true);
+    try {
+      await apiClient.post(proxy('unload'));
+      const nextHealth = await apiClient
+        .get(proxy('health'))
+        .then(res => res.data)
+        .catch(() => null);
+      if (nextHealth) setHealth(nextHealth);
+    } catch (e: any) {
+      const status = e?.response?.status;
+      alert(
+        status === 409
+          ? 'The engine is busy with a generation. Wait for it to finish, then try unloading again.'
+          : `Failed to unload the model: ${e?.response?.data?.detail || e?.response?.data?.error || e?.message || e}`,
+      );
+    } finally {
+      setUnloadBusy(false);
     }
   };
 
@@ -744,6 +768,16 @@ function GeneratePageInner() {
               <span className="text-green-400">Engine running</span>
               {health?.active?.arch && <span className="text-gray-400 hidden sm:inline">· {health.active.arch}</span>}
               {vram && <span className="text-gray-400 hidden md:inline">· VRAM {vram}</span>}
+              {health?.active?.arch && (
+                <Button
+                  onClick={unloadModel}
+                  disabled={engineBusy || unloadBusy || running || !!health?.busy}
+                  title="Free the loaded model and pooled components without stopping the engine"
+                  className="px-2 py-1 rounded-md bg-gray-700 hover:bg-gray-600 disabled:opacity-60 text-white flex items-center gap-1"
+                >
+                  {unloadBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Power className="w-4 h-4" />} Unload model
+                </Button>
+              )}
               <Button
                 onClick={stopEngine}
                 disabled={engineBusy}

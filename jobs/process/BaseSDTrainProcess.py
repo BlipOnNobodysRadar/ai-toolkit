@@ -483,6 +483,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         try:
             # send to be generated
             self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+            if getattr(self, '_feedback_schedule', None) is not None:
+                from toolkit.feedback_samples import capture_feedback_samples
+                capture_feedback_samples(self, sample_config, gen_img_config_list, step=step)
         except BaseException as primary:
             sampling_state.settle(give_back, primary)
             raise
@@ -520,6 +523,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         cursor = getattr(self, '_clean_share_cursor', None)
         if cursor is not None:
             info['clean_share_curriculum'] = cursor.state_dict()
+        feedback = getattr(self, '_feedback_schedule', None)
+        if feedback is not None:
+            info['dpo_feedback'] = feedback.state_dict()
         return info
 
     def clean_up_saves(self):
@@ -1563,6 +1569,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if 'epoch' in meta['training_info']:
                 self.epoch_num = meta['training_info']['epoch']
             self._clean_share_saved = meta['training_info'].get('clean_share_curriculum')
+            self._saved_feedback_schedule = meta['training_info'].get('dpo_feedback')
             self.start_step = self.step_num
             print_acc(f"Found step {self.step_num} in metadata, starting from there")
 
@@ -1649,6 +1656,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if 'epoch' in meta['training_info']:
                     self.epoch_num = meta['training_info']['epoch']
                 self._clean_share_saved = meta['training_info'].get('clean_share_curriculum')
+                self._saved_feedback_schedule = meta['training_info'].get('dpo_feedback')
                 self.start_step = self.step_num
                 print_acc(f"Found step {self.step_num} in metadata, starting from there")
 
@@ -3318,6 +3326,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     print_acc(f"Failed to compile model: {e}")
                     print_acc("Continuing without compilation")
 
+        feedback = None
+        if self.train_config.dpo_feedback is not None:
+            from toolkit.feedback_schedule import FeedbackSchedule
+            self._feedback_schedule = feedback = FeedbackSchedule(self)
+
         if self.has_first_sample_requested and self.step_num <= 1 and not self.train_config.disable_sampling:
             print_acc("Generating first sample from first sample config")
             self.sample(0, is_first=True)
@@ -3377,15 +3390,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.data_loader is not None:
             dataloader = self.data_loader
             skip = 0
+            feedback_recorded = False
             cursor = None  # main batches already taken from the current epoch (whole-epoch accumulation)
             if self.step_num > 0 and self.data_loader_reg is None and self._rng_seed(1, 0) is not None:
                 # resumed: continue in the epoch, and at the batch, an uninterrupted run would be at
                 per_epoch = len(dataloader)
                 if per_epoch:
                     self._data_epoch, skip = divmod(self.step_num * self.train_config.gradient_accumulation, per_epoch)
+            if feedback is not None and feedback.saved_position is not None:
+                # Preference windows consumed no ordinary training images. Recorded
+                # RAWR samplers restore their own cursor; never skip those twice.
+                self._data_epoch, ordinary_skip = feedback.saved_position
+                recorded = getattr(self, '_rawr_stochastic', None)
+                feedback_recorded = recorded is not None and not recorded.reason
+                skip = 0 if feedback_recorded else ordinary_skip
             if curriculum_cursor is not None:
                 self._data_epoch, skip = curriculum_cursor.position
-            if skip == 0 and self._data_epoch > 0:
+            if feedback_recorded:
+                dataloader_iterator = iter(dataloader)
+                cursor = ordinary_skip
+            elif skip == 0 and self._data_epoch > 0:
                 # resumed exactly on an epoch boundary: let the first fetch take the in-loop epoch reset, like an
                 # uninterrupted run (creating an iterator draws a worker base seed from the global RNG, so creating
                 # it here instead would shift that step's noise and timesteps)
@@ -3491,16 +3515,25 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if self.train_config.disable_sampling:
                     is_sample_step = False
 
-                if curriculum_cursor is not None:
-                    curriculum_cursor.begin()
-                batch_list, dataloader_iterator, dataloader_iterator_reg = self._fetch_batch_list(
-                    step, dataloader, dataloader_iterator, dataloader_reg, dataloader_iterator_reg,
-                    is_save_step, is_sample_step)
-                if curriculum_cursor is not None:
-                    if len(dataloader) != curriculum_cursor.contract['batches_per_epoch']:
-                        raise ValueError('primary loader length changed during clean-share curriculum')
-                    for batch in batch_list:
-                        curriculum_cursor.stamp(batch)
+                batch_list = feedback.batches() if feedback is not None else None
+                using_feedback = batch_list is not None
+                if using_feedback:
+                    if self.train_config.gradient_accumulation_steps == -1:
+                        # Whole-epoch ordinary windows end in the loader. A preference
+                        # window uses its selected pairs and leaves that loader parked.
+                        self.is_grad_accumulation_step = False
+                        self.grad_accumulation_step = 0
+                else:
+                    if curriculum_cursor is not None:
+                        curriculum_cursor.begin()
+                    batch_list, dataloader_iterator, dataloader_iterator_reg = self._fetch_batch_list(
+                        step, dataloader, dataloader_iterator, dataloader_reg, dataloader_iterator_reg,
+                        is_save_step, is_sample_step)
+                    if curriculum_cursor is not None:
+                        if len(dataloader) != curriculum_cursor.contract['batches_per_epoch']:
+                            raise ValueError('primary loader length changed during clean-share curriculum')
+                        for batch in batch_list:
+                            curriculum_cursor.stamp(batch)
 
                 # setup accumulation
                 self._setup_accumulation_iteration()
@@ -3510,7 +3543,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if self.torch_profiler is not None:
                 self.torch_profiler.start()
             loss_dict, did_oom = self._run_train_step(step, batch_list, optimizer)
-            if curriculum_cursor is not None:
+            if feedback is not None:
+                feedback.finish_iteration(did_oom)
+            if curriculum_cursor is not None and not using_feedback:
                 if did_oom:
                     raise RuntimeError('OOM during clean-share curriculum; aborting rather than skipping curriculum data')
                 curriculum_cursor.commit()

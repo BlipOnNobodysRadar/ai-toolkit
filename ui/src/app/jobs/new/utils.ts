@@ -1,8 +1,12 @@
-import { GroupedSelectOption, JobConfig, SelectOption } from '@/types';
+import { DpoFeedbackConfig, GroupedSelectOption, JobConfig, SelectOption } from '@/types';
 import { ModelArch } from './options';
 import { objectCopy } from '@/utils/basic';
 
 export const DPO_BETA_DEFAULT = 100;
+export const DPO_FEEDBACK_EVERY_DEFAULT = 10;
+export const DPO_FEEDBACK_START_AFTER_DEFAULT = 0;
+/** Used only when enabling feedback would otherwise leave no sample to rank. */
+export const DPO_FEEDBACK_PROMPT_FALLBACK = 'a high quality, detailed image';
 
 /** Only the text-to-image MOSS registrations are eligible; the edit variants
  * share the moss_image backend arch but are excluded from DPO. */
@@ -12,29 +16,166 @@ export const isMossImageDpoEligible = (archName: string | undefined): boolean =>
 export const isValidDpoBeta = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value) && value > 0;
 
-/** Apply the invariants DPO needs without touching unrelated training options. */
-export const applyDpoMode = (
+export const isValidDpoFeedbackEvery = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 1;
+
+export const isValidDpoFeedbackStartAfter = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+
+/** The persisted contract is absent/null = off and an object = on. Keep an
+ * object visible even if a hand-edited config has invalid cadence values so
+ * the editor can repair it instead of silently discarding the user's mode. */
+export const isDpoFeedbackEnabled = (value: unknown): value is DpoFeedbackConfig =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+export const isValidDpoFeedbackConfig = (value: unknown): value is DpoFeedbackConfig =>
+  isDpoFeedbackEnabled(value) &&
+  isValidDpoFeedbackEvery((value as DpoFeedbackConfig).every) &&
+  isValidDpoFeedbackStartAfter((value as DpoFeedbackConfig).start_after);
+
+/** Enforce the transformer-LoRA invariants shared by offline and online MOSS
+ * preference training, without changing the selected ordinary loss. */
+const applyTransformerLoraMode = (
   jobConfig: JobConfig,
   setJobConfig: (value: any, key: string) => void,
 ) => {
-  const process = jobConfig.config.process[0];
-  setJobConfig('dpo', 'config.process[0].train.loss_type');
-  setJobConfig('flowmatch', 'config.process[0].train.noise_scheduler');
-  if (!isValidDpoBeta(process.train.dpo_beta)) {
-    setJobConfig(DPO_BETA_DEFAULT, 'config.process[0].train.dpo_beta');
-  }
   setJobConfig('lora', 'config.process[0].network.type');
   setJobConfig(true, 'config.process[0].network.transformer_only');
   setJobConfig(true, 'config.process[0].train.train_unet');
   setJobConfig(false, 'config.process[0].train.train_text_encoder');
 };
 
-/** Remove DPO-only fields when leaving DPO or an eligible architecture. */
+const isPositiveNumber = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value) && value > 0;
+
+const isNonNegativeNumber = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value) && value >= 0;
+
+/** Make the normal sampling block able to produce the images the gallery will
+ * rank. Existing valid prompts and cadence are retained; only missing/invalid
+ * essentials are filled in. */
+const ensureFeedbackSampleGeneration = (
+  jobConfig: JobConfig,
+  setJobConfig: (value: any, key: string) => void,
+) => {
+  const process = jobConfig.config.process[0];
+  const sample = process.sample;
+
+  setJobConfig(false, 'config.process[0].train.disable_sampling');
+  if (typeof sample.sampler !== 'string' || sample.sampler.trim() === '') {
+    setJobConfig('flowmatch', 'config.process[0].sample.sampler');
+  }
+  if (!isPositiveNumber(sample.sample_every)) {
+    setJobConfig(250, 'config.process[0].sample.sample_every');
+  }
+  if (!isNonNegativeNumber(sample.sample_start_step)) {
+    setJobConfig(0, 'config.process[0].sample.sample_start_step');
+  }
+  if (!isPositiveNumber(sample.width)) {
+    setJobConfig(1024, 'config.process[0].sample.width');
+  }
+  if (!isPositiveNumber(sample.height)) {
+    setJobConfig(1024, 'config.process[0].sample.height');
+  }
+  if (!isNonNegativeNumber(sample.guidance_scale)) {
+    setJobConfig(4, 'config.process[0].sample.guidance_scale');
+  }
+  if (!isPositiveNumber(sample.sample_steps)) {
+    setJobConfig(30, 'config.process[0].sample.sample_steps');
+  }
+  if (!isNonNegativeNumber(sample.seed)) {
+    setJobConfig(42, 'config.process[0].sample.seed');
+  }
+
+  const samples = Array.isArray(sample.samples) ? sample.samples : [];
+  const hasUsablePrompt = samples.some(
+    item => typeof item?.prompt === 'string' && item.prompt.trim().length > 0,
+  );
+  if (!hasUsablePrompt) {
+    setJobConfig(
+      [...samples, { prompt: DPO_FEEDBACK_PROMPT_FALLBACK }],
+      'config.process[0].sample.samples',
+    );
+  }
+};
+
+/** Turn on interleaved feedback while leaving the ordinary loss selectable and
+ * the target dataset untouched. Cadence is measured in successful optimizer
+ * updates, not raw optimizer steps or regular sample_every steps. */
+export const applyDpoFeedbackMode = (
+  jobConfig: JobConfig,
+  setJobConfig: (value: any, key: string) => void,
+): boolean => {
+  const process = jobConfig.config.process[0];
+  // The trainer deliberately rejects interleaved feedback combined with the
+  // offline DPO loss. The editor disables the switch in that state, and this
+  // guard keeps programmatic callers from persisting an invalid combination.
+  if (process.train.loss_type === 'dpo') {
+    return false;
+  }
+  const current = isDpoFeedbackEnabled(process.train.dpo_feedback)
+    ? process.train.dpo_feedback
+    : null;
+  const feedback: DpoFeedbackConfig = {
+    every: isValidDpoFeedbackEvery(current?.every)
+      ? current!.every
+      : DPO_FEEDBACK_EVERY_DEFAULT,
+    start_after: isValidDpoFeedbackStartAfter(current?.start_after)
+      ? current!.start_after
+      : DPO_FEEDBACK_START_AFTER_DEFAULT,
+  };
+
+  setJobConfig(feedback, 'config.process[0].train.dpo_feedback');
+  if (!isValidDpoBeta(process.train.dpo_beta)) {
+    setJobConfig(DPO_BETA_DEFAULT, 'config.process[0].train.dpo_beta');
+  }
+  applyTransformerLoraMode(jobConfig, setJobConfig);
+  ensureFeedbackSampleGeneration(jobConfig, setJobConfig);
+  return true;
+};
+
+/** Turn off only interleaved feedback. Offline DPO keeps its beta; a standard
+ * loss job no longer has any consumer for dpo_beta, so remove the stale field. */
+export const clearDpoFeedbackConfig = (
+  jobConfig: JobConfig,
+  setJobConfig: (value: any, key: string) => void,
+) => {
+  const process = jobConfig.config.process[0];
+  setJobConfig(undefined, 'config.process[0].train.dpo_feedback');
+  if (process.train.loss_type !== 'dpo') {
+    setJobConfig(undefined, 'config.process[0].train.dpo_beta');
+  }
+};
+
+/** Apply the invariants offline DPO needs without touching unrelated training
+ * options. Interleaved feedback is a separate mode and is not enabled here. */
+export const applyDpoMode = (
+  jobConfig: JobConfig,
+  setJobConfig: (value: any, key: string) => void,
+) => {
+  const process = jobConfig.config.process[0];
+  // Offline DPO and interleaved feedback are mutually exclusive in the
+  // trainer. Selecting offline DPO clears the online switch without touching
+  // its beta, which this mode immediately defaults/validates below.
+  setJobConfig(undefined, 'config.process[0].train.dpo_feedback');
+  setJobConfig('dpo', 'config.process[0].train.loss_type');
+  setJobConfig('flowmatch', 'config.process[0].train.noise_scheduler');
+  if (!isValidDpoBeta(process.train.dpo_beta)) {
+    setJobConfig(DPO_BETA_DEFAULT, 'config.process[0].train.dpo_beta');
+  }
+  applyTransformerLoraMode(jobConfig, setJobConfig);
+};
+
+/** Remove offline-DPO-only fields when leaving DPO or an eligible architecture.
+ * Keep dpo_beta if interleaved feedback still needs it. */
 export const clearDpoConfig = (
   jobConfig: JobConfig,
   setJobConfig: (value: any, key: string) => void,
 ) => {
-  setJobConfig(undefined, 'config.process[0].train.dpo_beta');
+  const process = jobConfig.config.process[0];
+  if (!isDpoFeedbackEnabled(process.train.dpo_feedback)) {
+    setJobConfig(undefined, 'config.process[0].train.dpo_beta');
+  }
   jobConfig.config.process[0].datasets.forEach((_, i) => {
     setJobConfig(undefined, `config.process[0].datasets[${i}].rejected_path`);
   });
@@ -77,11 +218,13 @@ export const handleModelArchChange = (
   const newArchSupportsDpo = isMossImageDpoEligible(newArchName);
 
   // DPO fields are only valid on an eligible non-edit MOSS text-to-image arch.
+  // This covers both offline DPO and periodic ranked-sample feedback.
   if (!newArchSupportsDpo) {
     if (jobConfig.config.process[0].train.loss_type === 'dpo') {
       setJobConfig('mse', 'config.process[0].train.loss_type');
     }
     setJobConfig(undefined, 'config.process[0].train.dpo_beta');
+    setJobConfig(undefined, 'config.process[0].train.dpo_feedback');
   }
 
   // update vram setting

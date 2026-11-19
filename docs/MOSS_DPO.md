@@ -1,6 +1,146 @@
 # Preference tuning MOSS-Image
 
-Train a transformer LoRA from two images made for the same prompt. Put the image you want MOSS to favor in the chosen folder and its alternative in the rejected folder. Save the shared prompt next to the chosen image.
+This trainer supports two related preference workflows. They share a frozen MOSS-Image reference and the same
+positive `dpo_beta` objective, but they obtain pairs differently.
+
+- **Interactive ranked sample feedback** (the normal GUI workflow): a standard MOSS text-to-image transformer LoRA
+  is trained with its ordinary loss while the job generates regular sample images. You rank those images later in
+  the job gallery. This is also called interleaved or periodic online DPO.
+- **Offline dataset DPO**: chosen and rejected image folders are paired by matching relative paths and trained as
+  `loss_type: dpo`. This remains available for curated datasets and held-out scoring.
+
+Both workflows train MOSS-Image text-to-image transformer LoRAs. Preference updates use paired velocity errors.
+Ordinary updates in an interleaved run can still use their dataset masks and loss weighting.
+
+## Interactive ranked sample feedback (GUI)
+
+Use the normal **New Job** editor, choose an ordinary MOSS-Image text-to-image checkpoint, and keep the normal
+target dataset folder. In the Training card, enable **Periodic ranked sample feedback (online DPO)**. This is a
+separate switch from the Loss Type dropdown: MSE/MAE/Wavelet/Stepped Recovery remain selectable. Online feedback and
+offline DPO cannot run together, so choosing offline DPO clears the online switch; choose an ordinary loss before
+enabling periodic feedback.
+
+When enabled, the GUI writes this object under `train`:
+
+```yaml
+train:
+  loss_type: mse                 # any ordinary loss; loss_type: dpo is rejected here
+  dpo_beta: 100                  # positive; default 100
+  dpo_feedback:
+    every: 10                    # successful optimizer updates
+    start_after: 0               # successful optimizer updates
+```
+
+`train.dpo_feedback` absent or `null` means off. `every` counts successful optimizer updates, not raw steps, and
+`start_after` also counts optimizer updates. The regular **Sample Every** setting in the Sample card is independent:
+it controls how often ordinary gallery samples are generated. Feedback Every controls how often eligible voted pairs
+can be reused for online preference training.
+
+The switch does not replace the ordinary target folder. Because feedback needs real samples to rank, enabling it
+turns sampling on. If the normal sample list has no usable prompt, the editor appends a fallback prompt; otherwise it
+preserves the user's prompts, sample cadence, dimensions and other normal sample settings. You can edit the prompt
+list before launching, and the saved job config is ordinary YAML/JSON that can be reopened in the GUI.
+
+### Voting is delayed
+
+For example, with **Feedback Every** set to 10, a pair generated at update 100 can be ranked at update 137.
+At update 140 the trainer can use your vote. The job keeps the two images, their training latents and prompt
+conditioning. At training time it draws fresh shared noise and a timestep, scores the pair with the **current**
+LoRA and with the frozen base, and applies the preference gradient to the current LoRA. No old gradient or
+step-100 LoRA is needed.
+
+Each scheduled slot takes one complete optimizer window. A slot with no eligible votes does ordinary training.
+Eligible pairs rotate through later slots. Skip excludes a pair. Votes added after the final update are available
+if you extend and resume the same job. A changed frozen reference makes its earlier pairs ineligible. The
+reference identifier tracks the base and encoding setup. Learning rate, total steps and feedback cadence can
+change on resume without invalidating a vote.
+
+### On-disk pair contract
+
+Each new independent sample pair belongs to the current job and is stored under:
+
+```text
+<save_root>/preferences/<id>/
+```
+
+`<id>` is a lowercase UUID4 hex string. The directory contains fixed filenames:
+
+```text
+pair.json
+a.png
+b.png
+embeddings.safetensors
+latents.safetensors
+vote.json          # after voting
+```
+
+`pair.json` contains exactly the metadata needed to interpret the displayed pair:
+
+```json
+{
+  "version": 1,
+  "id": "<lowercase uuid4 hex>",
+  "step": 123,
+  "optimizer_updates": 41,
+  "ema": false,
+  "network_multiplier": 1,
+  "sampler": "flowmatch",
+  "sampling_steps": 20,
+  "guidance_scale": 3.5,
+  "negative_prompt": "",
+  "prompt": "the sample prompt",
+  "seeds": [42, 43],
+  "width": 1024,
+  "height": 1024,
+  "reference_id": "<frozen checkpoint/config identity>",
+  "created_at": "2026-11-18T00:00:00Z"
+}
+```
+
+`a.png` and `b.png` are the exact rated images. `embeddings.safetensors` is a single
+`AdvancedPromptEmbeds.save` payload for the pair's prompt. `latents.safetensors` has keys `a` and `b`; each value is
+a `[1, C, H, W]` tensor containing the normalized MOSS training `x0` for the corresponding displayed image. Keeping
+the displayed pixels and the training tensors together makes the vote unambiguous.
+
+`vote.json` is an immutable, atomic decision:
+
+```json
+{
+  "version": 1,
+  "id": "<same pair id>",
+  "choice": "a",
+  "voted_at": "2026-11-18T00:05:00Z"
+}
+```
+
+`choice` is `a`, `b`, or `skip`. Re-voting the same choice is idempotent. The UI writes votes; the trainer sorts and
+uses only eligible voted pairs. Pair IDs and metadata are validated. UI and data code treat every path and metadata
+field as untrusted: files are accessed by fixed names resolved against the job's bound root, never by a path supplied
+by the user or a pair manifest.
+
+### Interpreting the objective
+
+Each pair shares its prompt, timestep and sampled noise. The trainer predicts the flow velocity for both images with
+the LoRA disabled (the frozen reference), then repeats that prediction with the trainable LoRA enabled. It computes
+mean squared error per image in FP32. The objective follows the
+[Diffusion-DPO implementation](https://github.com/SalesforceAIResearch/DiffusionDPO/blob/main/train.py) with the MOSS
+flow target.
+
+```text
+gain(image) = reference_error(image) - policy_error(image)
+margin      = (dpo_beta / 2) * (gain(chosen) - gain(rejected))
+loss        = mean(softplus(-margin))
+```
+
+A fresh zero-initialized adapter should start near 0.693 with unit example weights. `dpo/margin` reports the mean
+scaled margin and `dpo/accuracy` the fraction of pairs with a strictly positive margin on the logged microbatch. The
+starting beta and learning rate are illustrative. Judge saved checkpoints on prompts held out from the preference
+pairs to measure whether images improve.
+
+## Offline dataset DPO
+
+Put the image you want MOSS to favor in the chosen folder and its alternative in the rejected folder. Save the shared
+prompt next to the chosen image.
 
 ```text
 preferences/
@@ -11,31 +151,27 @@ preferences/
     landscapes/001.png
 ```
 
-Use the same relative path, extension and displayed dimensions for both images. The loader keeps the pair together through shuffling, bucketing and flipping. One unit of `batch_size` is one pair. The example caches both image latents and the shared caption. Choose a fresh output name when starting a new experiment, as the trainer resumes existing jobs by name.
+Use the same relative path, extension and displayed dimensions for both images. The loader keeps the pair together
+through shuffling, bucketing and flipping. One unit of `batch_size` is one pair. The example caches both image latents
+and the shared caption. Choose a fresh output name when starting a new experiment, as the trainer resumes existing
+jobs by name.
 
-Copy [the example](../config/examples/train_dpo_moss_image.yaml), set both dataset paths and select your MOSS checkpoint. Launch it from the toolkit checkout with its usual Python environment.
+Copy [the example](../config/examples/train_dpo_moss_image.yaml), set both dataset paths and select your MOSS
+checkpoint. Launch it from the toolkit checkout with its usual Python environment.
 
 ```shell
 python run.py config/examples/train_dpo_moss_image.yaml
 ```
 
-`model.name_or_path` supplies the frozen reference. Both MOSS-Image Base and SFT use the same training path. To align a previously fine-tuned model against itself, supply that merged checkpoint as the model and start a fresh LoRA. Loading a trainable adapter with `network.pretrained_lora_path` initializes the policy only. During resume, keep the same reference checkpoint and quantization settings.
-
-## Interpreting the loss
-
-Each pair shares its prompt, timestep and sampled noise. The trainer predicts the flow velocity for both images with the LoRA disabled, then repeats that prediction with the trainable LoRA enabled. It computes mean squared error per image in FP32. The objective follows the [Diffusion-DPO implementation](https://github.com/SalesforceAIResearch/DiffusionDPO/blob/main/train.py) with the MOSS flow target.
-
-```text
-gain(image) = reference_error(image) - policy_error(image)
-margin      = (dpo_beta / 2) * (gain(chosen) - gain(rejected))
-loss        = mean(softplus(-margin))
-```
-
-A fresh zero-initialized adapter should start near 0.693 with unit example weights. `dpo/margin` reports the mean scaled margin and `dpo/accuracy` the fraction of pairs with a strictly positive margin on the logged microbatch. The starting beta and learning rate in the example are illustrative. Judge saved checkpoints on prompts held out from the preference pairs to measure whether the images improve.
+`model.name_or_path` supplies the frozen reference. Both MOSS-Image Base and SFT use the same training path. To align
+a previously fine-tuned model against itself, supply that merged checkpoint as the model and start a fresh LoRA.
+Loading a trainable adapter with `network.pretrained_lora_path` initializes the policy only. During resume, keep the
+same reference checkpoint and quantization settings.
 
 ## Scoring held-out preferences
 
-Use separate chosen and rejected folders with the same layout. Keep all pairs from a given prompt in the same split. Add this block under `train` to score a reproducible sample at fixed noise levels.
+Use separate chosen and rejected folders with the same layout. Keep all pairs from a given prompt in the same split.
+Add this block under `train` to score a reproducible sample at fixed noise levels.
 
 ```yaml
 validation_config:
@@ -49,6 +185,6 @@ validation_config:
   validate_every_n_steps: 25
 ```
 
-`val/dpo/accuracy` measures how often the policy improves the chosen image's denoising error more than its mate's, relative to the frozen reference. Ties count as zero. The job's `validation.jsonl` records the image ID, noise level, margin and four underlying errors so you can inspect individual pairs.
-
-The first implementation supports text-to-image MOSS transformer LoRAs. Use ordinary image pairs with a frozen text encoder. MOSS edit conditioning, masks, auxiliary training losses and full-model tuning require separate support. The trainer uses one transformer for both forwards and keeps gradients only for the policy pass.
+`val/dpo/accuracy` measures how often the policy improves the chosen image's denoising error more than its mate's,
+relative to the frozen reference. Ties count as zero. The job's `validation.jsonl` records the image ID, noise level,
+margin and four underlying errors so you can inspect individual pairs.

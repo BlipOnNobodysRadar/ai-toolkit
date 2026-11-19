@@ -164,13 +164,63 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
-  'train.dpo_beta': {
+  'train.dpo_feedback': {
+    title: 'Periodic Ranked Sample Feedback',
+    description: (
+      <>
+        Enables interleaved online DPO for ordinary MOSS text-to-image transformer LoRAs. During training the job
+        generates normal sample images and writes independent A/B pairs to its gallery. You rank each pair later, so
+        voting is delayed and training does not pause while you decide. This is separate from offline DPO and does not
+        change the selected Loss Type or replace the ordinary target dataset. Online feedback and offline DPO cannot
+        run together: choosing offline DPO clears this switch, so select an ordinary loss before enabling it.
+        <br />
+        <br />
+        Each displayed pair is immutable. Its vote is an immutable A/B/skip decision; re-voting the same choice is
+        idempotent and skip pairs are not trained. The frozen reference is fixed by the checkpoint&apos;s content and
+        configuration identity, not by the current trainable LoRA. Voted pairs are reused by subsequent feedback
+        updates. The job must have sampling enabled and at least one valid sample prompt; enabling this mode fills in
+        a fallback prompt only when none exists and preserves your other normal sample settings.
+        <br />
+        <br />
+        Feedback Every counts successful optimizer updates after Start After. It is independent of the regular
+        Sample Every cadence in the Sample card. DPO Beta must be positive and defaults to 100.
+      </>
+    ),
+  },
+  'train.dpo_feedback.every': {
+    title: 'Feedback Every (Optimizer Updates)',
+    description: (
+      <>
+        Number of successful optimizer updates between attempts to reuse eligible voted preference pairs for online
+        DPO. This is not a raw step count and is independent of the regular sample cadence. The default is 10.
+      </>
+    ),
+  },
+  'train.dpo_feedback.start_after': {
+    title: 'Start After (Optimizer Updates)',
+    description: (
+      <>
+        Wait this many successful optimizer updates before online feedback training begins. This gives the LoRA a
+        chance to settle before ranked samples are used. The default is 0.
+      </>
+    ),
+  },
+  'sample.sample_every': {
+    title: 'Sample Every',
+    description: (
+      <>
+        Generate ordinary gallery samples every this many training steps. This controls the regular sample cadence
+        only. When periodic ranked sample feedback is enabled, feedback training has a separate optimizer-update
+        cadence configured in the Training card.
+      </>
+    ),
+  },  'train.dpo_beta': {
     title: 'DPO Beta',
     description: (
       <>
-        Scales the preference margin for Diffusion DPO. It must be a finite number greater than zero; 100 is the default.
-        Larger values put more weight on separating chosen from rejected predictions. Start with the default and judge
-        the result on held-out prompts.
+        Scales the preference margin for Diffusion DPO and periodic ranked sample feedback. It must be a finite number
+        greater than zero; 100 is the default. Larger values put more weight on separating chosen from rejected
+        predictions. Start with the default and judge the result on held-out prompts or the job&apos;s ranked samples.
       </>
     ),
   },

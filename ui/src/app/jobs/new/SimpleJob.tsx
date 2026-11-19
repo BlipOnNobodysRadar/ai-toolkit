@@ -29,8 +29,16 @@ import { openPromptBoxEditor } from '@/components/PromptBoxEditorModal';
 import AddSingleImageModal, { openAddImageModal } from '@/components/AddSingleImageModal';
 import SampleControlImage from '@/components/SampleControlImage';
 import { FlipHorizontal2, FlipVertical2 } from 'lucide-react';
+import ForkTrainingOptions from './ForkTrainingOptions';
 import {
   DPO_BETA_DEFAULT,
+  DPO_FEEDBACK_EVERY_DEFAULT,
+  DPO_FEEDBACK_START_AFTER_DEFAULT,
+  applyDpoFeedbackMode,
+  clearDpoFeedbackConfig,
+  isDpoFeedbackEnabled,
+  isValidDpoFeedbackEvery,
+  isValidDpoFeedbackStartAfter,
   applyDpoMode,
   clearDpoConfig,
   handleModelArchChange,
@@ -75,6 +83,15 @@ export default function SimpleJob({
   const model = jobConfig.config.process[0].model;
   const dpoEligible = isMossImageDpoEligible(model.arch) && !model.model_kwargs?.edit;
   const isDpoActive = dpoEligible && jobConfig.config.process[0].train.loss_type === 'dpo';
+  const dpoFeedback = jobConfig.config.process[0].train.dpo_feedback;
+  const isDpoFeedbackActive = dpoEligible && isDpoFeedbackEnabled(dpoFeedback);
+  const showDpoBeta = isDpoActive || isDpoFeedbackActive;
+  const feedbackEvery = isValidDpoFeedbackEvery(dpoFeedback?.every)
+    ? dpoFeedback.every
+    : DPO_FEEDBACK_EVERY_DEFAULT;
+  const feedbackStartAfter = isValidDpoFeedbackStartAfter(dpoFeedback?.start_after)
+    ? dpoFeedback.start_after
+    : DPO_FEEDBACK_START_AFTER_DEFAULT;
   const lossTypeOptions = useMemo(() => {
     const options: SelectOption[] = [
       { value: 'mse', label: 'Mean Squared Error' },
@@ -83,7 +100,7 @@ export default function SimpleJob({
       { value: 'stepped', label: 'Stepped Recovery' },
     ];
     if (dpoEligible) {
-      options.push({ value: 'dpo', label: 'DPO (Direct Preference Optimization)' });
+      options.push({ value: 'dpo', label: 'DPO (offline rejected-image pairs)' });
     }
     return options;
   }, [dpoEligible]);
@@ -835,10 +852,76 @@ export default function SimpleJob({
                     }}
                     options={lossTypeOptions}
                   />
-                  {isDpoActive && (
+                  {dpoEligible && (
+                    <div className="mt-3 rounded-md border border-gray-700 bg-gray-900/60 p-3">
+                      <Checkbox
+                        label="Periodic ranked sample feedback (online DPO)"
+                        docKey="train.dpo_feedback"
+                        checked={isDpoFeedbackActive}
+                        disabled={isDpoActive}
+                        onChange={checked => {
+                          if (checked) {
+                            applyDpoFeedbackMode(jobConfig, setJobConfig);
+                          } else {
+                            clearDpoFeedbackConfig(jobConfig, setJobConfig);
+                          }
+                        }}
+                      />
+                      <p className="mt-2 text-xs text-gray-400">
+                        The job generates ordinary sample pairs and you rank A/B later in its gallery. Voting is
+                        delayed: generation keeps training while you judge, and your immutable votes are reused by
+                        subsequent feedback updates. This is separate from offline DPO, keeps the ordinary target
+                        folder, and does not change Loss Type.
+                      </p>
+                      {isDpoActive && (
+                        <p className="mt-2 text-xs text-amber-300">
+                          Periodic sample feedback uses an ordinary loss. Switch Loss Type away from offline DPO to
+                          enable it; choosing offline DPO clears this online mode.
+                        </p>
+                      )}
+                      {isDpoFeedbackActive && (
+                        <>
+                          <NumberInput
+                            label="Feedback Every (successful optimizer updates)"
+                            className="pt-2"
+                            docKey="train.dpo_feedback.every"
+                            value={feedbackEvery}
+                            onChange={value => {
+                              if (value !== null && isValidDpoFeedbackEvery(value)) {
+                                setJobConfig(value, 'config.process[0].train.dpo_feedback.every');
+                              }
+                            }}
+                            placeholder="eg. 10"
+                            min={1}
+                            required
+                          />
+                          <NumberInput
+                            label="Start After (optimizer updates)"
+                            className="pt-2"
+                            docKey="train.dpo_feedback.start_after"
+                            value={feedbackStartAfter}
+                            onChange={value => {
+                              if (value !== null && isValidDpoFeedbackStartAfter(value)) {
+                                setJobConfig(value, 'config.process[0].train.dpo_feedback.start_after');
+                              }
+                            }}
+                            placeholder="eg. 0"
+                            min={0}
+                            required
+                          />
+                          <p className="mt-2 text-xs text-gray-400">
+                            Feedback cadence counts successful optimizer updates after Start After. Regular gallery
+                            samples still follow Sample Every in the Sample card; the two cadences are independent.
+                            Enabling feedback turns sampling on and fills in a prompt only if none would be sampled.
+                          </p>
+                        </>
+                      )}
+                    </div>
+                  )}
+                  {showDpoBeta && (
                     <>
                       <NumberInput
-                        label="DPO Beta"
+                        label={isDpoFeedbackActive && !isDpoActive ? 'Feedback DPO Beta' : 'DPO Beta'}
                         className="pt-2"
                         docKey="train.dpo_beta"
                         value={
@@ -847,7 +930,7 @@ export default function SimpleJob({
                             : DPO_BETA_DEFAULT
                         }
                         onChange={value => {
-                          if (value !== null) {
+                          if (value !== null && isValidDpoBeta(value)) {
                             setJobConfig(value, 'config.process[0].train.dpo_beta');
                           }
                         }}
@@ -856,7 +939,11 @@ export default function SimpleJob({
                         required
                       />
                       <p className="pt-2 text-xs text-gray-400">
-                        DPO compares the trainable LoRA with the frozen MOSS checkpoint.
+                        {isDpoActive && isDpoFeedbackActive
+                          ? 'Offline DPO and periodic sample feedback share this positive beta; both compare against the frozen reference MOSS checkpoint.'
+                          : isDpoActive
+                            ? 'Offline DPO compares the trainable LoRA with the frozen MOSS checkpoint using rejected dataset pairs.'
+                            : 'Scales the online preference margin. The frozen reference is fixed by checkpoint content and configuration identity, not by the current trainable LoRA.'}
                       </p>
                     </>
                   )}
@@ -1226,6 +1313,7 @@ export default function SimpleJob({
           )}
         </div>
         <div>
+          <ForkTrainingOptions jobConfig={jobConfig} setJobConfig={setJobConfig} datasetOptions={datasetOptions} modelArch={modelArch} />
           <Card title="Datasets">
             <>
               {jobConfig.config.process[0].datasets.map((dataset, i) => (
@@ -1572,13 +1660,20 @@ export default function SimpleJob({
             <div className={sampleTopStyleClass}>
               <div>
                 <NumberInput
-                  label="Sample Every"
+                  label="Sample Every (training steps)"
+                  docKey="sample.sample_every"
                   value={jobConfig.config.process[0].sample.sample_every}
                   onChange={value => setJobConfig(value, 'config.process[0].sample.sample_every')}
                   placeholder="eg. 250"
                   min={1}
                   required
                 />
+                {isDpoFeedbackActive && (
+                  <p className="mt-1 text-xs text-gray-400">
+                    This is the regular gallery-sample cadence. Ranked feedback training has its own optimizer-update
+                    cadence in the Training card.
+                  </p>
+                )}
                 <NumberInput
                   label="Sample Start Step"
                   value={jobConfig.config.process[0].sample.sample_start_step ?? 0}
@@ -1728,9 +1823,14 @@ export default function SimpleJob({
                   </div>
                   <div>
                     <Checkbox
-                      label="Disable Sampling"
+                      label={
+                        isDpoFeedbackActive
+                          ? 'Disable Sampling (off while ranked feedback is enabled)'
+                          : 'Disable Sampling'
+                      }
                       className="pt-1"
                       checked={jobConfig.config.process[0].train.disable_sampling || false}
+                      disabled={isDpoFeedbackActive}
                       onChange={value => {
                         setJobConfig(value, 'config.process[0].train.disable_sampling');
                         // cannot do both, so disable the other

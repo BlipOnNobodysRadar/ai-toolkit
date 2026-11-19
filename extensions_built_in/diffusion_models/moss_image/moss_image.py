@@ -178,6 +178,7 @@ class MossImageModel(BaseModel):
         self.use_old_lokr_format = False
         self.lora_keys_use_comfy_prefix = True
         self.latent_space_version = "moss_image"
+        self.feedback_component_sources = {}
 
         kw = self.model_config.model_kwargs
         self.max_text_length = int(kw.get("max_text_length", MAX_TEXT_TOKENS))
@@ -231,7 +232,9 @@ class MossImageModel(BaseModel):
             state_dict = {}
             for name in sorted(os.listdir(folder)):
                 if name.endswith(".safetensors"):
-                    with safe_open(os.path.join(folder, name), "pt") as f:
+                    shard = os.path.join(folder, name)
+                    self.feedback_component_sources[f"transformer/{name}"] = shard
+                    with safe_open(shard, "pt") as f:
                         for key in f.keys():
                             state_dict[key] = f.get_tensor(key)
             if not state_dict:
@@ -249,6 +252,7 @@ class MossImageModel(BaseModel):
                 status_fn=self.print_and_status_update,
             )
         self.print_and_status_update(f" - transformer weights: {path}")
+        self.feedback_component_sources["transformer"] = path
         return MossImageTransformer.load_model(
             path, dtype=self.torch_dtype, qtype=qtype, quantize_on_load=False
         )
@@ -291,6 +295,11 @@ class MossImageModel(BaseModel):
             self.image_processor = AutoImageProcessor.from_pretrained(
                 _hub_file_folder(QWEN35_9B_REPO, "preprocessor_config.json")
             )
+        source = getattr(text_encoder, "_aitk_weight_source", te_path)
+        revision = getattr(text_encoder.config, "_commit_hash", None)
+        if revision and not os.path.exists(source):
+            source = f"{source}@{revision}"
+        self.feedback_component_sources["text_encoder"] = source
         text_encoder.eval()
         text_encoder.requires_grad_(False)
         return text_encoder
@@ -307,6 +316,7 @@ class MossImageModel(BaseModel):
             folder = _hub_tokenizer_folder(source)
         # the declared class: AutoTokenizer also resolves a config.json the
         # folder lacks, which fails offline
+        self.feedback_component_sources["tokenizer"] = folder
         tokenizer = Qwen2Tokenizer.from_pretrained(folder)
         if tokenizer.chat_template is None or len(tokenizer) < 1000:
             raise ValueError(f"incomplete MOSS-Image tokenizer in {folder}")
@@ -328,6 +338,7 @@ class MossImageModel(BaseModel):
             path = resolve_hub_file(
                 path, hf_token=HF_TOKEN, status_fn=self.print_and_status_update
             )
+        self.feedback_component_sources["vae"] = path
         state_dict = load_file(path)
         if any(k.startswith("encoder.down_blocks.") for k in state_dict):
             state_dict = convert_diffusers_state_dict(state_dict)
@@ -377,6 +388,9 @@ class MossImageModel(BaseModel):
         generator: torch.Generator,
         extra: dict,
     ):
+        if hasattr(gen_config, "feedback_conditioning"):
+            # Archive exactly the positive conditioning used by the displayed sample.
+            gen_config.feedback_conditioning = conditional_embeds.detach().to("cpu")
         if self.model.device == torch.device("cpu"):
             self.model.to(self.device_torch)
 

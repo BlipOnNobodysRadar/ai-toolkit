@@ -159,6 +159,14 @@ export interface ValidationConfig {
   seed?: number;
 }
 
+/** Interleaved ranked-sample feedback. Absent or null disables it. `every`
+ * counts successful optimizer updates; `start_after` is also in optimizer
+ * updates. Gallery voting happens after each pair is generated. */
+export interface DpoFeedbackConfig {
+  every: number;
+  start_after: number;
+}
+
 export interface TrainConfig {
   batch_size: number;
   bypass_guidance_embedding?: boolean;
@@ -192,6 +200,10 @@ export interface TrainConfig {
   switch_boundary_every: number;
   loss_type: 'mse' | 'mae' | 'wavelet' | 'stepped' | 'dpo';
   dpo_beta?: number;
+  /** Inline MOSS preference feedback from ranked gallery samples. This is
+   * independent of offline DPO, which uses loss_type='dpo' and rejected
+   * dataset folders. */
+  dpo_feedback?: DpoFeedbackConfig | null;
   do_differential_guidance?: boolean;
   differential_guidance_scale?: number;
   pool_datasets?: boolean;

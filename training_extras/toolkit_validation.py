@@ -92,7 +92,7 @@ def _validate_paired_validation_config(trainer, cfg):
         )
     if not any(flags):
         return False
-    if getattr(trainer.train_config, 'loss_type', None) != 'dpo':
+    if getattr(trainer.train_config, 'loss_type', None) != 'dpo' and getattr(trainer.train_config, 'dpo_feedback', None) is None:
         raise ValueError(
             "Validation datasets[].rejected_path requires train.loss_type: dpo"
         )
@@ -451,13 +451,14 @@ def _check_validation_disjoint(trainer):
         for obj in _as_list(getattr(trainer, attr, None)):
             for dataset in _iter_dataset_objects(obj):
                 for item in _as_list(getattr(dataset, "file_list", None)):
-                    path = getattr(item, "path", None) or item
-                    canonical = _canonical_path(path)
-                    if canonical:
-                        training_paths.add(canonical)
-                    identity = _file_identity(path)
-                    if identity:
-                        training_identities.add(identity)
+                    for path in (getattr(item, "path", None) or item, getattr(item, "rejected_path", None)):
+                        if path is not None:
+                            canonical = _canonical_path(path)
+                            if canonical:
+                                training_paths.add(canonical)
+                            identity = _file_identity(path)
+                            if identity:
+                                training_identities.add(identity)
     for validation in canonical_validation:
         for path in _collect_files_from_root(validation):
             canonical = _canonical_path(path)
@@ -691,7 +692,7 @@ def validate(trainer, phase='periodic'):
     cache = getattr(trainer, '_validation_cache', None) or {}
     paired_cache = bool(cache.get('paired')) if isinstance(cache, dict) else False
     if _is_paired_validation(cfg) or paired_cache:
-        if getattr(trainer.train_config, 'loss_type', None) != 'dpo':
+        if getattr(trainer.train_config, 'loss_type', None) != 'dpo' and getattr(trainer.train_config, 'dpo_feedback', None) is None:
             raise ValueError(
                 "Validation datasets[].rejected_path requires train.loss_type: dpo"
             )

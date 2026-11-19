@@ -11,10 +11,12 @@ from toolkit.prompt_utils import concat_prompt_embeds
 def validate_dpo_config(trainer):
     train = trainer.train_config
     datasets = trainer.dataset_configs
+    feedback = getattr(train, 'dpo_feedback', None) is not None
     if train.loss_type != 'dpo':
         if any(dataset.rejected_path for dataset in datasets):
             raise ValueError("datasets[].rejected_path requires train.loss_type: dpo")
-        return
+        if not feedback:
+            return
 
     model = trainer.model_config
     # ModelConfig strips the UI variant suffix, including on hand-written YAML.
@@ -30,9 +32,9 @@ def validate_dpo_config(trainer):
         raise ValueError('DPO requires a transformer LoRA with a frozen base and text encoder')
     if model.refiner_name_or_path or trainer.guidance_config:
         raise ValueError('DPO does not support a refiner or a guidance process')
-    if not datasets or not all(d.rejected_path and not d.is_reg for d in datasets):
+    if not datasets or (not feedback and not all(d.rejected_path and not d.is_reg for d in datasets)):
         raise ValueError('Every DPO dataset must provide a rejected_path for its chosen folder')
-    if (train.unload_text_encoder or trainer.is_caching_text_embeddings) and not all(
+    if not feedback and (train.unload_text_encoder or trainer.is_caching_text_embeddings) and not all(
             d.cache_text_embeddings for d in datasets):
         raise ValueError('DPO needs cached captions for every dataset when unloading the text encoder')
 
@@ -50,14 +52,19 @@ def validate_dpo_config(trainer):
         'match_noise_norm', 'correct_pred_norm', 'target_norm_std', 'do_signal_amplification',
     )
     for key in incompatible:
+        # Weighting the ordinary denoising objective is still meaningful. The
+        # preference window always uses unweighted per-image velocity errors.
+        if feedback and key in ('training_extras', 'min_snr_gamma', 'snr_gamma', 'do_fft_loss'):
+            continue
         if getattr(train, key, None):
             raise ValueError(f'train.{key} is incompatible with DPO')
     if train.optimal_noise_pairing_samples > 1 or train.pred_scaler != 1 or train.target_noise_multiplier != 1:
         raise ValueError('DPO requires ordinary noise pairing and unit target and prediction scales')
 
-    from toolkit.data_loader import validate_dpo_config_options
-    for dataset in datasets:
-        validate_dpo_config_options(dataset)
+    if not feedback:
+        from toolkit.data_loader import validate_dpo_config_options
+        for dataset in datasets:
+            validate_dpo_config_options(dataset)
 
 
 def prediction_errors(prediction, target):
@@ -107,6 +114,12 @@ def reference_errors(trainer, noisy, timesteps, conditioning, target):
 def train_dpo_accumulation(trainer, batch, accum_scale):
     with torch.no_grad():
         paired = paired_batch(batch)
+        if getattr(batch, '_feedback_pair_id', None):
+            # The ordinary loader owns the exposure counter. A voted pair
+            # uses the current curriculum epoch without consuming its images.
+            cursor = getattr(trainer, '_clean_share_cursor', None)
+            if cursor is not None:
+                paired._clean_share_epoch = cursor.position[0] + 1
         noisy, noise, timesteps, prompts, _ = trainer.process_general_training_batch(
             paired, shared_pair_noise=True)
         target = trainer.sd.get_loss_target(noise=noise, batch=paired)
@@ -139,5 +152,6 @@ def train_dpo_accumulation(trainer, batch, accum_scale):
         network.multiplier = previous_multiplier
 
     trainer.additional_logs['dpo/margin'] = logits.detach().mean().item()
+    trainer.additional_logs['dpo/gain_gap'] = trainer.additional_logs['dpo/margin'] * (2 / trainer.train_config.dpo_beta)
     trainer.additional_logs['dpo/accuracy'] = (logits.detach() > 0).float().mean().item()
     return loss.detach()

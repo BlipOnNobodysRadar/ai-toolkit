@@ -12,6 +12,7 @@ import { encodeFilePathForUrl } from '@/utils/basic';
 import classNames from 'classnames';
 import { FaCaretDown, FaCaretUp } from 'react-icons/fa';
 import SampleImageViewer from './SampleImageViewer';
+import PreferenceFeedback from './PreferenceFeedback';
 import { openConfirm } from './ConfirmModal';
 
 interface SampleImagesMenuProps {
@@ -271,6 +272,7 @@ export default function SampleImages({ job }: SampleImagesProps) {
   return (
     <div ref={scrollParentCallback} className="absolute top-[80px] left-0 right-0 bottom-0 overflow-y-auto">
       <div className="pb-4">
+        <PreferenceFeedback job={job} />
         {PageInfoContent}
         {sampleImages && rows.length > 0 && scrollParent && (
           <Virtuoso
