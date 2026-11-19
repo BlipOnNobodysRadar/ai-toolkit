@@ -334,3 +334,11 @@ def test_restore_failure_stops_training_instead_of_skipping_feedback(tmp_path, m
     with pytest.raises(RuntimeError, match="failed to restore training placement"):
         BaseSDTrainProcess.sample(trainer, 10)
     assert not list((Path(trainer.save_root) / "preferences").glob("[0-9a-f]*"))
+
+@pytest.mark.parametrize("legacy_empty", [None, False, ""])
+def test_optional_negative_prompt_is_text_for_moss(legacy_empty):
+    common = SampleConfig(prompts=["a bird"], neg=legacy_empty)
+    assert common.neg == common.samples[0].neg == ""
+    override = SampleConfig(neg="noise", samples=[{"prompt": "a bird", "neg": legacy_empty}])
+    assert override.neg == "noise" and override.samples[0].neg == ""
+    assert SampleConfig(prompts=["a bird"]).samples[0].neg == ""

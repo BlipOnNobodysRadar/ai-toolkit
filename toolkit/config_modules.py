@@ -52,7 +52,7 @@ class SampleItem:
         self.prompt = kwargs.get('prompt', None)
         self.width: int = kwargs.get('width', sample_config.width)
         self.height: int = kwargs.get('height', sample_config.height)
-        self.neg: str = kwargs.get('neg', sample_config.neg)
+        self.neg: str = kwargs.get('neg', sample_config.neg) or ''
         self.seed: Optional[int] = kwargs.get('seed', None) # if none, default to autogen seed
         self.guidance_scale: float = kwargs.get('guidance_scale', sample_config.guidance_scale)
         self.sample_steps: int = kwargs.get('sample_steps', sample_config.sample_steps)
@@ -87,7 +87,7 @@ class SampleConfig:
         self.sample_start_step: int = kwargs.get('sample_start_step', 0)
         self.width: int = kwargs.get('width', 512)
         self.height: int = kwargs.get('height', 512)
-        self.neg = kwargs.get('neg', False)
+        self.neg: str = kwargs.get('neg') or ''
         self.seed = kwargs.get('seed', 0)
         self.walk_seed = kwargs.get('walk_seed', False)
         self.guidance_scale = kwargs.get('guidance_scale', 7)
