@@ -1,23 +1,35 @@
 import fs from 'fs';
 import path from 'path';
+import { PreferenceFeedbackError, resolveBoundJobRoot } from './preferenceFeedback';
 
 // Read-only summaries of the reports fork training writes next to its checkpoints.
 // Both formats are documented in training_extras/README.md. Only these fixed
 // names are read; callers never supply a path.
 export const VALIDATION_FILE = 'validation.jsonl';
 export const EDM2_FILE = 'edm2-weighting.csv';
+export const REPORT_FILE_NAMES = [VALIDATION_FILE, EDM2_FILE] as const;
+export type ReportFileName = (typeof REPORT_FILE_NAMES)[number];
 const MAX_REPORT_BYTES = 8 * 1024 * 1024;
+const MAX_VALIDATION_TAIL_BYTES = 2 * 1024 * 1024;
 const MAX_VALIDATION_LINES = 5000;
 const MAX_VALIDATION_HISTORY = 500;
 const MAX_EDM_POINTS = 360;
 
+const REPORT_CONTENT_TYPES: Record<ReportFileName, string> = {
+  [VALIDATION_FILE]: 'application/x-ndjson; charset=utf-8',
+  [EDM2_FILE]: 'text/csv; charset=utf-8',
+};
+
+export const isReportFileName = (value: unknown): value is ReportFileName =>
+  typeof value === 'string' && (REPORT_FILE_NAMES as readonly string[]).includes(value);
+
 export type ReportFileMeta = {
-  fileName: string;
-  path: string;
+  fileName: ReportFileName;
   exists: boolean;
   size: number | null;
   updatedAt: string | null;
   tooLarge: boolean;
+  previewTruncated: boolean;
   readError: string | null;
 };
 
@@ -64,6 +76,12 @@ export type Edm2Report = ReportFileMeta & {
 export type JobReports = {
   validation: ValidationReport;
   edm2: Edm2Report;
+};
+
+export type ReportJob = {
+  id: string;
+  name: string;
+  run_dir?: string | null;
 };
 
 const METRIC_KEYS = [
@@ -118,15 +136,13 @@ export const summarizeValidationJsonl = (text: string): Omit<ValidationReport, k
   const history: ValidationHistoryEntry[] = [];
   const bySigmaMap = new Map<number, Record<string, unknown>[]>();
   let malformedLines = 0;
-  let lineCount = 0;
   let nativeSeen = false;
   let dpoSeen = false;
 
-  for (const rawLine of text.replace(/^\uFEFF/, '').split(/\r?\n/)) {
+  const lines = text.replace(/^\uFEFF/, '').trimEnd().split(/\r?\n/);
+  for (const rawLine of lines.slice(-MAX_VALIDATION_LINES)) {
     const line = rawLine.trim();
     if (!line) continue;
-    if (lineCount >= MAX_VALIDATION_LINES) break;
-    lineCount += 1;
 
     let parsed: unknown;
     try {
@@ -264,74 +280,122 @@ export const summarizeEdm2Csv = (text: string): Omit<Edm2Report, keyof ReportFil
   };
 };
 
-const readKnownFile = async (filePath: string): Promise<{ meta: ReportFileMeta; text: string | null }> => {
-  const meta: ReportFileMeta = {
-    fileName: path.basename(filePath),
-    path: filePath,
-    exists: false,
-    size: null,
-    updatedAt: null,
-    tooLarge: false,
-    readError: null,
-  };
+type BoundReportRoot = { lexical: string; real: string };
+type VerifiedReportFile = { lexical: string; real: string; size: number; updatedAt: string };
 
-  let stats;
+const samePath = (left: string, right: string): boolean => {
+  const a = path.resolve(left);
+  const b = path.resolve(right);
+  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+};
+
+const lstatOptional = async (file: string): Promise<fs.Stats | null> => {
   try {
-    stats = await fs.promises.stat(filePath);
-  } catch {
-    return { meta, text: null };
+    return await fs.promises.lstat(file);
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return null;
+    throw new PreferenceFeedbackError('The report file could not be inspected safely.', 500, 'REPORT_UNREADABLE');
   }
-  if (!stats.isFile()) return { meta, text: null };
+};
+
+// The job root was already accepted by resolveBoundJobRoot. This check is deliberately repeated for the report
+// itself: a fixed name must be a real regular file whose physical location is the verified job folder, not a
+// symlink/junction to another file.
+const verifyReportFile = async (bound: BoundReportRoot, fileName: ReportFileName): Promise<VerifiedReportFile | null> => {
+  const lexical = path.join(bound.lexical, fileName);
+  const stat = await lstatOptional(lexical);
+  if (!stat) return null;
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new PreferenceFeedbackError('The requested report file is not a regular file.', 403, 'UNSAFE_REPORT_FILE');
+  }
+  let real: string;
+  try {
+    real = await fs.promises.realpath(lexical);
+  } catch {
+    throw new PreferenceFeedbackError('The requested report file could not be resolved safely.', 403, 'UNSAFE_REPORT_FILE');
+  }
+  if (!samePath(path.dirname(real), bound.real)) {
+    throw new PreferenceFeedbackError('The requested report file resolves outside the job folder.', 403, 'UNSAFE_REPORT_FILE');
+  }
+  return { lexical, real, size: stat.size, updatedAt: stat.mtime.toISOString() };
+};
+
+const baseMeta = (fileName: ReportFileName): ReportFileMeta => ({
+  fileName,
+  exists: false,
+  size: null,
+  updatedAt: null,
+  tooLarge: false,
+  previewTruncated: false,
+  readError: null,
+});
+
+const errorCode = (error: any): string => error?.code || error?.message || 'read failed';
+
+const readReport = async (
+  bound: BoundReportRoot,
+  fileName: ReportFileName,
+  readLargeValidationTail: boolean,
+): Promise<{ meta: ReportFileMeta; text: string | null }> => {
+  const meta = baseMeta(fileName);
+  const verified = await verifyReportFile(bound, fileName);
+  if (!verified) return { meta, text: null };
 
   meta.exists = true;
-  meta.size = stats.size;
-  meta.updatedAt = stats.mtime.toISOString();
-  if (stats.size > MAX_REPORT_BYTES) {
-    meta.tooLarge = true;
-    return { meta, text: null };
-  }
+  meta.size = verified.size;
+  meta.updatedAt = verified.updatedAt;
+  meta.tooLarge = verified.size > MAX_REPORT_BYTES;
+  if (meta.tooLarge && !readLargeValidationTail) return { meta, text: null };
 
+  let handle: fs.promises.FileHandle | null = null;
   try {
-    return { meta, text: await fs.promises.readFile(filePath, 'utf-8') };
+    handle = await fs.promises.open(verified.lexical, 'r');
+    const opened = await handle.stat();
+    if (!opened.isFile()) {
+      throw new PreferenceFeedbackError('The requested report file is not a regular file.', 403, 'UNSAFE_REPORT_FILE');
+    }
+    meta.size = opened.size;
+    meta.updatedAt = opened.mtime.toISOString();
+    meta.tooLarge = opened.size > MAX_REPORT_BYTES;
+
+    if (meta.tooLarge && !readLargeValidationTail) return { meta, text: null };
+
+    if (meta.tooLarge) {
+      const start = Math.max(0, opened.size - MAX_VALIDATION_TAIL_BYTES);
+      const length = opened.size - start;
+      const buffer = Buffer.alloc(length);
+      const { bytesRead } = await handle.read(buffer, 0, length, start);
+      let text = buffer.subarray(0, bytesRead).toString('utf8');
+      // The read starts in the middle of a line; discard that partial record rather than counting it as malformed.
+      const firstNewline = text.indexOf('\n');
+      if (start > 0 && firstNewline >= 0) text = text.slice(firstNewline + 1);
+      else if (start > 0) text = '';
+      meta.previewTruncated = true;
+      return { meta, text };
+    }
+
+    const buffer = Buffer.alloc(opened.size);
+    let offset = 0;
+    while (offset < opened.size) {
+      const { bytesRead } = await handle.read(buffer, offset, opened.size - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    return { meta, text: buffer.subarray(0, offset).toString('utf8') };
   } catch (error: any) {
-    meta.readError = error?.code || error?.message || 'read failed';
+    if (error instanceof PreferenceFeedbackError) throw error;
+    meta.readError = errorCode(error);
     return { meta, text: null };
+  } finally {
+    if (handle) await handle.close().catch(() => undefined);
   }
 };
 
-/** Resolve a job folder under the configured training root, rejecting traversal and absolute job names. */
-export const resolveJobFolder = (trainingRoot: string, jobName: string): string => {
-  const root = path.resolve(trainingRoot);
-  const folder = path.resolve(root, jobName);
-  const relative = path.relative(root, folder);
-  if (relative === '' || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-    throw new Error('Job folder is outside the training root');
-  }
-  return folder;
-};
-
-/** Resolve an existing job folder physically too, so a junction/symlink cannot expose a report outside the root. */
-export const resolveExistingJobFolder = async (trainingRoot: string, jobName: string): Promise<string> => {
-  const lexicalFolder = resolveJobFolder(trainingRoot, jobName);
-  const realRoot = await fs.promises.realpath(path.resolve(trainingRoot));
-  let realFolder: string;
-  try {
-    realFolder = await fs.promises.realpath(lexicalFolder);
-  } catch (error: any) {
-    // A not-yet-created job folder has no reports. Other errors are real read failures.
-    if (error?.code === 'ENOENT') return lexicalFolder;
-    throw error;
-  }
-  const relative = path.relative(realRoot, realFolder);
-  if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
-    throw new Error('Job folder is outside the training root');
-  }
-  return realFolder;
-};
-
-export const readJobReports = async (jobFolder: string): Promise<JobReports> => {
-  const validationFile = await readKnownFile(path.join(jobFolder, VALIDATION_FILE));
-  const edm2File = await readKnownFile(path.join(jobFolder, EDM2_FILE));
+/** Resolve the persisted job binding, then read only the two fixed report names from that verified folder. */
+export const readJobReports = async (job: ReportJob, trainingRoot: string): Promise<JobReports> => {
+  const bound = await resolveBoundJobRoot(job, trainingRoot);
+  const validationFile = await readReport(bound, VALIDATION_FILE, true);
+  const edm2File = await readReport(bound, EDM2_FILE, false);
 
   const validation: ValidationReport = {
     ...validationFile.meta,
@@ -354,4 +418,49 @@ export const readJobReports = async (jobFolder: string): Promise<JobReports> => 
     ...(edm2File.text === null ? {} : summarizeEdm2Csv(edm2File.text)),
   };
   return { validation, edm2 };
+};
+
+export type JobReportDownload = {
+  stream: fs.ReadStream;
+  size: number;
+  fileName: ReportFileName;
+  contentType: string;
+};
+
+/** Open one fixed report name from the verified job folder and return a bounded-memory file stream. */
+export const readJobReportDownload = async (
+  job: ReportJob,
+  trainingRoot: string,
+  reportName: string,
+): Promise<JobReportDownload> => {
+  if (!isReportFileName(reportName)) {
+    throw new PreferenceFeedbackError('Invalid report file name.', 400, 'INVALID_REPORT_FILE');
+  }
+  const bound = await resolveBoundJobRoot(job, trainingRoot);
+  const verified = await verifyReportFile(bound, reportName);
+  if (!verified) {
+    throw new PreferenceFeedbackError('Report file not found.', 404, 'REPORT_NOT_FOUND');
+  }
+
+  let handle: fs.promises.FileHandle;
+  try {
+    handle = await fs.promises.open(verified.lexical, 'r');
+  } catch {
+    throw new PreferenceFeedbackError('The requested report file could not be opened.', 500, 'REPORT_UNREADABLE');
+  }
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile()) {
+      throw new PreferenceFeedbackError('The requested report file is not a regular file.', 403, 'UNSAFE_REPORT_FILE');
+    }
+    return {
+      stream: handle.createReadStream(),
+      size: opened.size,
+      fileName: reportName,
+      contentType: REPORT_CONTENT_TYPES[reportName],
+    };
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw error;
+  }
 };

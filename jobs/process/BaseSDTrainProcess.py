@@ -3402,7 +3402,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # RAWR samplers restore their own cursor; never skip those twice.
                 self._data_epoch, ordinary_skip = feedback.saved_position
                 recorded = getattr(self, '_rawr_stochastic', None)
-                feedback_recorded = recorded is not None and not recorded.reason
+                feedback_recorded = (recorded is not None and not recorded.reason
+                                     and bool(rawr_stochastic_saved and rawr_stochastic_saved.get('supported')))
                 skip = 0 if feedback_recorded else ordinary_skip
             if curriculum_cursor is not None:
                 self._data_epoch, skip = curriculum_cursor.position

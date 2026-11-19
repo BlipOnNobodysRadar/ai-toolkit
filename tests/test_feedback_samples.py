@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 from PIL import Image
 from safetensors.torch import load_file
@@ -31,6 +32,9 @@ class FakeSD:
         self.calls = []
         self.fail_on_call = fail_on_call
         self.vae = None
+        self.torch_dtype = torch.float32
+        self.device_state = None
+        self.preset = "train"
 
     def _color(self, seed):
         return (seed % 256, (seed * 3) % 256, (seed * 7) % 256)
@@ -51,14 +55,19 @@ class FakeSD:
             saved.append(path)
         return saved
 
+    def save_device_state(self):
+        self.device_state = self.preset
+
+    def set_device_state_preset(self, preset):
+        self.preset = preset
+
+    def restore_device_state(self):
+        self.preset = self.device_state
+
     def encode_images(self, images):
-        assert len(images) == 2
-        assert all(tuple(image.shape) == (3, 64, 64) for image in images)
-        means = torch.stack([image.mean() for image in images])
-        latents = torch.zeros((2, 4, 2, 2), dtype=torch.float32)
-        for i in range(2):
-            latents[i].fill_(means[i].item())
-        return latents
+        assert self.preset == "cache_latents"
+        assert len(images) == 1 and tuple(images[0].shape) == (3, 64, 64)
+        return torch.full((1, 4, 2, 2), images[0].mean().item())
 
 
 def _trainer(tmp_path, cache, *, fail_on_call=None, feedback=None):
@@ -91,7 +100,7 @@ def _trainer(tmp_path, cache, *, fail_on_call=None, feedback=None):
             dpo_feedback={"every": 10, "start_after": 0} if feedback is None else feedback,
             gradient_accumulation_steps=1,
         ),
-        model_config=SimpleNamespace(arch="moss_image", model_kwargs={}),
+        model_config=SimpleNamespace(arch="moss_image", name_or_path="test/moss", model_kwargs={}),
         post_process_generate_image_config_list=lambda configs: configs,
         _checkpoint_completed_step=10,
         _feedback_schedule=SimpleNamespace(updates=7),
@@ -312,3 +321,16 @@ def test_second_sample_uses_the_same_ema_view_and_restores_training_mode(tmp_pat
     assert ema.seen == [False, False]
     assert ema._is_train_mode is True
     assert len([p for p in (Path(trainer.save_root) / "preferences").iterdir() if p.is_dir()]) == 2
+
+
+def test_restore_failure_stops_training_instead_of_skipping_feedback(tmp_path, monkeypatch):
+    trainer = _trainer(tmp_path, [_embedding(1), _embedding(2)])
+    monkeypatch.setattr(feedback_training, "feedback_reference_id", lambda trainer: REFERENCE_ID)
+
+    def failed_restore():
+        raise RuntimeError("failed to restore training placement")
+
+    trainer.sd.restore_device_state = failed_restore
+    with pytest.raises(RuntimeError, match="failed to restore training placement"):
+        BaseSDTrainProcess.sample(trainer, 10)
+    assert not list((Path(trainer.save_root) / "preferences").glob("[0-9a-f]*"))

@@ -72,6 +72,7 @@ b.png
 embeddings.safetensors
 latents.safetensors
 vote.json          # after voting
+.decision/vote.json # durable decision used to recover an interrupted receipt write
 ```
 
 `pair.json` contains exactly the metadata needed to interpret the displayed pair:

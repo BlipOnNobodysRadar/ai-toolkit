@@ -287,7 +287,170 @@ const resolvePairDirectory = async (bound: BoundRoot, preferenceID: string): Pro
   return { lexical: pairLexical, real: pairReal };
 };
 
-const readPair = async (bound: BoundRoot, preferenceID: string, pair: { lexical: string; real: string }) => {
+type PairPath = { lexical: string; real: string };
+
+const VOTE_FILENAME = 'vote.json';
+const DECISION_DIRNAME = '.decision';
+
+const serializeVote = (vote: PreferenceVote): Buffer => Buffer.from(JSON.stringify(vote, null, 2) + '\n', 'utf8');
+
+// File data is fsync'd before publication. Directory fsync is best-effort because Windows does not expose directories
+// as openable files, while POSIX uses it to make the rename itself durable.
+const fsyncDirectory = async (dir: string): Promise<void> => {
+  let handle: fs.promises.FileHandle | null = null;
+  try {
+    handle = await fs.promises.open(dir, 'r');
+    await handle.sync();
+  } catch {
+    // Directory fsync is not portable; the complete vote file was already synced.
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
+};
+
+const readTopLevelVote = async (
+  pair: PairPath,
+  preferenceID: string,
+): Promise<{ present: boolean; vote: PreferenceVote | null }> => {
+  const votePath = path.join(pair.lexical, VOTE_FILENAME);
+  const stat = await lstatOptional(votePath);
+  if (!stat) return { present: false, vote: null };
+  try {
+    return {
+      present: true,
+      vote: parseVote(await readJsonFile(votePath, pair.real, MAX_VOTE_JSON_BYTES, 'INVALID_VOTE'), preferenceID),
+    };
+  } catch {
+    return { present: true, vote: null };
+  }
+};
+
+// The fixed .decision directory is the immutable source of truth. It is only ever created by renaming a complete staged
+// directory, and a non-empty destination directory cannot be replaced by a concurrent rename on POSIX or Windows.
+const readDecisionVote = async (
+  pair: PairPath,
+  preferenceID: string,
+): Promise<{ present: boolean; vote: PreferenceVote | null }> => {
+  const decisionPath = path.join(pair.lexical, DECISION_DIRNAME);
+  const stat = await lstatOptional(decisionPath);
+  if (!stat) return { present: false, vote: null };
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new PreferenceFeedbackError('The committed vote record is not a regular directory.', 403, 'INVALID_VOTE');
+  }
+  const decisionReal = await fs.promises.realpath(decisionPath).catch(() => {
+    throw new PreferenceFeedbackError('The committed vote record could not be resolved safely.', 403, 'INVALID_VOTE');
+  });
+  if (!isContained(pair.real, decisionReal)) {
+    throw new PreferenceFeedbackError('The committed vote record resolves outside the preference pair.', 403, 'INVALID_VOTE');
+  }
+
+  const votePath = path.join(decisionPath, VOTE_FILENAME);
+  let raw: unknown;
+  try {
+    raw = await readJsonFile(votePath, pair.real, MAX_VOTE_JSON_BYTES, 'INVALID_VOTE');
+  } catch (error) {
+    if (error instanceof PreferenceFeedbackError && error.status === 404) return { present: true, vote: null };
+    throw error;
+  }
+  return { present: true, vote: parseVote(raw, preferenceID) };
+};
+
+const projectionConflict = (): PreferenceFeedbackError =>
+  new PreferenceFeedbackError('This preference pair already has a different immutable vote.', 409, 'VOTE_CONFLICT');
+
+const projectionInvalid = (): PreferenceFeedbackError =>
+  new PreferenceFeedbackError('An existing vote record is invalid; refusing to overwrite it.', 409, 'VOTE_CONFLICT');
+
+// Project the committed decision into the legacy-compatible top-level vote.json receipt. A complete temp file is
+// fsync'd and atomically renamed. Any existing receipt is validated first and is never replaced by a conflicting choice.
+const projectVote = async (pair: PairPath, preferenceID: string, vote: PreferenceVote): Promise<void> => {
+  const votePath = path.join(pair.lexical, VOTE_FILENAME);
+
+  const existingStat = await lstatOptional(votePath);
+  if (existingStat) {
+    let existing: PreferenceVote | null = null;
+    try {
+      existing = parseVote(await readJsonFile(votePath, pair.real, MAX_VOTE_JSON_BYTES, 'INVALID_VOTE'), preferenceID);
+    } catch {
+      existing = null;
+    }
+    if (!existing) throw projectionInvalid();
+    if (existing.choice !== vote.choice) throw projectionConflict();
+    return;
+  }
+
+  const temp = path.join(pair.lexical, `.vote.project.${process.pid}.${randomUUID()}.tmp`);
+  let handle: fs.promises.FileHandle | null = null;
+  try {
+    handle = await fs.promises.open(temp, 'wx', 0o600);
+    await handle.writeFile(serializeVote(vote));
+    await handle.sync();
+    await handle.close();
+    handle = null;
+
+    // Respect a legacy receipt that appeared while this projection was being staged.
+    const appeared = await lstatOptional(votePath);
+    if (appeared) {
+      let existing: PreferenceVote | null = null;
+      try {
+        existing = parseVote(await readJsonFile(votePath, pair.real, MAX_VOTE_JSON_BYTES, 'INVALID_VOTE'), preferenceID);
+      } catch {
+        existing = null;
+      }
+      if (!existing) throw projectionInvalid();
+      if (existing.choice !== vote.choice) throw projectionConflict();
+      return;
+    }
+
+    await fs.promises.rename(temp, votePath);
+    await fsyncDirectory(pair.lexical);
+  } catch (error) {
+    if (error instanceof PreferenceFeedbackError) throw error;
+    throw new PreferenceFeedbackError('The vote receipt could not be projected safely.', 500, 'VOTE_WRITE_FAILED');
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+    await fs.promises.unlink(temp).catch(() => {});
+  }
+};
+
+const readVoteForPair = async (
+  pair: PairPath,
+  preferenceID: string,
+): Promise<{ vote: PreferenceVote | null; invalid: boolean }> => {
+  const votePath = path.join(pair.lexical, VOTE_FILENAME);
+  const voteStat = await lstatOptional(votePath);
+  if (voteStat) {
+    try {
+      const vote = parseVote(
+        await readJsonFile(votePath, pair.real, MAX_VOTE_JSON_BYTES, 'INVALID_VOTE'),
+        preferenceID,
+      );
+      return { vote, invalid: vote === null };
+    } catch {
+      return { vote: null, invalid: true };
+    }
+  }
+
+  let decision: { present: boolean; vote: PreferenceVote | null };
+  try {
+    decision = await readDecisionVote(pair, preferenceID);
+  } catch {
+    return { vote: null, invalid: true };
+  }
+  if (!decision.present) return { vote: null, invalid: false };
+  if (!decision.vote) return { vote: null, invalid: true };
+
+  // A crash can leave the committed decision without its top-level receipt. Serve the committed choice even when the
+  // receipt cannot currently be healed (for example on a temporarily read-only checkout).
+  try {
+    await projectVote(pair, preferenceID, decision.vote);
+  } catch {
+    // The decision remains authoritative; the trainer can ignore the pair until the receipt is restored.
+  }
+  return { vote: decision.vote, invalid: false };
+};
+
+const readPair = async (bound: BoundRoot, preferenceID: string, pair: PairPath) => {
   const metadata = parsePairMetadata(
     await readJsonFile(path.join(pair.lexical, 'pair.json'), pair.real, MAX_PAIR_JSON_BYTES, 'INVALID_PAIR'),
     preferenceID,
@@ -296,18 +459,7 @@ const readPair = async (bound: BoundRoot, preferenceID: string, pair: { lexical:
   await assertRegularFile(path.join(pair.lexical, 'a.png'), pair.real, 'INVALID_PAIR_IMAGE');
   await assertRegularFile(path.join(pair.lexical, 'b.png'), pair.real, 'INVALID_PAIR_IMAGE');
 
-  let vote: PreferenceVote | null = null;
-  let voteInvalid = false;
-  const votePath = path.join(pair.lexical, 'vote.json');
-  const voteStat = await lstatOptional(votePath);
-  if (voteStat) {
-    try {
-      vote = parseVote(await readJsonFile(votePath, pair.real, MAX_VOTE_JSON_BYTES, 'INVALID_VOTE'), preferenceID);
-      if (!vote) voteInvalid = true;
-    } catch {
-      voteInvalid = true;
-    }
-  }
+  const { vote, invalid: voteInvalid } = await readVoteForPair(pair, preferenceID);
   const status: PreferenceStatus = voteInvalid ? 'invalid' : vote === null ? 'pending' : vote.choice === 'skip' ? 'skipped' : 'rated';
   return { metadata, vote, status };
 };
@@ -372,13 +524,6 @@ export const readPreferenceImage = async (
   return { bytes, contentType: 'image/png' };
 };
 
-const readExistingVote = async (pair: { lexical: string; real: string }, preferenceID: string): Promise<PreferenceVote | null> => {
-  const votePath = path.join(pair.lexical, 'vote.json');
-  const stat = await lstatOptional(votePath);
-  if (!stat) return null;
-  return parseVote(await readJsonFile(votePath, pair.real, MAX_VOTE_JSON_BYTES, 'INVALID_VOTE'), preferenceID);
-};
-
 export const castPreferenceVote = async (
   job: BoundJob,
   trainingRoot: string,
@@ -392,50 +537,90 @@ export const castPreferenceVote = async (
   const pair = await resolvePairDirectory(bound, preferenceID);
   await readPair(bound, preferenceID, pair);
 
-  const votePath = path.join(pair.lexical, 'vote.json');
+  // Legacy vote.json wins over any new decision. This keeps pre-existing clients and files authoritative.
+  const topLevel = await readTopLevelVote(pair, preferenceID);
+  if (topLevel.present) {
+    if (!topLevel.vote) throw projectionInvalid();
+    if (topLevel.vote.choice === choice) return { vote: topLevel.vote, created: false };
+    throw projectionConflict();
+  }
+
+  // Recover a winner whose top-level projection was interrupted. Validate it before writing anything new.
+  let interrupted: { present: boolean; vote: PreferenceVote | null };
+  try {
+    interrupted = await readDecisionVote(pair, preferenceID);
+  } catch {
+    throw projectionInvalid();
+  }
+  if (interrupted.present) {
+    if (!interrupted.vote) throw projectionInvalid();
+    await projectVote(pair, preferenceID, interrupted.vote);
+    if (interrupted.vote.choice === choice) return { vote: interrupted.vote, created: false };
+    throw projectionConflict();
+  }
+
   const vote: PreferenceVote = {
     version: 1,
     id: preferenceID,
     choice,
     voted_at: new Date().toISOString(),
   };
-  const bytes = Buffer.from(JSON.stringify(vote, null, 2) + '\n', 'utf8');
-  const temp = path.join(pair.lexical, `.vote.${process.pid}.${randomUUID()}.tmp`);
+  const decisionPath = path.join(pair.lexical, DECISION_DIRNAME);
+  const stage = path.join(pair.lexical, `.vote.stage.${process.pid}.${randomUUID()}`);
   let handle: fs.promises.FileHandle | null = null;
-  let linked = false;
+
   try {
-    handle = await fs.promises.open(temp, 'wx', 0o600);
-    await handle.writeFile(bytes);
+    // Stage a complete directory. Only the atomic directory rename below can make it visible as a decision.
+    await fs.promises.mkdir(stage, { mode: 0o700 });
+    handle = await fs.promises.open(path.join(stage, VOTE_FILENAME), 'wx', 0o600);
+    await handle.writeFile(serializeVote(vote));
     await handle.sync();
     await handle.close();
     handle = null;
+    await fsyncDirectory(stage);
+
     try {
-      // Hard-link publication is atomic and cannot replace an existing vote.json. A same-choice retry is resolved
-      // below from the immutable winner; a different choice is a real conflict and stays 409 forever.
-      await fs.promises.link(temp, votePath);
-      linked = true;
-    } catch (error: any) {
-      if (error?.code !== 'EEXIST') throw error;
+      // On POSIX and Windows a non-empty .decision directory cannot be replaced by this rename. The loser therefore
+      // validates and adopts the winner rather than overwriting it.
+      await fs.promises.rename(stage, decisionPath);
+      await fsyncDirectory(pair.lexical);
+    } catch (renameError) {
+      let winner: { present: boolean; vote: PreferenceVote | null } | null = null;
+      try {
+        winner = await readDecisionVote(pair, preferenceID);
+      } catch {
+        winner = null;
+      }
+      if (!winner?.present) {
+        throw new PreferenceFeedbackError('The vote could not be published safely.', 500, 'VOTE_WRITE_FAILED');
+      }
+      if (!winner.vote) throw projectionInvalid();
+      try {
+        await projectVote(pair, preferenceID, winner.vote);
+      } catch (projectionError) {
+        if (projectionError instanceof PreferenceFeedbackError && projectionError.status === 409) throw projectionError;
+        // The committed decision is still valid; its top-level receipt can be healed by a later read or retry.
+      }
+      if (winner.vote.choice === choice) return { vote: winner.vote, created: false };
+      throw projectionConflict();
     }
+
+    try {
+      await projectVote(pair, preferenceID, vote);
+    } catch (projectionError) {
+      if (projectionError instanceof PreferenceFeedbackError && projectionError.status === 409) throw projectionError;
+      throw new PreferenceFeedbackError(
+        'The vote was committed but its top-level receipt could not be projected.',
+        500,
+        'VOTE_WRITE_FAILED',
+      );
+    }
+    return { vote, created: true };
   } catch (error) {
     if (error instanceof PreferenceFeedbackError) throw error;
     throw new PreferenceFeedbackError('The vote could not be published safely.', 500, 'VOTE_WRITE_FAILED');
   } finally {
     if (handle) await handle.close().catch(() => {});
-    await fs.promises.unlink(temp).catch(() => {});
+    await fs.promises.rm(stage, { recursive: true, force: true }).catch(() => {});
   }
-
-  if (linked) return { vote, created: true };
-
-  let existing: PreferenceVote | null = null;
-  try {
-    existing = await readExistingVote(pair, preferenceID);
-  } catch {
-    existing = null;
-  }
-  if (!existing) {
-    throw new PreferenceFeedbackError('An existing vote record is invalid; refusing to overwrite it.', 409, 'VOTE_CONFLICT');
-  }
-  if (existing.choice === choice) return { vote: existing, created: false };
-  throw new PreferenceFeedbackError('This preference pair already has a different immutable vote.', 409, 'VOTE_CONFLICT');
 };

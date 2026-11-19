@@ -33,6 +33,7 @@ from safetensors.torch import save_file
 
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 from toolkit.print import print_acc
+from toolkit import sampling_state
 
 PAIR_VERSION = 1
 PAIR_FILES = (
@@ -121,54 +122,16 @@ def _png_tensor(path: str) -> torch.Tensor:
     return tensor / 127.5 - 1.0
 
 
-def _latents_for_pair(sd: Any, a_path: str, b_path: str) -> tuple[torch.Tensor, torch.Tensor]:
-    images = [_png_tensor(a_path), _png_tensor(b_path)]
-    vae = getattr(sd, "vae", None)
-    entry_device = None
-    entry_training = None
-    if vae is not None:
-        entry_training = bool(getattr(vae, "training", False))
-        try:
-            entry_device = next(vae.parameters()).device
-        except (StopIteration, AttributeError, TypeError):
-            entry_device = getattr(vae, "device", None)
-    try:
-        with torch.no_grad():
-            encoded = sd.encode_images(images)
-        if hasattr(encoded, "tensor"):
-            encoded = encoded.tensor
-        if not torch.is_tensor(encoded):
-            raise TypeError("VAE encode did not return a tensor")
-        if encoded.ndim != 4 or encoded.shape[0] != 2:
-            raise ValueError(f"VAE encode returned {tuple(encoded.shape)}, expected a batch of two latents")
-        # The dataset latent cache stores the VAE output and the loader hands
-        # it to training in the model dtype.  Do the same conversion here so
-        # the pair payload is the canonical MOSS training x0, not merely the
-        # VAE's working dtype.
-        latent_dtype = getattr(sd, "torch_dtype", None)
-        a_latent = encoded[0].unsqueeze(0).detach().to("cpu").contiguous()
-        b_latent = encoded[1].unsqueeze(0).detach().to("cpu").contiguous()
-        if latent_dtype is not None:
-            a_latent = a_latent.to(dtype=latent_dtype).contiguous()
-            b_latent = b_latent.to(dtype=latent_dtype).contiguous()
-        if a_latent.ndim != 4 or a_latent.shape[0] != 1 or b_latent.shape != a_latent.shape:
-            raise ValueError("VAE latents do not have matching [1,C,H,W] shapes")
-        if not torch.isfinite(a_latent).all() or not torch.isfinite(b_latent).all():
-            raise FloatingPointError("VAE produced non-finite training latents")
-    finally:
-        # MOSS's encode_images opportunistically moves a CPU VAE to its encode
-        # device.  Put the shared trainer state back even when encoding failed;
-        # capture must never leave an extra model resident on the GPU.
-        if vae is not None and entry_device is not None:
-            try:
-                current_device = next(vae.parameters()).device
-            except (StopIteration, AttributeError, TypeError):
-                current_device = getattr(vae, "device", None)
-            if current_device != entry_device:
-                vae.to(entry_device)
-        if vae is not None and entry_training is not None:
-            vae.train(entry_training)
-    return a_latent, b_latent
+@torch.no_grad()
+def _encode_archived_image(sd, path):
+    # Use the same one-image VAE working set as normal dataset caching.
+    encoded = sd.encode_images([_png_tensor(path)])
+    if not torch.is_tensor(encoded) or encoded.ndim != 4 or encoded.shape[0] != 1:
+        raise ValueError("MOSS VAE must return a single [1,C,H,W] latent")
+    latent = encoded.detach().to(device="cpu", dtype=sd.torch_dtype).contiguous()
+    if not torch.isfinite(latent).all():
+        raise FloatingPointError("MOSS VAE produced a non-finite feedback latent")
+    return latent
 
 
 def _reference_id(trainer: Any) -> str:
@@ -222,7 +185,10 @@ def _publish_pair(
     embedding_path = os.path.join(pair_stage, "embeddings.safetensors")
     embedding.save(embedding_path)
 
-    a_latent, b_latent = _latents_for_pair(sd, a_path, b_path)
+    a_latent = _encode_archived_image(sd, a_path)
+    b_latent = _encode_archived_image(sd, b_path)
+    if a_latent.shape != b_latent.shape:
+        raise ValueError("MOSS feedback pair has mismatched latent shapes")
     latent_path = os.path.join(pair_stage, "latents.safetensors")
     save_file({"a": a_latent, "b": b_latent}, latent_path)
 
@@ -317,39 +283,48 @@ def capture_feedback_samples(
         reference_id = _reference_id(trainer)
         created_at = _utc_now()
         staged_pairs: list[tuple[str, str]] = []
-        for index, (first_config, second_config) in enumerate(zip(image_configs, second_configs)):
-            pair_id = uuid.uuid4().hex
-            if _ID_RE.fullmatch(pair_id) is None:
-                raise RuntimeError("uuid4 produced an unexpected id")
-            embedding = second_config.feedback_conditioning
-            if not isinstance(embedding, AdvancedPromptEmbeds):
-                raise RuntimeError(f"missing MOSS sample conditioning for pair {index}")
-            prompt = getattr(first_config, "prompt", None)
-            if prompt is None:
-                prompt = sample_config.prompts[index]
-            stage = _publish_pair(
-                parent,
-                pair_id,
-                step=completed_step,
-                provenance={
-                    "optimizer_updates": schedule.updates,
-                    "ema": trainer.ema is not None,
-                    "network_multiplier": first_config.network_multiplier,
-                    "sampler": sample_config.sampler,
-                    "sampling_steps": first_config.num_inference_steps,
-                    "guidance_scale": first_config.guidance_scale,
-                    "negative_prompt": first_config.negative_prompt,
-                },
-                prompt=prompt,
-                seeds=(int(first_config.seed), int(second_seeds[index])),
-                reference_id=reference_id,
-                created_at=created_at,
-                a_source=first_sources[index],
-                b_source=second_paths[index],
-                embedding=embedding,
-                sd=sd,
-            )
-            staged_pairs.append((stage, os.path.join(preferences_root, pair_id)))
+        # The second preview has restored the ordinary training placement.
+        # Borrow VAE-only placement once for every pair from this sample round.
+        saved = sampling_state.enter_device_preset(sd, "cache_latents")
+        try:
+            for index, (first_config, second_config) in enumerate(zip(image_configs, second_configs)):
+                pair_id = uuid.uuid4().hex
+                if _ID_RE.fullmatch(pair_id) is None:
+                    raise RuntimeError("uuid4 produced an unexpected id")
+                embedding = second_config.feedback_conditioning
+                if not isinstance(embedding, AdvancedPromptEmbeds):
+                    raise RuntimeError(f"missing MOSS sample conditioning for pair {index}")
+                prompt = getattr(first_config, "prompt", None)
+                if prompt is None:
+                    prompt = sample_config.prompts[index]
+                stage = _publish_pair(
+                    parent,
+                    pair_id,
+                    step=completed_step,
+                    provenance={
+                        "optimizer_updates": schedule.updates,
+                        "ema": trainer.ema is not None,
+                        "network_multiplier": first_config.network_multiplier,
+                        "sampler": sample_config.sampler,
+                        "sampling_steps": first_config.num_inference_steps,
+                        "guidance_scale": first_config.guidance_scale,
+                        "negative_prompt": first_config.negative_prompt,
+                    },
+                    prompt=prompt,
+                    seeds=(int(first_config.seed), int(second_seeds[index])),
+                    reference_id=reference_id,
+                    created_at=created_at,
+                    a_source=first_sources[index],
+                    b_source=second_paths[index],
+                    embedding=embedding,
+                    sd=sd,
+                )
+                staged_pairs.append((stage, os.path.join(preferences_root, pair_id)))
+        except BaseException as primary:
+            sampling_state.settle([lambda: sampling_state.leave_device_preset(sd, saved)], primary)
+            raise
+        else:
+            sampling_state.settle([lambda: sampling_state.leave_device_preset(sd, saved)])
 
         # Each rename commits one complete pair. A vote can arrive immediately
         # afterwards; never roll a published pair back if a later rename fails.
@@ -358,6 +333,8 @@ def capture_feedback_samples(
             published.append(final_path)
         return published
     except Exception as exc:
+        if getattr(exc, "aitk_restore_failed", False):
+            raise
         print_acc(f"Feedback sample capture skipped: {type(exc).__name__}: {exc}")
         return published
     finally:

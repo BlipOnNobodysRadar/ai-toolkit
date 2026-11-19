@@ -89,6 +89,23 @@ const makeFeedbackJob = async (name, { enabled = true, runDir = null, configOver
   return job;
 };
 
+const voteRecord = (pairID, choice, votedAt = '2026-11-18T13:00:00.000Z') => ({
+  version: 1,
+  id: pairID,
+  choice,
+  voted_at: votedAt,
+});
+
+const writeVote = (pairDir, vote) => {
+  fs.writeFileSync(path.join(pairDir, 'vote.json'), JSON.stringify(vote, null, 2) + '\n');
+};
+
+const writeDecision = (pairDir, vote) => {
+  const decisionDir = path.join(pairDir, '.decision');
+  fs.mkdirSync(decisionDir, { recursive: true });
+  fs.writeFileSync(path.join(decisionDir, 'vote.json'), JSON.stringify(vote, null, 2) + '\n');
+};
+
 const writePair = (jobFolder, preferenceID, overrides = {}, bytes = null) => {
   const pairDir = path.join(jobFolder, 'preferences', preferenceID);
   fs.mkdirSync(pairDir, { recursive: true });
@@ -297,6 +314,161 @@ test('existing bearer middleware protects preference reads and votes', () => {
     if (old === undefined) delete process.env.AI_TOOLKIT_AUTH;
     else process.env.AI_TOOLKIT_AUTH = old;
   }
+});
+
+
+test('portable decisions work without hard links and persist genuine A and B choices', async () => {
+  const job = await makeFeedbackJob('portable-ab');
+  const pairA = randomUUID().replaceAll('-', '');
+  const pairB = randomUUID().replaceAll('-', '');
+  const dirA = writePair(job.run_dir, pairA);
+  const dirB = writePair(job.run_dir, pairB);
+
+  const originalLink = fs.promises.link;
+  fs.promises.link = async () => {
+    throw Object.assign(new Error('hard links are unavailable in this test'), { code: 'ENOSYS' });
+  };
+  let resultA;
+  let resultB;
+  try {
+    [resultA, resultB] = await Promise.all([
+      callVote(job.id, pairA, { choice: 'a' }),
+      callVote(job.id, pairB, { choice: 'b' }),
+    ]);
+  } finally {
+    fs.promises.link = originalLink;
+  }
+
+  assert.equal(resultA.status, 200, JSON.stringify(await bodyOf(resultA)));
+  assert.equal(resultB.status, 200, JSON.stringify(await bodyOf(resultB)));
+  const bodyA = await bodyOf(resultA);
+  const bodyB = await bodyOf(resultB);
+  assert.equal(bodyA.created, true);
+  assert.equal(bodyB.created, true);
+  assert.equal(bodyA.vote.choice, 'a');
+  assert.equal(bodyB.vote.choice, 'b');
+
+  for (const [pairDir, pairID, expectedChoice, body] of [
+    [dirA, pairA, 'a', bodyA],
+    [dirB, pairB, 'b', bodyB],
+  ]) {
+    const topText = fs.readFileSync(path.join(pairDir, 'vote.json'), 'utf8');
+    const decisionText = fs.readFileSync(path.join(pairDir, '.decision', 'vote.json'), 'utf8');
+    const top = JSON.parse(topText);
+    assert.equal(topText, decisionText, 'the public receipt is the committed decision content');
+    assert.deepEqual(Object.keys(top).sort(), ['choice', 'id', 'version', 'voted_at']);
+    assert.equal(top.version, 1);
+    assert.equal(top.id, pairID);
+    assert.equal(top.choice, expectedChoice);
+    assert.match(top.voted_at, /^\d{4}-\d{2}-\d{2}T.*Z$/);
+    assert.deepEqual(body.vote, top);
+    assert.equal(fs.statSync(path.join(pairDir, 'vote.json')).nlink, 1, 'top-level receipt is a regular independent file');
+    assert.equal(fs.statSync(path.join(pairDir, '.decision', 'vote.json')).nlink, 1, 'decision file is a regular independent file');
+  }
+});
+
+test('legacy top-level vote.json is authoritative before any portable decision exists', async () => {
+  const job = await makeFeedbackJob('legacy-top-level');
+  const pairID = randomUUID().replaceAll('-', '');
+  const pairDir = writePair(job.run_dir, pairID);
+  const legacy = voteRecord(pairID, 'a', '2026-11-18T12:00:00.000Z');
+  writeVote(pairDir, legacy);
+  const legacyText = fs.readFileSync(path.join(pairDir, 'vote.json'), 'utf8');
+
+  const same = await callVote(job.id, pairID, { choice: 'a' });
+  assert.equal(same.status, 200);
+  const sameBody = await bodyOf(same);
+  assert.equal(sameBody.created, false);
+  assert.deepEqual(sameBody.vote, legacy);
+  assert.equal(fs.existsSync(path.join(pairDir, '.decision')), false, 'legacy success does not create a second decision');
+
+  const conflict = await callVote(job.id, pairID, { choice: 'b' });
+  assert.equal(conflict.status, 409);
+  assert.match((await bodyOf(conflict)).error, /different immutable vote/);
+  assert.equal(fs.readFileSync(path.join(pairDir, 'vote.json'), 'utf8'), legacyText);
+  assert.equal(fs.existsSync(path.join(pairDir, '.decision')), false, 'legacy conflict does not mutate the pair');
+});
+
+test('concurrent same-choice votes are idempotent with one complete winner', async () => {
+  const job = await makeFeedbackJob('vote-race-same');
+  const pairID = randomUUID().replaceAll('-', '');
+  const pairDir = writePair(job.run_dir, pairID);
+
+  const responses = await Promise.all(
+    Array.from({ length: 6 }, () => callVote(job.id, pairID, { choice: 'a' })),
+  );
+  assert.ok(responses.every(response => response.status === 200));
+  const bodies = await Promise.all(responses.map(bodyOf));
+  const winners = bodies.filter(body => body.created);
+  assert.equal(winners.length, 1, 'exactly one publisher created the immutable decision');
+  assert.ok(bodies.every(body => body.vote.choice === 'a'));
+  assert.ok(bodies.every(body => JSON.stringify(body.vote) === JSON.stringify(winners[0].vote)));
+
+  const topText = fs.readFileSync(path.join(pairDir, 'vote.json'), 'utf8');
+  const decisionText = fs.readFileSync(path.join(pairDir, '.decision', 'vote.json'), 'utf8');
+  assert.equal(topText, decisionText);
+  assert.deepEqual(JSON.parse(topText), winners[0].vote);
+  assert.deepEqual(fs.readdirSync(pairDir).filter(name => name.startsWith('.vote.')), []);
+});
+
+test('interrupted projection heals from .decision and retries recover the committed winner', async () => {
+  const job = await makeFeedbackJob('interrupted-projection');
+  const pairID = randomUUID().replaceAll('-', '');
+  const pairDir = writePair(job.run_dir, pairID);
+  const committed = voteRecord(pairID, 'b', '2026-11-18T14:00:00.000Z');
+  writeDecision(pairDir, committed);
+  const decisionText = fs.readFileSync(path.join(pairDir, '.decision', 'vote.json'), 'utf8');
+
+  const listed = await bodyOf(await callList(job.id));
+  assert.equal(listed.pairs[0].status, 'rated');
+  assert.deepEqual(listed.pairs[0].vote, committed);
+  assert.deepEqual(listed.counts, { pending: 0, rated: 1, skipped: 0, invalid: 0 });
+  assert.equal(fs.readFileSync(path.join(pairDir, 'vote.json'), 'utf8'), decisionText, 'read healed the receipt');
+
+  fs.unlinkSync(path.join(pairDir, 'vote.json'));
+  const same = await callVote(job.id, pairID, { choice: 'b' });
+  assert.equal(same.status, 200);
+  const sameBody = await bodyOf(same);
+  assert.equal(sameBody.created, false);
+  assert.deepEqual(sameBody.vote, committed);
+  assert.equal(fs.readFileSync(path.join(pairDir, 'vote.json'), 'utf8'), decisionText);
+
+  fs.unlinkSync(path.join(pairDir, 'vote.json'));
+  const conflict = await callVote(job.id, pairID, { choice: 'a' });
+  assert.equal(conflict.status, 409);
+  assert.match((await bodyOf(conflict)).error, /different immutable vote/);
+  assert.equal(fs.readFileSync(path.join(pairDir, 'vote.json'), 'utf8'), decisionText);
+  assert.equal(fs.readFileSync(path.join(pairDir, '.decision', 'vote.json'), 'utf8'), decisionText, 'the real decision was never reversed');
+  assert.deepEqual(fs.readdirSync(pairDir).filter(name => name.startsWith('.vote.')), []);
+});
+
+test('linked .decision directories are rejected without reading outside or writing a receipt', async () => {
+  const outside = fs.mkdtempSync(path.join(SCRATCH, 'preference-decision-outside-'));
+  roots.push(outside);
+  const job = await makeFeedbackJob('linked-decision');
+  const pairID = randomUUID().replaceAll('-', '');
+  const pairDir = writePair(job.run_dir, pairID);
+  const outsideDecision = path.join(outside, 'decision');
+  fs.mkdirSync(outsideDecision, { recursive: true });
+  fs.writeFileSync(path.join(outsideDecision, 'vote.json'), JSON.stringify(voteRecord(pairID, 'a'), null, 2) + '\n');
+
+  let linked = false;
+  try {
+    fs.symlinkSync(outsideDecision, path.join(pairDir, '.decision'), 'junction');
+    linked = true;
+  } catch (error) {
+    if (error?.code !== 'EPERM' && error?.code !== 'EACCES') throw error;
+  }
+  if (!linked) return;
+
+  const listed = await bodyOf(await callList(job.id));
+  assert.equal(listed.pairs[0].status, 'invalid');
+  assert.deepEqual(listed.counts, { pending: 0, rated: 0, skipped: 0, invalid: 1 });
+  assert.equal(JSON.stringify(listed).includes(outside), false, 'no outside path leaks');
+
+  const vote = await callVote(job.id, pairID, { choice: 'a' });
+  assert.equal(vote.status, 409);
+  assert.equal(fs.existsSync(path.join(pairDir, 'vote.json')), false, 'linked decision cannot create a top-level receipt');
 });
 
 test('Samples integration is opt-in and the browser component never handles filesystem paths', () => {

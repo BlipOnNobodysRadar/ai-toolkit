@@ -37,12 +37,9 @@ from safetensors.torch import load as load_safetensors
 
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 from toolkit.cache_identity import (
-    build_latent_encoder_identity,
-    build_text_encoder_identity,
     cache_key_digest,
     local_path_identity,
 )
-from toolkit.checkpoint_identity import base_recipe
 from toolkit.config_modules import DatasetConfig
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO, FileItemDTO
 
@@ -67,60 +64,6 @@ _REPARSE_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _SCAN_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 _SCAN_CACHE_LIMIT = 50_000
 _UNSET = object()
-
-# These are the only fields admitted into the frozen reference identity from
-# the effective encoder helpers.  Loaded-object state (vae_class/vae_config and
-# loaded_text_encoders) is deliberately excluded so unloading or moving a
-# component on resume cannot strand already-voted pairs.
-_LATENT_ENCODER_IDENTITY_KEYS = (
-    "requested_vae_path",
-    "base_model_path",
-    "local_vae_identity",
-    "vae_dtype",
-    "quantize",
-    "qtype",
-    "cache_latents_as_uint8",
-    "load_rgba",
-    "is_audio_model",
-    "sample_rate",
-)
-_TEXT_ENCODER_IDENTITY_KEYS = (
-    "requested_te_path",
-    "base_model_path",
-    "local_te_identity",
-    "quantize_te",
-    "qtype_te",
-    "text_encoder_bits",
-    "te_padding_side",
-    "te_torch_dtype",
-)
-# Actual frozen model construction knobs.  Training/dataset/optimizer/LoRA
-# settings are deliberately absent.
-_FROZEN_MODEL_SETTING_KEYS = (
-    "dtype",
-    "vae_path",
-    "vae_dtype",
-    "te_dtype",
-    "quantize",
-    "quantize_te",
-    "qtype",
-    "qtype_te",
-    "quantize_kwargs",
-    "te_name_or_path",
-    "text_encoder_bits",
-    "model_kwargs",
-    "model_paths",
-    "lora_path",
-    "assistant_lora_path",
-    "accuracy_recovery_adapter",
-    "inference_lora_path",
-    "unconditional_lora_path",
-    "refiner_name_or_path",
-    "latent_space_version",
-    "extras_name_or_path",
-    "unet_path",
-)
-
 
 class FeedbackError(RuntimeError):
     """Base class for feedback-pair boundary errors."""
@@ -214,6 +157,9 @@ def _require_safe_regular_file(
 
 
 def _read_closed_bytes(path: str, label: str, max_bytes: int) -> bytes:
+    # lstat first so a Windows path that lacks O_NOFOLLOW cannot redirect us to
+    # a symlink/reparse target.  fstat below rechecks the opened descriptor.
+    _require_safe_regular_file(path, label, max_bytes=max_bytes)
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
@@ -338,119 +284,48 @@ def _validate_vote_data(data: dict[str, Any], pair_id: str) -> _VoteRecord:
     return _VoteRecord(choice=choice, voted_at=voted_at)
 
 
-def _read_pair_record(pair_dir: str, pair_id: str) -> _PairRecord:
-    path = _fixed_child(pair_dir, "pair.json")
-    try:
-        data = _read_json_object(path, f"pair {pair_id}/pair.json")
-    except FileNotFoundError as exc:
-        raise FeedbackCorruptError(f"pair {pair_id} is missing pair.json") from exc
-    return _validate_pair_record(data, pair_id)
-
-
-def _read_vote(pair_dir: str, pair_id: str) -> Optional[_VoteRecord]:
-    path = _fixed_child(pair_dir, "vote.json")
-    if not os.path.lexists(path):
+def _source_identity(source):
+    """Keep hub IDs independent of the launch directory and local IDs of drive letters."""
+    if not source:
         return None
-    try:
-        data = _read_json_object(path, f"pair {pair_id}/vote.json")
-    except FileNotFoundError:
-        return None
-    return _validate_vote_data(data, pair_id)
+    source = os.fspath(source)
+    if not os.path.exists(source):
+        return source
+    manifest = local_path_identity(source)
+    # File identities retain the volume/file IDs and generation; directory entries
+    # retain their relative paths. Remounting the same volume is safe.
+    return {key: value for key, value in manifest.items() if key != "path"}
 
 
-def _stable_encoder_identity(identity: Any, keys: tuple[str, ...]) -> Any:
-    if identity is None:
-        return None
-    if not isinstance(identity, dict):
-        raise FeedbackError("native encoder identity helper returned a non-mapping")
-    return {key: identity.get(key) for key in keys}
-
-
-def _actual_local_base_identity(model_config: Any) -> Optional[dict[str, Any]]:
-    if model_config is None:
-        return None
-    source = getattr(model_config, "name_or_path_original", None)
-    if source is None:
-        source = getattr(model_config, "name_or_path", None)
-    if source is None:
-        return None
-    try:
-        raw = os.fspath(source)
-    except TypeError as exc:
-        raise FeedbackError("model_config base source is not a local path") from exc
-    if not isinstance(raw, str) or not raw:
-        return None
-    if not os.path.exists(raw):
-        # A hub identifier is still identity-bearing through base_recipe; no
-        # local manifest exists to add.
-        return None
-    resolved = os.path.realpath(raw)
-    return {"path": resolved, "identity": local_path_identity(resolved)}
-
-
-def _frozen_model_settings(model_config: Any) -> dict[str, Any]:
-    if model_config is None:
-        return {}
-    return {name: getattr(model_config, name, None) for name in _FROZEN_MODEL_SETTING_KEYS}
-
-
-def _frozen_component_sources(sd: Any) -> dict[str, Any]:
-    sources = getattr(sd, "feedback_component_sources", None) if sd is not None else None
-    if sources is None:
-        return {}
-    if not isinstance(sources, dict):
-        raise FeedbackError("sd.feedback_component_sources must be a mapping")
-    out: dict[str, Any] = {}
-    for name, source in sorted(sources.items(), key=lambda item: str(item[0])):
-        if not isinstance(name, str) or not name:
-            raise FeedbackError("feedback component source names must be non-empty strings")
-        try:
-            raw = os.fspath(source)
-        except TypeError as exc:
-            raise FeedbackError(
-                f"feedback component source {name!r} is not a resolved path"
-            ) from exc
-        if not isinstance(raw, str) or not raw:
-            raise FeedbackError(
-                f"feedback component source {name!r} is not a resolved path"
-            )
-        resolved = os.path.realpath(raw)
-        out[name] = {"path": resolved, "identity": local_path_identity(resolved)}
-    return out
-
-
-def _feedback_reference_identity(trainer: Any) -> dict[str, Any]:
-    model_config = getattr(trainer, "model_config", None)
-    sd = getattr(trainer, "sd", None)
-    if model_config is None and sd is not None:
-        model_config = getattr(sd, "model_config", None)
-    if model_config is None:
-        raise FeedbackError("feedback requires a loaded model_config on the trainer")
-
-    latent_identity = (
-        _stable_encoder_identity(
-            build_latent_encoder_identity(sd), _LATENT_ENCODER_IDENTITY_KEYS
-        )
-        if sd is not None
-        else None
-    )
-    text_identity = (
-        _stable_encoder_identity(
-            build_text_encoder_identity(sd), _TEXT_ENCODER_IDENTITY_KEYS
-        )
-        if sd is not None
-        else None
-    )
+def _feedback_reference_identity(trainer):
+    """Frozen MOSS weights and the preprocessing that produced the archived tensors."""
+    sd = trainer.sd
+    config = trainer.model_config
+    sources = dict(getattr(sd, "feedback_component_sources", {}) or {})
+    # The native MOSS loader records the exact shards. Alternative loaders can
+    # still identify the base and encoders from their configured sources.
+    if not any(name == "transformer" or name.startswith("transformer/") for name in sources):
+        sources["transformer"] = config.name_or_path
+    kw = config.model_kwargs or {}
+    sources.setdefault("text_encoder", getattr(config, "te_name_or_path", None) or kw.get("text_encoder_path"))
+    sources.setdefault("vae", getattr(config, "vae_path", None))
+    for name in ("lora_path", "assistant_lora_path", "accuracy_recovery_adapter", "unconditional_lora_path"):
+        value = getattr(config, name, None)
+        if isinstance(value, str) and value:
+            sources[name] = value
+    precision = {key: getattr(config, key, None) for key in (
+        "dtype", "vae_dtype", "te_dtype", "quantize", "qtype", "quantize_te", "qtype_te",
+        "text_encoder_bits", "quantize_kwargs", "accuracy_recovery_adapter",
+    )}
+    # Adapter source was identified above; the option can also be a boolean switch.
+    if "accuracy_recovery_adapter" in sources:
+        precision.pop("accuracy_recovery_adapter")
     return {
-        "schema": "aitk-feedback-reference-v2",
-        "base_recipe": base_recipe(model_config),
-        "actual_local_base": _actual_local_base_identity(model_config),
-        "frozen_model_settings": _frozen_model_settings(model_config),
-        "encoder_identity": {
-            "latent": latent_identity,
-            "text": text_identity,
-        },
-        "component_sources": _frozen_component_sources(sd),
+        "schema": "moss-feedback-reference-v3", "architecture": config.arch,
+        "sources": {key: _source_identity(source) for key, source in sources.items() if source},
+        "precision": precision,
+        "max_text_length": int(getattr(sd, "max_text_length", kw.get("max_text_length", 4096))),
+        "edit": bool(kw.get("edit", False)), "kv_cache": bool(kw.get("kv_cache", False)),
     }
 
 
@@ -519,7 +394,10 @@ def _pair_dir(root: str, pair_id: str) -> str:
     pair_id = _validate_pair_id(pair_id)
     preferences = _preferences_dir(root)
     pair_dir = os.path.join(preferences, pair_id)
-    _require_safe_directory(pair_dir, f"feedback pair {pair_id}")
+    try:
+        _require_safe_directory(pair_dir, f"feedback pair {pair_id}")
+    except FileNotFoundError as exc:
+        raise FeedbackCorruptError(f"feedback pair {pair_id} does not exist") from exc
     preferences_real = os.path.realpath(preferences)
     pair_real = os.path.realpath(pair_dir)
     try:
@@ -586,6 +464,19 @@ def _scan_cache_entry(preferences_real: str, pair_id: str) -> dict[str, Any]:
     return cache
 
 
+def _vote_path(pair_dir):
+    receipt = _fixed_child(pair_dir, "vote.json")
+    if os.path.lexists(receipt):
+        return receipt
+    # The GUI atomically publishes a nonempty directory before projecting the
+    # receipt. A crash in between still leaves a complete, irrevocable decision.
+    committed = os.path.join(pair_dir, ".decision")
+    if os.path.lexists(committed):
+        _require_safe_directory(committed, "committed feedback decision")
+        return os.path.join(committed, "vote.json")
+    return receipt
+
+
 def _scan_cached_pair(
     preferences_real: str, pair_dir: str, pair_id: str
 ) -> tuple[_PairRecord, Optional[_VoteRecord], dict[str, Any]]:
@@ -599,7 +490,7 @@ def _scan_cached_pair(
         cache["pair_token"] = pair_token
     record: _PairRecord = cache["record"]
 
-    vote_path = _fixed_child(pair_dir, "vote.json")
+    vote_path = _vote_path(pair_dir)
     vote_token = _file_token(vote_path, f"pair {pair_id}/vote.json", required=False)
     if cache.get("vote_token") != vote_token or "vote" not in cache:
         vote = None
@@ -607,7 +498,7 @@ def _scan_cached_pair(
             data = _read_json_object(vote_path, f"pair {pair_id}/vote.json")
             vote = _validate_vote_data(data, pair_id)
         prior = cache.get("vote", _UNSET)
-        if prior is not _UNSET and prior != vote:
+        if prior is not _UNSET and prior is not None and prior != vote:
             # vote.json is an immutable atomic decision.  A changed decision is
             # tampering, not a delayed-first vote (None -> decision is allowed).
             raise FeedbackCorruptError(
@@ -616,11 +507,15 @@ def _scan_cached_pair(
         cache["vote"] = vote
         cache["vote_token"] = vote_token
 
-    vote = cache["vote"]
-    if vote is not None and vote.choice != "skip" and not cache.get("material_ok"):
+    return record, cache["vote"], cache
+
+
+def _ensure_cached_material(
+    pair_dir: str, pair_id: str, cache: dict[str, Any]
+) -> None:
+    if not cache.get("material_ok"):
         _require_fixed_material(pair_dir, pair_id)
         cache["material_ok"] = True
-    return record, vote, cache
 
 
 def voted_feedback_ids(trainer: Any) -> list[str]:
@@ -633,6 +528,10 @@ def voted_feedback_ids(trainer: Any) -> list[str]:
     """
     root = _bound_job_root(trainer)
     preferences = _preferences_dir(root)
+    logs = getattr(trainer, "additional_logs", None)
+    if logs is not None:
+        logs.update({"feedback/eligible_pairs": 0, "feedback/foreign_votes": 0,
+                     "feedback/skipped_pairs": 0, "feedback/invalid_pairs": 0})
     if not os.path.isdir(preferences):
         return []
     preferences_real = os.path.realpath(preferences)
@@ -647,6 +546,7 @@ def voted_feedback_ids(trainer: Any) -> list[str]:
         ) from exc
 
     eligible: list[str] = []
+    foreign = skipped = invalid = 0
     for entry in entries:
         pair_id = entry.name
         if not PAIR_ID_V4_RE.fullmatch(pair_id):
@@ -659,26 +559,42 @@ def voted_feedback_ids(trainer: Any) -> list[str]:
             record, vote, _cache = _scan_cached_pair(
                 preferences_real, pair_dir, pair_id
             )
+            if vote is None:
+                continue
+            if vote.choice == "skip":
+                skipped += 1
+                continue
             if record.reference_id != reference_id:
+                foreign += 1
                 continue
-            if vote is None or vote.choice == "skip":
-                continue
+            _ensure_cached_material(pair_dir, pair_id, _cache)
             eligible.append(pair_id)
         except FileNotFoundError:
             # The publisher may rename a complete directory into place between
             # enumeration and inspection.  It is not eligible this poll.
             continue
         except (FeedbackError, OSError) as exc:
+            invalid += 1
             LOGGER.warning("Skipping feedback pair %s: %s", pair_id, exc)
             continue
+    if foreign:
+        LOGGER.warning("%d voted feedback pair(s) use a different frozen reference and were excluded", foreign)
+    if logs is not None:
+        logs.update({"feedback/eligible_pairs": len(eligible), "feedback/foreign_votes": foreign,
+                     "feedback/skipped_pairs": skipped, "feedback/invalid_pairs": invalid})
     return sorted(eligible)
 
 
 def _load_latents(pair_dir: str, pair_id: str) -> tuple[torch.Tensor, torch.Tensor]:
     path = _fixed_child(pair_dir, "latents.safetensors")
-    raw = _read_closed_bytes(
-        path, f"pair {pair_id}/latents.safetensors", _TENSOR_MAX_BYTES
-    )
+    try:
+        raw = _read_closed_bytes(
+            path, f"pair {pair_id}/latents.safetensors", _TENSOR_MAX_BYTES
+        )
+    except FileNotFoundError as exc:
+        raise FeedbackCorruptError(
+            f"pair {pair_id}/latents.safetensors is missing"
+        ) from exc
     try:
         tensors = load_safetensors(raw)
     except Exception as exc:
@@ -723,7 +639,10 @@ def _load_latents(pair_dir: str, pair_id: str) -> tuple[torch.Tensor, torch.Tens
 def _load_embeddings(pair_dir: str, pair_id: str) -> AdvancedPromptEmbeds:
     path = _fixed_child(pair_dir, "embeddings.safetensors")
     label = f"pair {pair_id}/embeddings.safetensors"
-    _require_safe_regular_file(path, label, max_bytes=_TENSOR_MAX_BYTES)
+    try:
+        _require_safe_regular_file(path, label, max_bytes=_TENSOR_MAX_BYTES)
+    except FileNotFoundError as exc:
+        raise FeedbackCorruptError(f"{label} is missing") from exc
     try:
         with safe_open(path, framework="pt", device="cpu") as handle:
             metadata = handle.metadata() or {}
@@ -894,6 +813,7 @@ def load_feedback_batch(trainer: Any, pair_id: str) -> DataLoaderBatchDTO:
     if vote.choice == "skip":
         raise FeedbackSkippedError(f"feedback pair {pair_id} was skipped")
 
+    _ensure_cached_material(pair_dir, pair_id, _cache)
     latents_a, latents_b = _load_latents(pair_dir, pair_id)
     embeddings = _load_embeddings(pair_dir, pair_id)
     chosen_key = vote.choice

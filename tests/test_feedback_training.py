@@ -31,11 +31,17 @@ def _utc_now() -> str:
 def _make_base_tree(tmp_path, name="base"):
     root = tmp_path / name
     root.mkdir(parents=True, exist_ok=True)
-    (root / "config.json").write_text('{"arch": "moss_image"}', encoding="utf-8")
-    (root / "vae").mkdir(exist_ok=True)
-    (root / "vae" / "vae.safetensors").write_bytes(b"vae-fixture")
-    (root / "text_encoder").mkdir(exist_ok=True)
-    (root / "text_encoder" / "te.safetensors").write_bytes(b"te-fixture")
+    config = root / "config.json"
+    if not config.exists():
+        config.write_text('{"arch": "moss_image"}', encoding="utf-8")
+    vae = root / "vae"
+    vae.mkdir(exist_ok=True)
+    if not (vae / "vae.safetensors").exists():
+        (vae / "vae.safetensors").write_bytes(b"vae-fixture")
+    text_encoder = root / "text_encoder"
+    text_encoder.mkdir(exist_ok=True)
+    if not (text_encoder / "te.safetensors").exists():
+        (text_encoder / "te.safetensors").write_bytes(b"te-fixture")
     return root
 
 
@@ -43,10 +49,13 @@ def _make_component_sources(tmp_path, suffix="one", content=b"transformer-fixtur
     components = tmp_path / "components" / suffix
     components.mkdir(parents=True, exist_ok=True)
     transformer = components / "transformer.safetensors"
-    transformer.write_bytes(content)
+    if not transformer.exists():
+        transformer.write_bytes(content)
     tokenizer = components / "tokenizer"
     tokenizer.mkdir(exist_ok=True)
-    (tokenizer / "tokenizer.json").write_text('{"fixture": true}', encoding="utf-8")
+    tokenizer_file = tokenizer / "tokenizer.json"
+    if not tokenizer_file.exists():
+        tokenizer_file.write_text('{"fixture": true}', encoding="utf-8")
     return {
         "transformer": str(transformer),
         "tokenizer": str(tokenizer),
@@ -229,6 +238,8 @@ def test_reference_identity_uses_only_frozen_model_and_encoding_identity(tmp_pat
         dataset_loss=8.0,
         network_rank=16,
     )
+    second.model_config.model_kwargs.update(batched_cfg=False, sdpa_cudnn=False, fused_pointwise=True,
+                                           uncond_skip_layers=[], sample_shift=7.0)
     assert feedback.feedback_reference_id(second) == ref
     with torch.no_grad():
         first.network.weight.add_(123.0)
@@ -284,6 +295,7 @@ def test_reference_identity_is_cached_once_on_trainer(tmp_path, monkeypatch):
 
 def test_voted_ids_sorted_and_skips_pending_skipped_foreign_old_and_stale(tmp_path):
     trainer = _fake_trainer(tmp_path)
+    trainer.additional_logs = {}
     first_id, _, _, _, _ = _write_pair(tmp_path, trainer, choice="a")
     second_id, _, _, _, _ = _write_pair(tmp_path, trainer, choice="b")
     pending_id, _, _, _, _ = _write_pair(tmp_path, trainer, write_vote=False)
@@ -303,6 +315,10 @@ def test_voted_ids_sorted_and_skips_pending_skipped_foreign_old_and_stale(tmp_pa
     assert foreign_id not in eligible
     assert old_id not in eligible
     assert stale_id not in eligible
+
+    assert trainer.additional_logs["feedback/eligible_pairs"] == 2
+    assert trainer.additional_logs["feedback/foreign_votes"] == 1
+    assert trainer.additional_logs["feedback/skipped_pairs"] == 1
 
 
 def test_poll_cache_observes_delayed_vote_but_rejects_changed_immutable_vote(tmp_path):
@@ -503,3 +519,15 @@ def test_load_batch_preserves_domain_errors_for_ineligible_pairs(tmp_path):
         feedback.load_feedback_batch(trainer, foreign_id)
     with pytest.raises(feedback.FeedbackCorruptError):
         feedback.load_feedback_batch(trainer, old_id)
+    with pytest.raises(feedback.FeedbackCorruptError, match="does not exist"):
+        feedback.load_feedback_batch(trainer, uuid.uuid4().hex)
+
+
+def test_committed_vote_survives_interrupted_receipt_publish(tmp_path):
+    trainer = _fake_trainer(tmp_path)
+    pair_id, pair_dir, *_ = _write_pair(tmp_path, trainer, choice="b")
+    committed = pair_dir / ".decision"
+    committed.mkdir()
+    (pair_dir / "vote.json").rename(committed / "vote.json")
+    assert feedback.voted_feedback_ids(trainer) == [pair_id]
+    assert feedback.load_feedback_batch(trainer, pair_id).feedback_choice == "b"

@@ -2,14 +2,16 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Job } from '@prisma/client';
+import { Dialog, DialogBackdrop, DialogPanel, DialogTitle } from '@headlessui/react';
 import { apiClient } from '@/utils/api';
 import usePollLoop from '@/hooks/usePollLoop';
 import { RequestOwner, Ticket } from '@/utils/requestOwner';
-import { LuImage, LuLoader, LuVote } from 'react-icons/lu';
+import { LuChevronLeft, LuChevronRight, LuImage, LuLoader, LuMaximize2, LuVote, LuX } from 'react-icons/lu';
 
 type PreferenceChoice = 'a' | 'b' | 'skip';
 type PreferenceStatus = 'pending' | 'rated' | 'skipped' | 'invalid';
 type TabKey = 'pending' | 'rated' | 'skipped' | 'invalid';
+type ImageArm = 'a' | 'b';
 
 interface PreferenceVote {
   version: 1;
@@ -38,6 +40,18 @@ interface PreferenceFeedbackList {
   counts: Record<TabKey, number>;
 }
 
+interface PreferenceComparison {
+  pair: PreferencePair;
+  arm: ImageArm;
+}
+
+const EMPTY_SELECTION: Record<TabKey, string | null> = {
+  pending: null,
+  rated: null,
+  skipped: null,
+  invalid: null,
+};
+
 const configuredForFeedback = (job: Job): boolean => {
   try {
     const parsed = JSON.parse(job.job_config) as any;
@@ -64,9 +78,23 @@ const choiceLabel: Record<PreferenceChoice, string> = {
 // The image endpoint is authenticated and intentionally not under the public `/api/img` exemption. Fetch the bytes
 // through the bearer-aware client and render an object URL, so a plain <img> never needs to carry a secret and no
 // local filesystem path reaches the browser.
-function AuthenticatedPreferenceImage({ url, alt }: { url: string; alt: string }) {
+function AuthenticatedPreferenceImage({
+  url,
+  alt,
+  width,
+  height,
+  size = 'gallery',
+}: {
+  url: string;
+  alt: string;
+  width: number;
+  height: number;
+  size?: 'gallery' | 'dialog';
+}) {
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  const mediaClass = size === 'dialog' ? 'min-h-64 max-h-[calc(100vh-13rem)]' : 'min-h-48 max-h-[68vh]';
+  const stateClass = `flex w-full items-center justify-center rounded-lg bg-black ${mediaClass}`;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -92,26 +120,32 @@ function AuthenticatedPreferenceImage({ url, alt }: { url: string; alt: string }
   }, [url]);
 
   if (failed) {
-    return (
-      <div className="flex h-56 items-center justify-center rounded-lg bg-gray-100 text-xs text-gray-500 dark:bg-gray-800 dark:text-gray-400">
-        Image unavailable
-      </div>
-    );
+    return <div className={`${stateClass} text-xs text-gray-400`}>Image unavailable</div>;
   }
   if (!src) {
     return (
-      <div className="flex h-56 items-center justify-center rounded-lg bg-gray-100 dark:bg-gray-800">
+      <div className={stateClass}>
         <LuLoader className="h-5 w-5 animate-spin text-gray-500" />
       </div>
     );
   }
-  return <img src={src} alt={alt} className="h-56 w-full rounded-lg bg-black object-contain" />;
+  return (
+    <img
+      src={src}
+      alt={alt}
+      width={width}
+      height={height}
+      className={`block h-auto w-full rounded-lg bg-black object-contain ${mediaClass}`}
+    />
+  );
 }
 
 export default function PreferenceFeedback({ job }: { job: Job }) {
   const [feedback, setFeedback] = useState<PreferenceFeedbackList | null>(null);
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const [tab, setTab] = useState<TabKey>('pending');
+  const [selectedByTab, setSelectedByTab] = useState<Record<TabKey, string | null>>(EMPTY_SELECTION);
+  const [comparison, setComparison] = useState<PreferenceComparison | null>(null);
   const [votingID, setVotingID] = useState<string | null>(null);
   const [voteError, setVoteError] = useState<string | null>(null);
   const ownerRef = useRef<RequestOwner | null>(null);
@@ -146,12 +180,33 @@ export default function PreferenceFeedback({ job }: { job: Job }) {
     ownerRef.current!.reset(job.id);
     setFeedback(null);
     setStatus('idle');
+    setTab('pending');
+    setSelectedByTab({ ...EMPTY_SELECTION });
+    setComparison(null);
     votingRef.current = null;
     setVotingID(null);
     setVoteError(null);
   }, [job.id]);
 
   usePollLoop(() => fetchFeedback(ownerRef.current!.begin()), 5000, [job.id]);
+
+  const pairs = feedback?.pairs ?? [];
+  const visible = pairs.filter(pair => pair.status === tab);
+  const selectedID = selectedByTab[tab];
+  const selectedIndex = Math.max(
+    0,
+    visible.findIndex(pair => pair.id === selectedID),
+  );
+  const focusedPair = visible[selectedIndex] ?? null;
+
+  const selectPairAt = useCallback(
+    (index: number) => {
+      if (visible.length === 0) return;
+      const nextIndex = Math.max(0, Math.min(index, visible.length - 1));
+      setSelectedByTab(prev => ({ ...prev, [tab]: visible[nextIndex].id }));
+    },
+    [tab, visible],
+  );
 
   const vote = useCallback(
     async (pair: PreferencePair, choice: PreferenceChoice) => {
@@ -162,12 +217,18 @@ export default function PreferenceFeedback({ job }: { job: Job }) {
       // Supersede any list read issued before this mutation. The POST is the authority; an old poll must not put the
       // pair back into pending while the vote is in flight.
       ownerRef.current!.mutate();
+      const currentIndex = visible.findIndex(item => item.id === pair.id);
+      const remaining = visible.filter(item => item.id !== pair.id);
+      const nextPairID = remaining[Math.min(currentIndex, remaining.length - 1)]?.id ?? null;
       try {
         await apiClient.post(
           `/api/jobs/${encodeURIComponent(job.id)}/preferences/${encodeURIComponent(pair.id)}/vote`,
           { choice },
         );
         await fetchFeedback(ownerRef.current!.mutate());
+        if (tab === 'pending') {
+          setSelectedByTab(prev => ({ ...prev, pending: nextPairID }));
+        }
       } catch (error: any) {
         const message =
           error?.response?.data?.error ||
@@ -181,7 +242,7 @@ export default function PreferenceFeedback({ job }: { job: Job }) {
         setVotingID(null);
       }
     },
-    [fetchFeedback, job.id],
+    [fetchFeedback, job.id, tab, visible],
   );
 
   const shouldShow = configured || !!feedback?.enabled || (feedback?.pairs.length ?? 0) > 0;
@@ -193,120 +254,252 @@ export default function PreferenceFeedback({ job }: { job: Job }) {
     { key: 'skipped', label: 'Skipped' },
     ...(feedback && feedback.counts.invalid > 0 ? [{ key: 'invalid' as TabKey, label: 'Unavailable' }] : []),
   ];
-  const visible = (feedback?.pairs ?? []).filter(pair => pair.status === tab);
+  const comparePair = comparison?.pair ?? null;
 
   return (
-    <section className="mb-4 rounded-xl border border-gray-700 bg-gray-900/70 shadow-lg">
-      <div className="flex flex-wrap items-center gap-2 border-b border-gray-700 px-4 py-3">
-        <LuVote className="h-4 w-4 text-amber-500" />
-        <h2 className="text-sm font-semibold text-gray-100">Preference feedback</h2>
-        <span className="text-xs text-gray-400">Choose the image that better matches the prompt.</span>
-        <div className="flex-1" />
-        {tabs.map(item => {
-          const count = feedback?.counts[item.key] ?? 0;
-          return (
-            <button
-              key={item.key}
-              type="button"
-              onClick={() => setTab(item.key)}
-              className={`rounded px-2 py-1 text-xs ${
-                tab === item.key ? 'bg-gray-700 text-white' : 'text-gray-300 hover:bg-gray-800'
-              }`}
-            >
-              {item.label} ({count})
-            </button>
-          );
-        })}
+    <section
+      className="mb-4 rounded-xl border border-gray-700 bg-gray-900/70 shadow-lg"
+      aria-labelledby="preference-feedback-title"
+    >
+      <div className="border-b border-gray-700 px-4 py-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <LuVote className="h-4 w-4 text-amber-500" />
+          <h2 id="preference-feedback-title" className="text-sm font-semibold text-gray-100">
+            Preference feedback
+          </h2>
+          <span className="text-xs text-gray-400">
+            Review one pair at a time. Click either image to compare full size.
+          </span>
+          <div className="flex-1" />
+          <div className="flex flex-wrap items-center gap-1" role="group" aria-label="Preference pair status">
+            {tabs.map(item => {
+              const count = feedback?.counts[item.key] ?? 0;
+              return (
+                <button
+                  key={item.key}
+                  type="button"
+                  aria-pressed={tab === item.key}
+                  onClick={() => {
+                    setTab(item.key);
+                    setComparison(null);
+                    setVoteError(null);
+                  }}
+                  className={`rounded px-2 py-1 text-xs ${
+                    tab === item.key ? 'bg-gray-700 text-white' : 'text-gray-300 hover:bg-gray-800'
+                  }`}
+                >
+                  {item.label} ({count})
+                </button>
+              );
+            })}
+          </div>
+        </div>
       </div>
 
       {voteError && (
-        <div className="border-b border-amber-700/40 bg-amber-900/20 px-4 py-2 text-xs text-amber-200">{voteError}</div>
-      )}
-
-      {status === 'loading' && feedback === null && (
-        <div className="flex items-center gap-2 px-4 py-6 text-sm text-gray-300">
-          <LuLoader className="h-4 w-4 animate-spin" /> Loading preference pairs...
-        </div>
-      )}
-      {status === 'error' && feedback === null && (
-        <div className="px-4 py-6 text-sm text-red-300">Preference pairs could not be loaded.</div>
-      )}
-
-      {feedback && visible.length === 0 && (
-        <div className="flex flex-col items-center justify-center px-4 py-10 text-center text-gray-300">
-          <LuImage className="mb-2 h-7 w-7 text-gray-500" />
-          <p className="text-sm">
-            {tab === 'pending' ? 'No preference pairs are waiting for a vote.' : `No ${tab} preference pairs.`}
-          </p>
-          {tab === 'pending' && feedback.enabled && (
-            <p className="mt-1 text-xs text-gray-500">New pairs appear here as the job publishes them.</p>
-          )}
+        <div role="alert" className="border-b border-amber-700/40 bg-amber-900/20 px-4 py-2 text-xs text-amber-200">
+          {voteError}
         </div>
       )}
 
-      {feedback && visible.length > 0 && (
-        <div className="grid grid-cols-1 gap-4 p-4 xl:grid-cols-2">
-          {visible.map(pair => (
-            <article key={pair.id} className="rounded-lg border border-gray-700 bg-gray-800/60 p-3">
+      <div id="preference-feedback-panel">
+        {status === 'loading' && feedback === null && (
+          <div className="flex items-center gap-2 px-4 py-6 text-sm text-gray-300">
+            <LuLoader className="h-4 w-4 animate-spin" /> Loading preference pairs...
+          </div>
+        )}
+        {status === 'error' && feedback === null && (
+          <div className="px-4 py-6 text-sm text-red-300">Preference pairs could not be loaded.</div>
+        )}
+
+        {feedback && visible.length === 0 && (
+          <div className="flex flex-col items-center justify-center px-4 py-10 text-center text-gray-300">
+            <LuImage className="mb-2 h-7 w-7 text-gray-500" />
+            <p className="text-sm">
+              {tab === 'pending' ? 'No preference pairs are waiting for a vote.' : `No ${tab} preference pairs.`}
+            </p>
+            {tab === 'pending' && feedback.enabled && (
+              <p className="mt-1 text-xs text-gray-500">New pairs appear here as the job publishes them.</p>
+            )}
+          </div>
+        )}
+
+        {feedback && focusedPair && (
+          <div className="p-4">
+            <div className="mb-3 flex items-center justify-center gap-3">
+              <button
+                type="button"
+                title="Previous preference pair"
+                aria-label="Previous preference pair"
+                disabled={selectedIndex <= 0}
+                onClick={() => selectPairAt(selectedIndex - 1)}
+                className="rounded border border-gray-600 p-1.5 text-gray-300 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <LuChevronLeft className="h-4 w-4" />
+              </button>
+              <span className="min-w-32 text-center text-xs text-gray-400" aria-live="polite">
+                Pair {selectedIndex + 1} of {visible.length}
+              </span>
+              <button
+                type="button"
+                title="Next preference pair"
+                aria-label="Next preference pair"
+                disabled={selectedIndex >= visible.length - 1}
+                onClick={() => selectPairAt(selectedIndex + 1)}
+                className="rounded border border-gray-600 p-1.5 text-gray-300 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <LuChevronRight className="h-4 w-4" />
+              </button>
+            </div>
+
+            <article className="rounded-lg border border-gray-700 bg-gray-800/60 p-3">
               <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-400">
-                <span className="rounded bg-gray-700 px-2 py-0.5 text-gray-200">Step {pair.step}</span>
+                <span className="rounded bg-gray-700 px-2 py-0.5 text-gray-200">Step {focusedPair.step}</span>
                 <span>
-                  seeds {pair.seeds[0]} / {pair.seeds[1]}
+                  {focusedPair.width}x{focusedPair.height}
                 </span>
-                <span>
-                  {pair.width}x{pair.height}
-                </span>
-                <span>{statusLabel[pair.status]}</span>
-                {pair.vote && <span>Voted {choiceLabel[pair.vote.choice]}</span>}
+                <span>{statusLabel[focusedPair.status]}</span>
+                {focusedPair.vote && (
+                  <>
+                    <span>Voted {choiceLabel[focusedPair.vote.choice]}</span>
+                    <span>
+                      seeds {focusedPair.seeds[0]} / {focusedPair.seeds[1]}
+                    </span>
+                  </>
+                )}
               </div>
-              <p className="mb-3 line-clamp-3 whitespace-pre-wrap break-words text-sm text-gray-100" title={pair.prompt}>
-                {pair.prompt}
+              <p className="mb-3 whitespace-pre-wrap break-words text-sm text-gray-100" title={focusedPair.prompt}>
+                {focusedPair.prompt}
               </p>
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <AuthenticatedPreferenceImage url={pair.image_urls.a} alt={`Preference ${pair.id}, image A`} />
-                  {pair.status === 'pending' && (
-                    <button
-                      type="button"
-                      disabled={votingID !== null}
-                      onClick={() => vote(pair, 'a')}
-                      className="mt-2 w-full rounded bg-sky-700 px-3 py-1.5 text-sm text-white hover:bg-sky-600 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      {votingID === pair.id ? 'Saving...' : 'Choose A'}
-                    </button>
-                  )}
-                </div>
-                <div>
-                  <AuthenticatedPreferenceImage url={pair.image_urls.b} alt={`Preference ${pair.id}, image B`} />
-                  {pair.status === 'pending' && (
-                    <button
-                      type="button"
-                      disabled={votingID !== null}
-                      onClick={() => vote(pair, 'b')}
-                      className="mt-2 w-full rounded bg-sky-700 px-3 py-1.5 text-sm text-white hover:bg-sky-600 disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      {votingID === pair.id ? 'Saving...' : 'Choose B'}
-                    </button>
-                  )}
-                </div>
+
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                {(['a', 'b'] as const).map(arm => {
+                  const armLabel = arm.toUpperCase();
+                  return (
+                    <figure key={arm} className="min-w-0">
+                      <figcaption className="mb-2 flex items-center justify-between gap-2">
+                        <span className="rounded bg-gray-900 px-2 py-0.5 text-xs font-semibold text-gray-200">
+                          Image {armLabel}
+                        </span>
+                        <span className="text-[11px] text-gray-500">
+                          {focusedPair.width}x{focusedPair.height}
+                        </span>
+                      </figcaption>
+                      <button
+                        type="button"
+                        title={`Compare image ${armLabel} full size`}
+                        aria-label={`Compare image ${armLabel} full size for preference ${focusedPair.id}`}
+                        onClick={() => setComparison({ pair: focusedPair, arm })}
+                        className="group relative block w-full rounded-lg focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+                      >
+                        <AuthenticatedPreferenceImage
+                          url={focusedPair.image_urls[arm]}
+                          alt={`Preference ${focusedPair.id}, image ${armLabel}`}
+                          width={focusedPair.width}
+                          height={focusedPair.height}
+                        />
+                        <span className="pointer-events-none absolute bottom-2 right-2 flex items-center gap-1 rounded bg-black/75 px-2 py-1 text-[11px] text-white opacity-90 group-hover:opacity-100">
+                          <LuMaximize2 className="h-3 w-3" /> Full size
+                        </span>
+                      </button>
+                      {focusedPair.status === 'pending' && (
+                        <button
+                          type="button"
+                          title={`Choose ${armLabel}`}
+                          aria-label={`Choose ${armLabel}`}
+                          disabled={votingID !== null}
+                          onClick={() => vote(focusedPair, arm)}
+                          className="mt-2 w-full rounded bg-sky-700 px-3 py-2 text-sm font-medium text-white hover:bg-sky-600 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {votingID === focusedPair.id ? 'Saving...' : `Choose ${armLabel}`}
+                        </button>
+                      )}
+                    </figure>
+                  );
+                })}
               </div>
-              {pair.status === 'pending' && (
+
+              {focusedPair.status === 'pending' && (
                 <button
                   type="button"
+                  title="Skip this pair"
+                  aria-label="Skip this pair"
                   disabled={votingID !== null}
-                  onClick={() => vote(pair, 'skip')}
-                  className="mt-2 w-full rounded border border-gray-600 px-3 py-1.5 text-xs text-gray-300 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+                  onClick={() => vote(focusedPair, 'skip')}
+                  className="mt-3 w-full rounded border border-gray-600 px-3 py-2 text-xs text-gray-300 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   Skip this pair
                 </button>
               )}
-              {pair.status === 'invalid' && (
-                <p className="mt-2 text-xs text-amber-300">An existing vote record is invalid; it will not be overwritten.</p>
+              {focusedPair.status === 'invalid' && (
+                <p className="mt-2 text-xs text-amber-300">
+                  An existing vote record is invalid; it will not be overwritten.
+                </p>
               )}
             </article>
-          ))}
+          </div>
+        )}
+      </div>
+
+      <Dialog open={comparison !== null} onClose={() => setComparison(null)} className="relative z-50">
+        <DialogBackdrop className="fixed inset-0 bg-black/80" />
+        <div className="fixed inset-0 flex items-center justify-center overflow-y-auto p-2 sm:p-6">
+          <DialogPanel className="w-full max-w-[96rem] rounded-lg border border-gray-700 bg-gray-900 p-3 text-left shadow-2xl sm:p-4">
+            <div className="mb-3 flex items-start gap-3">
+              <div className="min-w-0 flex-1">
+                <DialogTitle className="text-sm font-semibold text-gray-100">
+                  Compare image A and image B at full size
+                </DialogTitle>
+                <p className="mt-1 whitespace-pre-wrap break-words text-xs text-gray-400">{comparePair?.prompt}</p>
+              </div>
+              <button
+                type="button"
+                title="Close full-size comparison"
+                aria-label="Close full-size comparison"
+                onClick={() => setComparison(null)}
+                className="rounded border border-gray-600 p-1.5 text-gray-300 hover:bg-gray-700"
+              >
+                <LuX className="h-4 w-4" />
+              </button>
+            </div>
+            {comparePair && (
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                {(['a', 'b'] as const).map(arm => {
+                  const armLabel = arm.toUpperCase();
+                  return (
+                    <figure key={arm} className="min-w-0">
+                      <figcaption className="mb-2 flex items-center gap-2 text-xs text-gray-300">
+                        <span className="rounded bg-gray-700 px-2 py-0.5 font-semibold">Image {armLabel}</span>
+                        <span className="text-gray-500">
+                          {comparePair.width}x{comparePair.height}
+                        </span>
+                      </figcaption>
+                      <AuthenticatedPreferenceImage
+                        url={comparePair.image_urls[arm]}
+                        alt={`Preference ${comparePair.id}, image ${armLabel}`}
+                        width={comparePair.width}
+                        height={comparePair.height}
+                        size="dialog"
+                      />
+                    </figure>
+                  );
+                })}
+              </div>
+            )}
+            <div className="mt-3 flex justify-end">
+              <button
+                type="button"
+                title="Close full-size comparison"
+                aria-label="Close full-size comparison"
+                onClick={() => setComparison(null)}
+                className="rounded bg-gray-700 px-3 py-1.5 text-xs text-white hover:bg-gray-600"
+              >
+                Close comparison
+              </button>
+            </div>
+          </DialogPanel>
         </div>
-      )}
+      </Dialog>
     </section>
   );
 }

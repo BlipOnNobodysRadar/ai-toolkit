@@ -83,7 +83,7 @@ class FeedbackSchedule:
             self.plan = self._start_window()
         if not self.plan:
             return None
-        from toolkit.feedback_training import load_feedback_batch
+        from toolkit.feedback_training import FeedbackError, load_feedback_batch
 
         train = self.trainer.train_config
         accel = self.trainer.accelerator
@@ -93,7 +93,13 @@ class FeedbackSchedule:
             raise ValueError('Preference feedback window and gradient accumulation are out of sync')
         batches = []
         for pair_id in block[accel.process_index::accel.num_processes]:
-            batch = load_feedback_batch(self.trainer, pair_id)
+            try:
+                batch = load_feedback_batch(self.trainer, pair_id)
+            except FeedbackError as exc:
+                raise RuntimeError(
+                    f"Could not use voted pair {pair_id}: {exc}. Check the archived decision, "
+                    "original reference model and pair files before resuming this window."
+                ) from exc
             batch._feedback_pair_id = pair_id
             batches.append(batch)
         self.offset += count

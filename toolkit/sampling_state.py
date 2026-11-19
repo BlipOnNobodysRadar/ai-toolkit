@@ -35,6 +35,10 @@ def settle(steps, primary=None, what='borrowed state'):
             errors.append(e)
     if not errors:
         return
+    # Optional feedback capture can recover from a render error only after the
+    # trainer has regained its original state. Preserve the original exception.
+    failure = primary if primary is not None else errors[0]
+    failure.aitk_restore_failed = True
     if primary is not None:
         for e in errors:
             try:  # best effort: nothing here may replace the primary error

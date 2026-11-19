@@ -4,16 +4,15 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Job } from '@prisma/client';
 import { Activity, BarChart3, Download, FileText, Loader2, RefreshCw } from 'lucide-react';
 import { apiClient } from '@/utils/api';
-import { encodeFilePathForUrl } from '@/utils/basic';
 
 type MetricMap = { [key: string]: number };
 type ReportFileMeta = {
   fileName: string;
-  path: string;
   exists: boolean;
   size: number | null;
   updatedAt: string | null;
   tooLarge: boolean;
+  previewTruncated: boolean;
   readError: string | null;
 };
 type ValidationHistoryEntry = { step: number | null; phase: string; sampleCount: number; metrics: MetricMap };
@@ -78,18 +77,23 @@ const primaryMetricKeys = (kind: ValidationReport['kind']) =>
     ? ['dpo_loss', 'margin', 'strict_preference_correct']
     : ['video_mse', 'audio_mse'];
 
-const downloadUrl = (path: string) => `/api/files/${encodeFilePathForUrl(path)}`;
+const reportDownloadUrl = (jobID: string, fileName: string) =>
+  `/api/jobs/${encodeURIComponent(jobID)}/reports/${encodeURIComponent(fileName)}`;
 
 function ReportHeader({
   title,
   subtitle,
   report,
   icon,
+  downloading,
+  onDownload,
 }: {
   title: string;
   subtitle: string;
   report: ReportFileMeta;
   icon: React.ReactNode;
+  downloading: boolean;
+  onDownload: (fileName: string) => void;
 }) {
   return (
     <div className="flex flex-wrap items-start justify-between gap-3 border-b border-gray-800 pb-3">
@@ -104,14 +108,15 @@ function ReportHeader({
         {report.updatedAt && <span>{formatDate(report.updatedAt)}</span>}
         {report.size !== null && <span>{formatBytes(report.size)}</span>}
         {report.exists && (
-          <a
-            href={downloadUrl(report.path)}
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center gap-1 rounded bg-gray-800 px-2 py-1 text-gray-200 hover:bg-gray-700"
+          <button
+            type="button"
+            onClick={() => onDownload(report.fileName)}
+            disabled={downloading}
+            className="inline-flex items-center gap-1 rounded bg-gray-800 px-2 py-1 text-gray-200 hover:bg-gray-700 disabled:cursor-wait disabled:opacity-60"
           >
-            <Download className="h-3.5 w-3.5" /> {report.fileName}
-          </a>
+            {downloading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
+            {report.fileName}
+          </button>
         )}
       </div>
     </div>
@@ -188,6 +193,8 @@ export default function JobReports({ job }: { job: Job }) {
   const [reports, setReports] = useState<ReportsResponse | null>(null);
   const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading');
   const [error, setError] = useState('');
+  const [downloadError, setDownloadError] = useState('');
+  const [downloadingFile, setDownloadingFile] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setStatus(previous => (previous === 'ready' ? 'loading' : previous));
@@ -201,6 +208,31 @@ export default function JobReports({ job }: { job: Job }) {
       setStatus('error');
     }
   }, [job.id]);
+
+  const downloadReport = useCallback(
+    async (fileName: string) => {
+      setDownloadingFile(fileName);
+      setDownloadError('');
+      try {
+        const response = await apiClient.get(reportDownloadUrl(job.id, fileName), { responseType: 'blob' });
+        const blob = response.data instanceof Blob ? response.data : new Blob([response.data]);
+        const href = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = href;
+        link.download = fileName;
+        link.rel = 'noreferrer';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(href), 0);
+      } catch (requestError: any) {
+        setDownloadError(requestError?.response?.data?.error || requestError?.message || `Could not download ${fileName}`);
+      } finally {
+        setDownloadingFile(null);
+      }
+    },
+    [job.id],
+  );
 
   useEffect(() => {
     setReports(null);
@@ -257,6 +289,10 @@ export default function JobReports({ job }: { job: Job }) {
         </button>
       </div>
 
+      {downloadError && (
+        <div className="rounded-lg border border-rose-900 bg-rose-950/30 px-3 py-2 text-xs text-rose-200">{downloadError}</div>
+      )}
+
       {validationMissing && edm2Missing && (
         <NoReport>
           No fork report files were found for this job. Held-out validation writes <code>validation.jsonl</code> when
@@ -271,25 +307,34 @@ export default function JobReports({ job }: { job: Job }) {
           subtitle="Native video/image/audio MSE and DPO preference metrics appended by the trainer."
           report={validation}
           icon={<Activity className="h-4 w-4 text-emerald-400" />}
+          downloading={downloadingFile === validation.fileName}
+          onDownload={fileName => void downloadReport(fileName)}
         />
         {validationMissing ? (
           <NoReport>
             No <code>validation.jsonl</code> yet. Configure native held-out datasets under
             <code> train.validation_config</code> to record reproducible validation metrics.
           </NoReport>
-        ) : validation.tooLarge ? (
-          <NoReport>
-            The validation report is larger than the UI&apos;s 8 MB preview limit. Download the raw file to inspect it.
-          </NoReport>
         ) : validation.readError ? (
           <NoReport>The validation report could not be read ({validation.readError}).</NoReport>
         ) : latest === null ? (
-          <NoReport>The validation report has no valid metric records yet.</NoReport>
+          <NoReport>
+            {validation.tooLarge
+              ? 'The validation report is too large to preview and its recent tail has no valid metric records. Download the raw file to inspect it.'
+              : 'The validation report has no valid metric records yet.'}
+          </NoReport>
         ) : (
           <>
+            {validation.previewTruncated && (
+              <div className="mt-3 rounded-lg border border-amber-900 bg-amber-950/30 px-3 py-2 text-xs text-amber-200">
+                This report is larger than the 8 MB preview limit. Showing a recent tail of up to 2 MB; download the raw
+                file for the complete history.
+              </div>
+            )}
             <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-gray-400">
               <span className="rounded-full bg-gray-800 px-2 py-0.5">
                 {validation.entries} validation record{validation.entries === 1 ? '' : 's'}
+                {validation.previewTruncated ? ' in recent tail' : ''}
               </span>
               <span className="rounded-full bg-gray-800 px-2 py-0.5">
                 latest step {latest.step ?? '?'} / {latest.phase || 'unknown phase'}
@@ -388,6 +433,8 @@ export default function JobReports({ job }: { job: Job }) {
           subtitle="Per-timestep prediction weights written alongside the latest checkpoint."
           report={edm2}
           icon={<BarChart3 className="h-4 w-4 text-sky-400" />}
+          downloading={downloadingFile === edm2.fileName}
+          onDownload={fileName => void downloadReport(fileName)}
         />
         {edm2Missing ? (
           <NoReport>
