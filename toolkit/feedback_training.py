@@ -311,6 +311,9 @@ def _feedback_reference_identity(trainer):
     sources.setdefault("vae", getattr(config, "vae_path", None))
     for name in ("lora_path", "assistant_lora_path", "accuracy_recovery_adapter", "unconditional_lora_path"):
         value = getattr(config, name, None)
+        if name == "accuracy_recovery_adapter":
+            adapter = getattr(sd, name, None)
+            value = getattr(adapter, "_aitk_weight_source", None) or value
         if isinstance(value, str) and value:
             sources[name] = value
     precision = {key: getattr(config, key, None) for key in (

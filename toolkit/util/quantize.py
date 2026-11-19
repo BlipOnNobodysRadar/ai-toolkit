@@ -635,6 +635,7 @@ def attach_ara_and_quantize(
     network.eval()
     network.is_active = True
     network.can_merge_in = False
+    network._aitk_weight_source = os.path.realpath(load_lora_path)
     base_model.accuracy_recovery_adapter = network
 
     # quantize it

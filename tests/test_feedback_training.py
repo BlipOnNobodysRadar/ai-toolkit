@@ -260,6 +260,21 @@ def test_reference_identity_uses_only_frozen_model_and_encoding_identity(tmp_pat
     assert feedback.feedback_reference_id(changed_components) != ref
 
 
+def test_feedback_reference_follows_the_loaded_recovery_adapter(tmp_path):
+    def reference(source):
+        trainer = _fake_trainer(tmp_path)
+        trainer.model_config.accuracy_recovery_adapter = "org/repo/adapter.safetensors"
+        trainer.sd.accuracy_recovery_adapter = SimpleNamespace(_aitk_weight_source=str(source))
+        return feedback.feedback_reference_id(trainer)
+
+    first = tmp_path / "adapter.safetensors"
+    first.write_bytes(b"first revision")
+    before = reference(first)
+    assert reference(first) == before
+    first.write_bytes(b"second revision")
+    assert reference(first) != before
+
+
 def test_reference_identity_ignores_transient_loaded_encoder_state(tmp_path):
     trainer = _fake_trainer(tmp_path)
     loaded = feedback.feedback_reference_id(trainer)
