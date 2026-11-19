@@ -9,7 +9,8 @@ import sys
 from pathlib import Path
 
 for key, value in {
-    'CUDA_VISIBLE_DEVICES': '', 'ACCELERATE_USE_CPU': 'true',
+    'CUDA_VISIBLE_DEVICES': '-1',  # not '': empty leaves the GPUs visible on Windows builds
+    'ACCELERATE_USE_CPU': 'true',
     'OMP_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1', 'OPENBLAS_NUM_THREADS': '1',
     'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1',
     'HF_HUB_DISABLE_TELEMETRY': '1', 'NO_ALBUMENTATIONS_UPDATE': '1',

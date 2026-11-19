@@ -28,6 +28,7 @@ import torch
 from jobs.process import BaseExtensionProcess
 from toolkit.paths import TOOLKIT_ROOT
 from toolkit.ui_job_status import UIJobStatus
+from toolkit.sampling_state import settle
 
 
 class InferenceEngineConfig:
@@ -58,14 +59,25 @@ class InferenceEngine(BaseExtensionProcess):
         self.server = None
         self.server_thread = None
         self.endpoint = None
+        self._previous_signal_handlers = {}
 
     def run(self):
         super().run()
+        self.ui.update_status("running", "Starting server")
+        os.makedirs(self.job_folder, exist_ok=True)
+        # everything from here on (server, endpoint file, signal handlers, stop watcher, a preload that a stop
+        # interrupts) is given back by shutdown(), also when startup fails; the original error stays the error
+        try:
+            self._serve()
+        except BaseException as primary:
+            settle([lambda: self.shutdown(primary)], primary, 'the inference engine')
+            raise
+        self.shutdown()
+
+    def _serve(self):
         from .engine import Engine
         from .server import create_app
 
-        self.ui.update_status("running", "Starting server")
-        os.makedirs(self.job_folder, exist_ok=True)
         self.engine = Engine(
             device=self.device,
             output_folder=self.output_folder,
@@ -86,7 +98,7 @@ class InferenceEngine(BaseExtensionProcess):
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                signal.signal(sig, _on_signal)
+                self._previous_signal_handlers[sig] = signal.signal(sig, _on_signal)
             except Exception:
                 pass
 
@@ -103,11 +115,8 @@ class InferenceEngine(BaseExtensionProcess):
                 self.engine.preload(dict(self.engine_config.default_model))
 
         self.engine._idle_status()
-        try:
-            with torch.no_grad():
-                self.engine.run_forever()
-        finally:
-            self.shutdown()
+        with torch.no_grad():
+            self.engine.run_forever()
 
     def start_server(self, app, token: str):
         from .server import serve_in_thread
@@ -132,23 +141,56 @@ class InferenceEngine(BaseExtensionProcess):
         os.replace(tmp, self.endpoint_path)
         print(f"[AITK] Inference engine listening on http://{host}:{port} (endpoint file: {self.endpoint_path})")
 
-    def shutdown(self):
+    def shutdown(self, primary=None):
+        """Give back everything run() acquired, each step attempted even if an earlier one fails; with a primary
+        (startup) error the step failures are attached to it instead of replacing it."""
         reason = self.engine.stop_reason if self.engine else "stopped"
         print(f"[AITK] Inference engine shutting down ({reason})")
-        if self.server is not None:
-            self.server.should_exit = True
-            if self.server_thread is not None:
-                self.server_thread.join(timeout=10)
-        try:
-            os.remove(self.endpoint_path)
-        except FileNotFoundError:
-            pass
-        if self.engine is not None:
+
+        def restore_signal_handlers():
+            for sig, previous in self._previous_signal_handlers.items():
+                try:
+                    signal.signal(sig, previous)
+                except Exception:
+                    pass
+            self._previous_signal_handlers = {}
+
+        def close_admission():
+            # requests admitted over HTTP before run_forever started (or after it died) are settled, not left
+            # waiting on a worker that will never run them; a no-op after a normal run_forever exit
+            if self.engine is not None:
+                self.engine.stop(reason)
+                self.engine._close_and_drain()
+
+        def stop_server():
+            if self.server is not None:
+                self.server.should_exit = True
+                if self.server_thread is not None:
+                    self.server_thread.join(timeout=10)
+
+        def remove_endpoint():
             try:
-                self.engine.unload()
-            except Exception:
+                os.remove(self.endpoint_path)
+            except FileNotFoundError:
                 pass
-        self.ui.update_status("stopped", "Engine stopped")
+
+        def unload():
+            if self.engine is not None:
+                try:
+                    self.engine.unload()
+                except Exception:
+                    pass
+
+        settle([
+            # a stop flag seen after this point must not raise SIGINT into the teardown or whatever runs next
+            self.ui.stop_stop_watcher,
+            restore_signal_handlers,
+            close_admission,
+            stop_server,
+            remove_endpoint,
+            unload,
+            lambda: self.ui.update_status("stopped", "Engine stopped"),
+        ], primary, 'the inference engine')
 
     def on_error(self, e: Exception):
         super().on_error(e)

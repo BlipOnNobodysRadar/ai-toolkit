@@ -2,11 +2,12 @@ import math
 from typing import List
 import torch
 from toolkit.optimizers.optimizer_utils import copy_stochastic, stochastic_grad_accummulation
+from toolkit.optimizers.pending_grads import PendingGradZeroGradMixin
 from optimum.quanto import QBytesTensor
 import random
 
 
-class Adafactor(torch.optim.Optimizer):
+class Adafactor(PendingGradZeroGradMixin, torch.optim.Optimizer):
     """
     Adafactor implementation with stochastic rounding accumulation and stochastic rounding on apply.
     Modified from transformers Adafactor implementation to support stochastic rounding accumulation and apply.
@@ -164,11 +165,13 @@ class Adafactor(torch.optim.Optimizer):
         
     
     def enable_paramiter_swapping(self, paramiter_swapping_factor=0.1):
+        if not 0 < paramiter_swapping_factor <= 1:
+            raise ValueError(f"paramiter_swapping_factor must be in (0, 1], got {paramiter_swapping_factor}")
         self.do_paramiter_swapping = True
         self.paramiter_swapping_factor = paramiter_swapping_factor
         # call it an initial time
         self.swap_paramiters()
-                    
+
     def swap_paramiters(self):
         all_params = []
         # deactivate all paramiters
@@ -180,16 +183,15 @@ class Adafactor(torch.optim.Optimizer):
                 all_params.append(param)
         # shuffle all paramiters
         random.shuffle(all_params)
-        
-        # keep activating paramiters until we are going to go over the target paramiters
+
+        # keep activating paramiters until the next one would go over the target paramiters; at least one trains
         target_paramiters = int(self._total_paramiter_size * self.paramiter_swapping_factor)
         total_paramiters = 0
         for param in all_params:
-            total_paramiters += torch.numel(param)
-            if total_paramiters >= target_paramiters:
+            if total_paramiters > 0 and total_paramiters + torch.numel(param) > target_paramiters:
                 break
-            else:
-                param.requires_grad_(True)
+            param.requires_grad_(True)
+            total_paramiters += torch.numel(param)
 
     @staticmethod
     def _get_lr(param_group, param_state):
@@ -356,8 +358,13 @@ class Adafactor(torch.optim.Optimizer):
 
                 p_data_fp32.add_(-update)
 
-                if p.dtype != torch.float32 and self.stochastic_rounding:
-                    # apply stochastic rounding
-                    copy_stochastic(p, p_data_fp32)
+                if p.dtype != torch.float32:
+                    # the update went into an fp32 copy; write it back (P-03: with stochastic_rounding off it
+                    # never was, so bf16/fp16 parameters did not train)
+                    if self.stochastic_rounding:
+                        # apply stochastic rounding
+                        copy_stochastic(p, p_data_fp32)
+                    else:
+                        p.copy_(p_data_fp32)  # round to nearest
 
         return loss

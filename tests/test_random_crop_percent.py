@@ -4,6 +4,7 @@ import random
 from types import SimpleNamespace
 
 import pytest
+import torch
 from torch.utils.data import DataLoader, Dataset
 
 from toolkit.config_modules import DatasetConfig
@@ -174,7 +175,13 @@ def test_setup_buckets_percent_crop_window():
 
 class FakeEmbeds:
     def save(self, path):
-        open(path, "wb").close()
+        cache_hit(path)
+
+
+def cache_hit(path):
+    # a readable cache file: the caching pass rebuilds unreadable (e.g. empty, truncated) ones (P-01)
+    from safetensors.torch import save_file
+    save_file({"text_embed": torch.zeros(1)}, str(path))
 
 
 class FakeSD:
@@ -215,7 +222,7 @@ def text_item(tmp_path, pct=0.06, hit=False, control=None, control_videos=None, 
     cfg = DatasetConfig(folder_path="x", random_crop_percent=pct, do_i2v=True)
     embed = tmp_path / "item.safetensors"
     if hit:
-        embed.write_bytes(b"")
+        cache_hit(embed)
     return TextItem(dataset_config=cfg, caption="cap", is_video=True, path="clip.mp4", embed_path=str(embed),
                     encode_control_in_text_embeddings=control is not None or control_videos is not None,
                     control_path=control, control_video_paths=control_videos or [], dopsd_self_ref=dopsd,
@@ -244,7 +251,7 @@ def test_explicit_controls_still_accepted(tmp_path, hit):
         assert len(ds.sd.calls) == (0 if hit else 1)
         (tmp_path / "item.safetensors").unlink(missing_ok=True)
         if hit:
-            (tmp_path / "item.safetensors").write_bytes(b"")
+            cache_hit(tmp_path / "item.safetensors")
 
 
 def test_first_frame_embeds_fine_without_percent_crop(tmp_path):

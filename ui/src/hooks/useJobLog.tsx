@@ -4,11 +4,7 @@ import { useEffect, useState, useRef } from 'react';
 import { apiClient } from '@/utils/api';
 import { TerminalEmulator } from '@/utils/terminalEmulator';
 import usePollLoop from '@/hooks/usePollLoop';
-
-interface FileObject {
-  path: string;
-  size: number;
-}
+import { RequestOwner, Ticket } from '@/utils/requestOwner';
 
 export default function useJobLog(jobID: string, reloadInterval: null | number = null) {
   const [log, setLog] = useState<string>('');
@@ -19,56 +15,67 @@ export default function useJobLog(jobID: string, reloadInterval: null | number =
     terminalRef.current = new TerminalEmulator();
   }
   const didInitialLoadRef = useRef(false);
-  // Byte offset into the log file that we've already consumed. Sent to the
-  // server so it only returns newly appended content.
+  // Cursor into the log: byte offset already consumed, and the identity of the log file it refers to (a new run
+  // rotates log.txt; an offset into the old file means nothing in the new one).
   const offsetRef = useRef<number | null>(null);
-  // Guards against overlapping requests: if a poll fires while a request is
-  // still in flight, both would read the same offset and append the same
-  // bytes twice.
-  const inFlightRef = useRef(false);
+  const generationRef = useRef<string | null>(null);
+  // One cursor read in flight per job: two reads from the same offset would append the same bytes twice. The slot
+  // belongs to the job (identity) that issued it; an old job's request never holds or releases the new job's slot.
+  const inFlightRef = useRef<{ ticket: Ticket; promise: Promise<void> } | null>(null);
+  const ownerRef = useRef<RequestOwner | null>(null);
+  if (ownerRef.current === null) ownerRef.current = new RequestOwner();
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error' | 'refreshing'>('idle');
 
-  const refresh = () => {
-    if (inFlightRef.current) {
-      return;
+  const refresh = (): Promise<void> => {
+    const owner = ownerRef.current!;
+    // a callback from an earlier render (old jobID) must not issue a request under the new identity
+    if (!owner.isCurrent(jobID)) return Promise.resolve();
+    const current = inFlightRef.current;
+    if (current && owner.valid(current.ticket)) {
+      return current.promise;
     }
-    inFlightRef.current = true;
-    let loadStatus: 'loading' | 'refreshing' = 'loading';
-    if (didInitialLoadRef.current) {
-      loadStatus = 'refreshing';
-    }
-    setStatus(loadStatus);
+    const ticket = owner.begin();
+    setStatus(didInitialLoadRef.current ? 'refreshing' : 'loading');
     const offset = offsetRef.current;
-    return apiClient
-      .get(`/api/jobs/${jobID}/log`, offset !== null ? { params: { offset } } : undefined)
+    const generation = generationRef.current;
+    const params = offset !== null ? { offset, ...(generation ? { generation } : {}) } : undefined;
+    const promise = apiClient
+      .get(`/api/jobs/${jobID}/log`, params ? { params } : undefined)
       .then(res => res.data)
       .then(data => {
-        offsetRef.current = data.offset ?? null;
+        if (!owner.accept(ticket)) return;
         const terminal = terminalRef.current!;
         if (data.reset) {
-          // Log was reset/truncated (or initial load) — replace everything.
+          // new log file, truncated log, or initial load: replace everything
           terminal.reset();
         }
+        offsetRef.current = data.offset ?? null;
+        generationRef.current = data.generation ?? null;
         terminal.write(data.log ?? '');
         setLog(terminal.toString());
         setStatus('success');
         didInitialLoadRef.current = true;
       })
       .catch(error => {
+        if (!owner.accept(ticket)) return;
         console.error('Error fetching log:', error);
         setStatus('error');
       })
       .finally(() => {
-        inFlightRef.current = false;
+        if (inFlightRef.current?.ticket === ticket) inFlightRef.current = null;
       });
+    inFlightRef.current = { ticket, promise };
+    return promise;
   };
 
   // New job — start fresh. Declared before the poll loop so the reset runs
   // before the first fetch when jobID changes.
   useEffect(() => {
+    ownerRef.current!.reset(jobID);
+    inFlightRef.current = null;
     offsetRef.current = null;
+    generationRef.current = null;
     didInitialLoadRef.current = false;
-    inFlightRef.current = false;
     terminalRef.current?.reset();
     setLog('');
   }, [jobID]);

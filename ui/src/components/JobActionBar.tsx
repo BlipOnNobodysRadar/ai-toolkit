@@ -13,6 +13,8 @@ import {
   markJobAsStopped,
   saveJobNow,
   sampleJobNow,
+  forceStopJob,
+  actionError,
 } from '@/utils/jobs';
 import { startQueue } from '@/utils/queue';
 import { Menu, MenuButton, MenuItem, MenuItems } from '@headlessui/react';
@@ -31,7 +33,7 @@ interface JobActionBarProps {
   menuAnchor?: 'bottom' | 'top end';
 }
 
-type PendingAction = 'start' | 'remove' | 'stop' | 'delete' | 'save' | 'sample' | 'markStopped';
+type PendingAction = 'start' | 'remove' | 'stop' | 'delete' | 'save' | 'sample' | 'markStopped' | 'forceStop';
 
 // If the job never reports a state change (e.g. the request silently failed
 // server-side), unlock the bar after this long so it can't stay stuck.
@@ -46,7 +48,8 @@ export default function JobActionBar({
   autoStartQueue = false,
   menuAnchor = 'bottom',
 }: JobActionBarProps) {
-  const { canStart, canStop, canDelete, canEdit, canRemoveFromQueue } = getAvaliableJobActions(job);
+  const { canStart, canStop, canDelete, isRetryDelete, canEdit, canRemoveFromQueue, canForceStop, canMarkStopped } =
+    getAvaliableJobActions(job);
 
   if (!afterDelete) afterDelete = onRefresh;
 
@@ -57,7 +60,7 @@ export default function JobActionBar({
   // Job state key captured when the pending action was fired. null means the
   // action does not change job state and clears as soon as the request resolves.
   const pendingStateKeyRef = useRef<string | null>(null);
-  const jobStateKey = `${job.status}|${job.stop ? 1 : 0}`;
+  const jobStateKey = `${job.status}|${job.stop ? 1 : 0}|${job.launch_phase ?? ''}`;
 
   const clearPending = () => {
     pendingStateKeyRef.current = null;
@@ -88,6 +91,8 @@ export default function JobActionBar({
     } catch (e) {
       console.error(`Error running job action "${action}":`, e);
       clearPending();
+      // e.g. 409 "the previous run's process has not exited yet": the server's reason, not a silent no-op
+      alert(actionError(e));
     }
   };
 
@@ -99,7 +104,7 @@ export default function JobActionBar({
   const menuItemDisabledClass = `${menuItemClass} opacity-40 cursor-not-allowed`;
   const spinner = <LuLoader className={`${iconSizeClass} animate-spin`} />;
   const menuSpinner = <LuLoader className="w-4 h-4 animate-spin" />;
-  const menuPending = pending === 'save' || pending === 'sample' || pending === 'markStopped';
+  const menuPending = pending === 'save' || pending === 'sample' || pending === 'markStopped' || pending === 'forceStop';
 
   return (
     <div className={`flex items-center flex-shrink-0 ${className ?? ''}`}>
@@ -186,27 +191,27 @@ export default function JobActionBar({
         </Link>
       )}
       <Button
-        disabled={isBusy}
+        disabled={isBusy || !canDelete}
+        title={
+          isRetryDelete
+            ? 'Retry Delete: finish the deletion that did not complete'
+            : canDelete
+              ? 'Delete'
+              : 'Available once the job has stopped and its process has exited'
+        }
+        aria-label={isRetryDelete ? 'Retry Delete' : 'Delete'}
         onClick={() => {
-          if (isBusy) return;
-          let message = `Are you sure you want to delete the job "${job.name}"? This will also permanently remove it from your disk.`;
-          if (job.status === 'running') {
-            message += ' WARNING: The job is currently running. You should stop it first if you can.';
-          }
+          if (isBusy || !canDelete) return;
+          const message = isRetryDelete
+            ? `The deletion of "${job.name}" did not finish. Retry it now? Its folder will be removed from your disk. If another deletion of this job is still running, the retry is refused.`
+            : `Are you sure you want to delete the job "${job.name}"? This will also permanently remove it from your disk.`;
           openConfirm({
-            title: 'Delete Job',
+            title: isRetryDelete ? 'Retry Delete' : 'Delete Job',
             message: message,
             type: 'warning',
-            confirmText: 'Delete',
+            confirmText: isRetryDelete ? 'Retry Delete' : 'Delete',
             onConfirm: () =>
               runAction('delete', async () => {
-                if (job.status === 'running') {
-                  try {
-                    await stopJob(job.id);
-                  } catch (e) {
-                    console.error('Error stopping job before deleting:', e);
-                  }
-                }
                 await deleteJob(job.id);
                 if (afterDelete) afterDelete();
               }),
@@ -278,12 +283,36 @@ export default function JobActionBar({
               </div>
             </MenuItem>
           )}
-          <MenuItem disabled={isBusy}>
+          {canForceStop && (
+            <MenuItem disabled={isBusy}>
+              <div
+                className={isBusy ? menuItemDisabledClass : menuItemEnabledClass}
+                onClick={() => {
+                  if (isBusy) return;
+                  openConfirm({
+                    title: 'Force Stop Job',
+                    message: `Force stop ends every process of "${job.name}" immediately, without a final save. Continue?`,
+                    type: 'warning',
+                    confirmText: 'Force Stop',
+                    onConfirm: () =>
+                      runAction('forceStop', async () => {
+                        await forceStopJob(job.id);
+                        onRefresh && onRefresh();
+                      }),
+                  });
+                }}
+              >
+                {pending === 'forceStop' ? menuSpinner : <OctagonX className="w-4 h-4" />}
+                Force Stop
+              </div>
+            </MenuItem>
+          )}
+          <MenuItem disabled={isBusy || !canMarkStopped}>
             <div
-              className={isBusy ? menuItemDisabledClass : menuItemEnabledClass}
+              className={isBusy || !canMarkStopped ? menuItemDisabledClass : menuItemEnabledClass}
               onClick={() => {
-                if (isBusy) return;
-                let message = `Are you sure you want to mark this job as stopped? This will set the job status to 'stopped' if the status is hung. Only do this if you are 100% sure the job is stopped. This will NOT stop the job.`;
+                if (isBusy || !canMarkStopped) return;
+                let message = `Are you sure you want to mark this job as stopped? This only resets the displayed status of a job whose process is already gone; it will NOT stop anything.`;
                 openConfirm({
                   title: 'Mark Job as Stopped',
                   message: message,

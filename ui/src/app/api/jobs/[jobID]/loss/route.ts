@@ -70,7 +70,7 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
   try {
     await fs.promises.access(logPath);
   } catch {
-    return NextResponse.json({ keys: [], since_step: 0, series: {} });
+    return NextResponse.json({ keys: [], since_step: 0, run_id: job.run_id ?? null, series: {} });
   }
 
   const url = new URL(request.url);
@@ -91,7 +91,9 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
       const vals = rows[0]?.vals ?? '[]';
       parts.push(`${JSON.stringify(key)}:{"steps":${steps},"values":${vals}}`);
     }
-    body = `{"keys":${JSON.stringify(keys)},"since_step":${sinceStep},"series":{${parts.join(',')}}}`;
+    // run_id: the client's since_step cursor belongs to one run; a new run may rewrite steps it already has, so the
+    // client reloads everything (history is kept, it lives in this file) when the run changes
+    body = `{"keys":${JSON.stringify(keys)},"since_step":${sinceStep},"run_id":${JSON.stringify(job.run_id ?? null)},"series":{${parts.join(',')}}}`;
   } finally {
     await closeDb(db);
   }

@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import tempfile
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, List, Dict, Union
@@ -14,12 +15,19 @@ import traceback
 import cv2
 import numpy as np
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection, SiglipImageProcessor
 
 from toolkit.audio.preserve_pitch import time_stretch_preserve_pitch
 from toolkit.basic import UnusableFileError, flush, value_map
+from toolkit.cache_identity import (
+    CACHE_KEY_SCHEMA_VERSION,
+    cache_key_digest,
+    ordered_reference_identity,
+    sha256_file,
+)
 from toolkit.buckets import get_bucket_for_image_size, get_resolution
 from toolkit.config_modules import ControlTypes
 from toolkit.control_generator import ControlGenerator
@@ -32,6 +40,7 @@ from PIL import Image, ImageFilter, ImageOps
 from PIL.ImageOps import exif_transpose
 import albumentations as A
 from toolkit.print import print_acc
+from toolkit import sampling_state
 from toolkit.accelerator import get_accelerator
 from toolkit.prompt_utils import PromptEmbeds
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
@@ -1921,6 +1930,67 @@ def _dto_extras_from_state_dict(state_dict) -> dict:
     return extras
 
 
+def _read_latent_cache(path, load, expected_cache_digest=None):
+    """(complete, state_dict) for an existing latent cache file.
+
+    A readable file is not enough: when the caller supplies the expected key
+    digest, the file must prove it was produced for that exact source and
+    encoder identity. Legacy files without the digest are a miss and are
+    rebuilt lazily. An interrupted write leaves a truncated file, which
+    safetensors refuses at open from its header alone, so the disk-only path
+    need not read the tensors.
+    """
+    try:
+        with safe_open(path, framework='pt', device='cpu') as f:
+            keys = f.keys()
+            metadata = f.metadata() or {}
+            if expected_cache_digest is not None:
+                if metadata.get('aitk_cache_key') != expected_cache_digest:
+                    return False, None
+            complete = 'latent' in keys
+        if load and complete:
+            return True, load_file(path, device='cpu')
+        return complete, None
+    except Exception:
+        return False, None
+
+
+def _publish_cache_file(write, path):
+    """write(temp) a new file next to path and swap the name, so a cache path never names a partial file (latent,
+    text-embedding and CLIP-vision caches; docs/STATE_MACHINES.md M8, SM-07/P-01)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix='.', suffix='.tmp', dir=os.path.dirname(path), delete=False) as f:
+            temp = f.name
+        # the handle is closed first: safetensors reopens the name (required on Windows)
+        write(temp)
+        os.replace(temp, path)
+        temp = None
+    finally:
+        if temp is not None and os.path.exists(temp):
+            os.unlink(temp)
+
+
+def _save_cache_file_atomic(state_dict, path, metadata=None):
+    _publish_cache_file(lambda temp: save_file(state_dict, temp, metadata=metadata), path)
+
+
+def _cache_file_is_usable(path):
+    """A cache file that exists and whose safetensors header opens. An interrupted write (before atomic publication,
+    or by an older version) leaves a truncated file, which safe_open refuses; it is derived data, so it is rebuilt
+    from the source instead of crashing every later run."""
+    if not os.path.exists(path):
+        return False
+    try:
+        with safe_open(path, framework='pt', device='cpu') as f:
+            f.keys()
+        return True
+    except Exception:
+        print_acc(f"Unreadable cache file {path} (interrupted write?); rebuilding it")
+        return False
+
+
 class LatentCachingFileItemDTOMixin:
     def __init__(self, *args, **kwargs):
         # if we have super, call it
@@ -1939,8 +2009,20 @@ class LatentCachingFileItemDTOMixin:
         self.latent_load_device = 'cpu'
         # todo, increment this if we change the latent format to invalidate cache
         self.latent_version = 1
+        # Built once per dataset from the effective VAE/encoding stack. The
+        # model-specific latent_space_version above remains authoritative.
+        self.latent_cache_encoder_identity = kwargs.get('latent_cache_encoder_identity', None)
+        self._latent_source_sha256 = None
 
-    def get_latent_info_dict(self: 'FileItemDTO'):
+    def _get_latent_source_sha256(self: 'FileItemDTO', force=False):
+        # At cache admission recalculate=True refreshes this from the source
+        # bytes. Normal training-item reads use the memoized value and do not
+        # rehash media per step.
+        if force or self._latent_source_sha256 is None:
+            self._latent_source_sha256 = sha256_file(self.path)
+        return self._latent_source_sha256
+
+    def get_latent_info_dict(self: 'FileItemDTO', force_source_identity=False):
         item = OrderedDict([
             ("filename", os.path.basename(self.path)),
             ("scale_to_width", self.scale_to_width),
@@ -1951,7 +2033,30 @@ class LatentCachingFileItemDTOMixin:
             ("crop_height", self.crop_height),
             ("latent_space_version", self.latent_space_version),
             ("latent_version", self.latent_version),
+            ("cache_key_schema_version", CACHE_KEY_SCHEMA_VERSION),
+            ("source_content_sha256", self._get_latent_source_sha256(force=force_source_identity)),
         ])
+        if self.latent_cache_encoder_identity is not None:
+            item["latent_encoder_identity"] = self.latent_cache_encoder_identity
+        dataset_config = getattr(self, "dataset_config", None)
+        if dataset_config is not None:
+            item["preprocessing_identity"] = {
+                "standardize_images": bool(getattr(dataset_config, "standardize_images", False)),
+                "buckets": bool(getattr(dataset_config, "buckets", False)),
+                "resolution": getattr(dataset_config, "resolution", None),
+                "scale": getattr(dataset_config, "scale", None),
+                "random_crop": bool(getattr(dataset_config, "random_crop", False)),
+                "random_crop_percent": getattr(dataset_config, "random_crop_percent", 0),
+                "square_crop": bool(getattr(dataset_config, "square_crop", False)),
+                "auto_frame_count": bool(getattr(dataset_config, "auto_frame_count", False)),
+                "trim_auto_frame_count_tail": bool(getattr(dataset_config, "trim_auto_frame_count_tail", False)),
+                "num_frames": getattr(dataset_config, "num_frames", None),
+                "fps": getattr(dataset_config, "fps", None),
+                "do_i2v": bool(getattr(dataset_config, "do_i2v", False)),
+                "do_audio": bool(getattr(dataset_config, "do_audio", False)),
+                "audio_normalize": bool(getattr(dataset_config, "audio_normalize", False)),
+                "audio_preserve_pitch": bool(getattr(dataset_config, "audio_preserve_pitch", False)),
+            }
         is_video = False
         # when adding items, do it after so we dont change old latents
         if self.flip_x:
@@ -1999,7 +2104,7 @@ class LatentCachingFileItemDTOMixin:
             # we store latents in a folder in same path as image called _latent_cache
             img_dir = os.path.dirname(self.path)
             latent_dir = os.path.join(img_dir, '_latent_cache')
-            hash_dict = self.get_latent_info_dict()
+            hash_dict = self.get_latent_info_dict(force_source_identity=recalculate)
             filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
             # get base64 hash of md5 checksum of hash_dict
             hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
@@ -2083,8 +2188,9 @@ class LatentCachingMixin:
             if to_memory:
                 print_acc(" - Keeping latents in memory")
             # move sd items to cpu except for vae. Only done on the first item that
-            # actually needs encoding so fully cached datasets don't shuffle models around
-            did_move = False
+            # actually needs encoding so fully cached datasets don't shuffle models around.
+            # Given back in the finally below, also when encoding or publishing a cache file fails (R04).
+            borrowed_device_state = None
 
             # prep (video decode, frame extraction, audio load, disk reads) is done by a
             # thread pool so the next items are ready while the current one is encoding.
@@ -2097,10 +2203,17 @@ class LatentCachingMixin:
                 prep_item.latent_load_device = self.sd.device
 
                 prep_latent_path = prep_item.get_latent_path(recalculate=True)
+                expected_cache_digest = cache_key_digest(prep_item.get_latent_info_dict())
                 try:
                     if os.path.exists(prep_latent_path):
-                        cached_state_dict = load_file(prep_latent_path, device='cpu') if to_memory else None
-                        return prep_item, prep_latent_path, cached_state_dict, False
+                        complete, cached_state_dict = _read_latent_cache(
+                            prep_latent_path, load=to_memory, expected_cache_digest=expected_cache_digest)
+                        if complete:
+                            return prep_item, prep_latent_path, cached_state_dict, False
+                        # derived data only: rebuild it from the source (same item, same bucket) instead of
+                        # trusting it or dropping the item; written atomically below when caching to disk
+                        print_acc(f"Unreadable latent cache {prep_latent_path} (interrupted write?); "
+                                  f"re-encoding {prep_item.path}")
                     # not saved to disk, load the image/video/audio
                     prep_item.load_and_process_image(prep_item.dataloader_transforms or self.transform, only_load_latents=True)
                 except Exception as e:
@@ -2115,6 +2228,7 @@ class LatentCachingMixin:
             failed_items = []
             pbar = tqdm(total=len(self.file_list), desc=f'Caching latents{" to disk" if to_disk else ""}')
             executor = ThreadPoolExecutor(max_workers=num_workers)
+            primary = None
             try:
                 pending = deque()
                 file_iter = iter(self.file_list)
@@ -2131,9 +2245,10 @@ class LatentCachingMixin:
                         failed_items.append(file_item)
                         pbar.update(1)
                         continue
-                    if needs_encode and not did_move:
-                        self.sd.set_device_state_preset('cache_latents')
-                        did_move = True
+                    if needs_encode and borrowed_device_state is None:
+                        # a preset that fails part way is put back by enter_device_preset itself
+                        # (a 1-tuple: the saved state itself may be None)
+                        borrowed_device_state = (sampling_state.enter_device_preset(self.sd, 'cache_latents'),)
                     try:
                         self._cache_one_latent(file_item, latent_path, cached_state_dict, needs_encode, to_disk, to_memory)
                     except UnusableFileError as e:
@@ -2147,17 +2262,21 @@ class LatentCachingMixin:
                     file_item.is_latent_cached = True
                     i += 1
                     pbar.update(1)
+            except BaseException as e:
+                primary = e
+                raise
             finally:
-                executor.shutdown(wait=True, cancel_futures=True)
-                pbar.close()
+                # three independent give-backs: each is attempted even if another fails (or a KeyboardInterrupt
+                # arrives while waiting for a prep thread), and none replaces the error that ended the pass
+                cleanup = [lambda: executor.shutdown(wait=True, cancel_futures=True), pbar.close]
+                if borrowed_device_state is not None:
+                    # restore device state
+                    cleanup.append(lambda: sampling_state.leave_device_preset(self.sd, borrowed_device_state[0]))
+                sampling_state.settle(cleanup, primary, 'the latent caching pass')
 
             if failed_items:
                 print_acc(f"Removed {len(failed_items)} files from the dataset that failed to load or were unusable")
                 self._remove_file_items(failed_items)
-
-            # restore device state
-            if did_move:
-                self.sd.restore_device_state()
 
     def _remove_file_items(self: 'AiToolkitDataset', items_to_remove: List['FileItemDTO']):
         # buckets hold raw indices into file_list, so removal requires remapping them
@@ -2289,9 +2408,11 @@ class LatentCachingMixin:
             # save_latent
             if to_disk:
                 # metadata
-                meta = get_meta_for_safetensors(file_item.get_latent_info_dict())
+                latent_info = file_item.get_latent_info_dict()
+                meta = get_meta_for_safetensors(latent_info)
+                meta["aitk_cache_key"] = cache_key_digest(latent_info)
                 os.makedirs(os.path.dirname(latent_path), exist_ok=True)
-                save_file(state_dict, latent_path, metadata=meta)
+                _save_cache_file_atomic(state_dict, latent_path, metadata=meta)
 
             if to_memory:
                 # keep it in memory; audio rides inside the latent DTO
@@ -2335,8 +2456,105 @@ class TextEmbeddingFileItemDTOMixin:
         self.is_text_embedding_cached = False
         self.text_embedding_load_device = 'cpu'
         self.text_embedding_version = 1
+        # Built once per dataset from the effective TE/prompt stack. Model
+        # overrides of text_embedding_space_version remain authoritative.
+        self.text_encoder_cache_identity = kwargs.get('text_encoder_cache_identity', None)
+        self._text_source_sha256 = None
+        self._reference_identity_cache = {}
 
-    def get_text_embedding_info_dict(self: 'FileItemDTO', caption_override=None, text_only=False, dopsd_self_ref=False):
+    def _get_text_source_sha256(self: 'FileItemDTO', force=False):
+        # Only embeddings that actually consume the item's own media carry this
+        # value. It is refreshed at cache admission (recalculate=True), not on
+        # every training step.
+        if force or self._text_source_sha256 is None:
+            self._text_source_sha256 = sha256_file(self.path)
+        return self._text_source_sha256
+
+    def _get_ordered_reference_identity(self: 'FileItemDTO', kind, paths, force=False):
+        """Memoized, ordered content identity for control/reference files.
+
+        The identity hashes reference bytes at cache admission.  Building one
+        embedding path asks for it several times (normal/blank/DOP targets), so
+        the result is kept on the prepared item; a recalculate/admission call
+        with force=True refreshes it from disk.
+        """
+        if paths is None:
+            return []
+        if isinstance(paths, (str, os.PathLike)):
+            paths = [paths]
+        path_list = [os.fspath(path) for path in paths]
+        cache_key = (str(kind), tuple(path_list))
+        if force or cache_key not in self._reference_identity_cache:
+            self._reference_identity_cache[cache_key] = ordered_reference_identity(path_list)
+        return self._reference_identity_cache[cache_key]
+
+    @staticmethod
+    def _temporal_policy_identity(dataset_config):
+        return {
+            "num_frames": getattr(dataset_config, "num_frames", None),
+            "auto_frame_count": bool(getattr(dataset_config, "auto_frame_count", False)),
+            "trim_auto_frame_count_tail": bool(
+                getattr(dataset_config, "trim_auto_frame_count_tail", False)
+            ),
+            "fps": getattr(dataset_config, "fps", None),
+            "shrink_video_to_frames": bool(
+                getattr(dataset_config, "shrink_video_to_frames", False)
+            ),
+        }
+
+    def _get_self_reference_identity(self: 'FileItemDTO', purpose, force=False):
+        """Identity of the item media a conditioned text embedding consumes.
+
+        A D-OPSD image and an i2v first-frame embed are built from the prepared
+        bucketed pixels, so the key carries the actual scale/crop/flip policy.
+        A D-OPSD video is passed to the model by raw path and the model applies
+        its own video-reference presentation; no latent-loader pixel crop is
+        claimed in that case.
+        """
+        source_sha256 = self._get_text_source_sha256(force=force)
+        dataset_config = self.dataset_config
+        if purpose == "dopsd" and self.is_video:
+            return {
+                "mode": "raw_video_reference_path",
+                "source_content_sha256": source_sha256,
+                "reference_presentation": "model_video_ref_2fps",
+                "dataset_temporal_policy": self._temporal_policy_identity(dataset_config),
+            }
+        mode = "own_video_first_frame_pixels" if purpose == "first_frame" else "own_image_pixels"
+        policy = {
+            "mode": mode,
+            "source_content_sha256": source_sha256,
+            "resize": {
+                "scale_to_width": getattr(self, "scale_to_width", None),
+                "scale_to_height": getattr(self, "scale_to_height", None),
+                "filter": "bicubic",
+            },
+            "crop": {
+                "crop_x": getattr(self, "crop_x", None),
+                "crop_y": getattr(self, "crop_y", None),
+                "crop_width": getattr(self, "crop_width", None),
+                "crop_height": getattr(self, "crop_height", None),
+            },
+            "flip_x": bool(getattr(self, "flip_x", False)),
+            "flip_y": bool(getattr(self, "flip_y", False)),
+            "dataset_preprocessing": {
+                "buckets": bool(getattr(dataset_config, "buckets", False)),
+                "scale": getattr(dataset_config, "scale", None),
+                "resolution": getattr(dataset_config, "resolution", None),
+                "random_crop": bool(getattr(dataset_config, "random_crop", False)),
+                "random_crop_percent": getattr(dataset_config, "random_crop_percent", 0),
+                "square_crop": bool(getattr(dataset_config, "square_crop", False)),
+                "standardize_images": bool(getattr(dataset_config, "standardize_images", False)),
+            },
+            "augments": list(getattr(dataset_config, "augments", None) or []),
+            "dataloader_transform_class": type(getattr(self, "dataloader_transforms", None)).__name__,
+        }
+        if mode == "own_video_first_frame_pixels":
+            policy["video_frame_policy"] = self._temporal_policy_identity(dataset_config)
+        return policy
+
+    def get_text_embedding_info_dict(self: 'FileItemDTO', caption_override=None, text_only=False,
+                                     dopsd_self_ref=False, force_source_identity=False):
         # make sure the caption is loaded here
         # TODO: we need a way to cache all the other features like trigger words, DOP, etc. For now, we need to throw an error if not compatible.
         if self.caption is None:
@@ -2345,26 +2563,45 @@ class TextEmbeddingFileItemDTOMixin:
             ("caption", self.caption if caption_override is None else caption_override),
             ("text_embedding_space_version", self.text_embedding_space_version),
             ("text_embedding_version", self.text_embedding_version),
+            ("cache_key_schema_version", CACHE_KEY_SCHEMA_VERSION),
+            ("te_padding_side", getattr(self, 'te_padding_side', 'right')),
+            ("text_only", bool(text_only)),
+            ("dopsd_self_ref", bool(dopsd_self_ref)),
+            ("encode_control_in_text_embeddings", bool(getattr(self, 'encode_control_in_text_embeddings', False))),
+            ("encode_first_frame_in_text_embeddings", bool(getattr(self, 'encode_first_frame_in_text_embeddings', False))),
+            ("text_embedding_uses_target_size", bool(getattr(self, 'text_embedding_uses_target_size', False))),
         ])
+        if self.text_encoder_cache_identity is not None:
+            item["text_encoder_identity"] = self.text_encoder_cache_identity
         if dopsd_self_ref:
             # teacher embeds carry the item's own media as the vision reference
             item["dopsd_self_ref"] = True
+            item["self_reference_content_sha256"] = self._get_text_source_sha256(
+                force=force_source_identity)
+            item["self_reference_identity"] = self._get_self_reference_identity(
+                "dopsd", force=force_source_identity)
             return item
         # dropout embeds are encoded as plain text, keep control conditioning
         # out of their cache key
         if text_only:
             return item
-        # if we have a control image, cache the path
-        if self.encode_control_in_text_embeddings and self.control_path is not None:
-            item["control_path"] = self.control_path
+        # Ordered reference identities: reordering references or replacing the
+        # bytes at one path must produce a new key. Identity is content-based,
+        # not just a path label.  Explicit control images are opened raw
+        # (Image.open/exif_transpose), so this case does not invent DTO crop or
+        # flip flags the model does not consume.
+        control_paths = getattr(self, 'control_path', None)
+        if self.encode_control_in_text_embeddings and control_paths is not None:
+            item["control_paths"] = self._get_ordered_reference_identity(
+                "control_images", control_paths, force=force_source_identity)
             if getattr(self, 'text_embedding_uses_target_size', False) and getattr(self, 'crop_width', None):
                 item["control_target_size"] = [self.crop_width, self.crop_height]
-        if self.encode_control_in_text_embeddings and getattr(self, 'control_video_paths', None):
-            item["control_videos"] = sorted(self.control_video_paths)
-            # v2: reference-video vision blocks are no longer resampled by the
-            # processor (do_sample_frames=False); older video-ref embeds are
-            # misaligned with their presentation. Only items WITH control
-            # videos carry this key, so no other cache is touched.
+        control_videos = getattr(self, 'control_video_paths', None) or []
+        if self.encode_control_in_text_embeddings and control_videos:
+            # Keep the producer's order: images are presented first, then
+            # videos in exactly this sequence.
+            item["control_videos"] = self._get_ordered_reference_identity(
+                "control_videos", control_videos, force=force_source_identity)
             item["control_videos_version"] = 2
         # first-frame vision conditioning changes the embedding content -> new cache key
         elif (
@@ -2373,13 +2610,20 @@ class TextEmbeddingFileItemDTOMixin:
             and self.is_video
         ):
             item["first_frame_in_te"] = True
+            item["self_reference_content_sha256"] = self._get_text_source_sha256(
+                force=force_source_identity)
+            item["self_reference_identity"] = self._get_self_reference_identity(
+                "first_frame", force=force_source_identity)
         return item
 
-    def _build_text_embedding_path(self: 'FileItemDTO', caption_override=None, text_only=False, dopsd_self_ref=False):
+    def _build_text_embedding_path(self: 'FileItemDTO', caption_override=None, text_only=False,
+                                   dopsd_self_ref=False, force_source_identity=False):
         # we store text embeddings in a folder in same path as image called _text_embedding_cache
         img_dir = os.path.dirname(self.path)
         te_dir = os.path.join(img_dir, '_t_e_cache')
-        hash_dict = self.get_text_embedding_info_dict(caption_override=caption_override, text_only=text_only, dopsd_self_ref=dopsd_self_ref)
+        hash_dict = self.get_text_embedding_info_dict(
+            caption_override=caption_override, text_only=text_only,
+            dopsd_self_ref=dopsd_self_ref, force_source_identity=force_source_identity)
         filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
         # get base64 hash of md5 checksum of hash_dict
         hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
@@ -2391,7 +2635,7 @@ class TextEmbeddingFileItemDTOMixin:
         if self._text_embedding_path is not None and not recalculate:
             return self._text_embedding_path
         else:
-            self._text_embedding_path = self._build_text_embedding_path()
+            self._text_embedding_path = self._build_text_embedding_path(force_source_identity=recalculate)
 
         return self._text_embedding_path
 
@@ -2405,7 +2649,7 @@ class TextEmbeddingFileItemDTOMixin:
             # if the trigger word is not in the caption, this hashes to the same
             # path as the normal embedding and the cache file is shared
             self._dop_text_embedding_path = self._build_text_embedding_path(
-                caption_override=self.caption_dop
+                caption_override=self.caption_dop, force_source_identity=recalculate
             )
 
         return self._dop_text_embedding_path
@@ -2435,7 +2679,8 @@ class TextEmbeddingFileItemDTOMixin:
             # the same path as the blank embedding and the cache file is shared.
             # text_only: dropout embeds carry no control conditioning
             self._dop_blank_text_embedding_path = self._build_text_embedding_path(
-                caption_override=self.get_dop_dropout_caption(), text_only=True
+                caption_override=self.get_dop_dropout_caption(), text_only=True,
+                force_source_identity=recalculate
             )
 
         return self._dop_blank_text_embedding_path
@@ -2447,7 +2692,8 @@ class TextEmbeddingFileItemDTOMixin:
         if self.caption is None:
             self.load_caption()
         self._dopsd_text_embedding_path = self._build_text_embedding_path(
-            caption_override=self.caption_dopsd, dopsd_self_ref=True
+            caption_override=self.caption_dopsd, dopsd_self_ref=True,
+            force_source_identity=recalculate
         )
         return self._dopsd_text_embedding_path
 
@@ -2465,7 +2711,8 @@ class TextEmbeddingFileItemDTOMixin:
             return self._dopsd_blank_text_embedding_path
         # unlike DOP, dropout embeds keep the vision reference
         self._dopsd_blank_text_embedding_path = self._build_text_embedding_path(
-            caption_override=self.get_dopsd_dropout_caption(), dopsd_self_ref=True
+            caption_override=self.get_dopsd_dropout_caption(), dopsd_self_ref=True,
+            force_source_identity=recalculate
         )
         return self._dopsd_blank_text_embedding_path
 
@@ -2478,7 +2725,8 @@ class TextEmbeddingFileItemDTOMixin:
             # embedding and the cache file is shared.
             # text_only: dropout embeds carry no control conditioning
             self._blank_text_embedding_path = self._build_text_embedding_path(
-                caption_override=self.get_dropout_caption(), text_only=True
+                caption_override=self.get_dropout_caption(), text_only=True,
+                force_source_identity=recalculate
             )
 
         return self._blank_text_embedding_path
@@ -2535,6 +2783,26 @@ class TextEmbeddingCachingMixin:
         self.is_caching_text_embeddings = self.dataset_config.cache_text_embeddings
 
     def cache_text_embeddings(self: 'AiToolkitDataset'):
+        # CAP-01: get_caption() re-draws shuffle_tokens and random_triggers on
+        # every access, but a cached text embedding is encoded once from one
+        # draw and later loaded by path.  The live caption and the cached
+        # embedding can therefore disagree.  Refuse this admission combination
+        # at the cache boundary; there is no safe way to make one cached file
+        # represent every per-access random draw.
+        offending = []
+        for file_item in self.file_list:
+            item_config = getattr(file_item, "dataset_config", None) or self.dataset_config
+            if getattr(item_config, "shuffle_tokens", False) or getattr(item_config, "random_triggers", None):
+                offending.append(getattr(file_item, "path", "<unknown>"))
+        if offending:
+            sample = ", ".join(offending[:3])
+            more = f" and {len(offending) - 3} more" if len(offending) > 3 else ""
+            raise ValueError(
+                "Cached text embeddings cannot be combined with shuffle_tokens or "
+                "random_triggers: those options are re-drawn on every caption access, "
+                "while a cached embedding is built from one draw. "
+                f"Offending items: {sample}{more}"
+            )
         with accelerator.main_process_first():
             print_acc(f"Caching text_embeddings for {self.dataset_path}")
             print_acc(" - Saving text embeddings to disk")
@@ -2567,7 +2835,7 @@ class TextEmbeddingCachingMixin:
                         size = 1
                         continue  # redo this chunk one prompt at a time
                     for (path, _), part in zip(chunk, parts):
-                        part.save(path)
+                        _publish_cache_file(part.save, path)
                     del embeds, parts
                     start += len(chunk)
                 pending.clear()
@@ -2613,7 +2881,7 @@ class TextEmbeddingCachingMixin:
                                      "combined with i2v first-frame text embeddings cached from the item's own "
                                      f"crop. Offending item: {file_item.path}")
                 # only process if not saved to disk
-                encode_targets = [t for t in encode_targets if not os.path.exists(t[0])]
+                encode_targets = [t for t in encode_targets if not _cache_file_is_usable(t[0])]
                 if len(encode_targets) > 0:
                     # load if not loaded
                     if not did_move:
@@ -2675,7 +2943,7 @@ class TextEmbeddingCachingMixin:
                             else:
                                 prompt_embeds: PromptEmbeds = self.sd.encode_prompt(
                                     caption, control_images=ctrl_img, target_size=target_size)
-                            prompt_embeds.save(path)
+                            _publish_cache_file(prompt_embeds.save, path)
                             del prompt_embeds
                     elif (
                         getattr(self.sd, 'encode_first_frame_in_text_embeddings', False)
@@ -2706,7 +2974,7 @@ class TextEmbeddingCachingMixin:
                                     prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption, control_images=ctrl_img)
                             else:
                                 prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption, control_images=ctrl_img)
-                            prompt_embeds.save(path)
+                            _publish_cache_file(prompt_embeds.save, path)
                             del prompt_embeds
                         file_item.tensor = None
                     else:
@@ -2737,7 +3005,7 @@ class TextEmbeddingCachingMixin:
                         dopsd_blank_path = file_item.get_dopsd_blank_text_embedding_path(recalculate=True)
                         if dopsd_blank_path != dopsd_targets[0][0]:
                             dopsd_targets.append((dopsd_blank_path, file_item.get_dopsd_dropout_caption()))
-                    dopsd_targets = [t for t in dopsd_targets if not os.path.exists(t[0])]
+                    dopsd_targets = [t for t in dopsd_targets if not _cache_file_is_usable(t[0])]
                     if len(dopsd_targets) > 0:
                         if not did_move:
                             self.sd.set_device_state_preset('cache_text_encoder')
@@ -2762,12 +3030,13 @@ class TextEmbeddingCachingMixin:
                             ctrl_img = ctrl_img[0]
                         for path, caption in dopsd_targets:
                             prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption, control_images=ctrl_img)
-                            prompt_embeds.save(path)
+                            _publish_cache_file(prompt_embeds.save, path)
                             del prompt_embeds
                 file_item.is_text_embedding_cached = True
                 i += 1
             flush_pending()
-            # restore device state
+            # restore device state: deliberately not done here (BaseSDTrainProcess parks the text encoder once after
+            # all datasets are cached, instead of bouncing it per dataset); a failure ends the run
             # if did_move:
             #     self.sd.restore_device_state()
 
@@ -2787,9 +3056,19 @@ class CLIPCachingMixin:
             print_acc(f"Caching clip vision for {self.dataset_path}")
 
             print_acc(" - Saving clip to disk")
-            # move sd items to cpu except for vae
-            self.sd.set_device_state_preset('cache_clip')
+        # move sd items to cpu except for vae; given back also when encoding or publishing fails (R04/P-01)
+        saved_device_state = sampling_state.enter_device_preset(self.sd, 'cache_clip')
+        try:
+            self._cache_clip_vision_borrowed()
+        except BaseException as primary:
+            sampling_state.settle([lambda: sampling_state.leave_device_preset(self.sd, saved_device_state)],
+                                  primary, 'the device state after caching clip vision')
+            raise
+        # restore device state
+        sampling_state.leave_device_preset(self.sd, saved_device_state)
 
+    def _cache_clip_vision_borrowed(self: 'AiToolkitDataset'):
+        with torch.no_grad():
             # make sure the adapter has attributes
             if self.sd.adapter is None:
                 raise Exception("Error: must have an adapter to cache clip vision to disk")
@@ -2850,7 +3129,7 @@ class CLIPCachingMixin:
                 hash_str = hash_str.replace('=', '')
 
                 uncond_path = os.path.join(clip_vision_cache_path, f'uncond_{hash_str}_{i}.safetensors')
-                if os.path.exists(uncond_path):
+                if _cache_file_is_usable(uncond_path):
                     # skip it
                     unconditional_paths.append(uncond_path)
                     continue
@@ -2886,8 +3165,7 @@ class CLIPCachingMixin:
                     ('penultimate_hidden_states', clip_output.hidden_states[-2].clone().detach().cpu()),
                 ])
 
-                os.makedirs(os.path.dirname(uncond_path), exist_ok=True)
-                save_file(state_dict, uncond_path)
+                _save_cache_file_atomic(state_dict, uncond_path)
                 unconditional_paths.append(uncond_path)
 
             self.clip_vision_unconditional_cache = unconditional_paths
@@ -2905,7 +3183,7 @@ class CLIPCachingMixin:
 
                 embedding_path = file_item.get_clip_vision_embeddings_path(recalculate=True)
                 # check if it is saved to disk already
-                if not os.path.exists(embedding_path):
+                if not _cache_file_is_usable(embedding_path):
                     # load the image first
                     file_item.load_clip_image()
                     # add batch dimension
@@ -2931,8 +3209,7 @@ class CLIPCachingMixin:
                     ])
                     # metadata
                     meta = get_meta_for_safetensors(file_item.get_clip_vision_info_dict())
-                    os.makedirs(os.path.dirname(embedding_path), exist_ok=True)
-                    save_file(state_dict, embedding_path, metadata=meta)
+                    _save_cache_file_atomic(state_dict, embedding_path, metadata=meta)
 
                     del clip_image
                     del clip_output
@@ -2944,9 +3221,6 @@ class CLIPCachingMixin:
             # flush every 100
             # if i % 100 == 0:
             #     flush()
-
-        # restore device state
-        self.sd.restore_device_state()
 
 
 

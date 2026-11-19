@@ -132,7 +132,7 @@ class ScheduleFreeWrapper(BaseOptimizer):
                         # pack
                         if p.dtype in {torch.float16, torch.bfloat16}:
                             copy_stochastic_(p, p_fp32)
-                self.train_mode = False
+        self.train_mode = False  # after every group (was set inside the loop: C16)
 
     @torch.no_grad()
     def train(self):
@@ -155,7 +155,7 @@ class ScheduleFreeWrapper(BaseOptimizer):
                         # pack
                         if p.dtype in {torch.float16, torch.bfloat16}:
                             copy_stochastic_(p, p_fp32)
-                self.train_mode = True
+        self.train_mode = True  # after every group (was set inside the loop: C16)
 
     @staticmethod
     def swap(x: torch.Tensor, y: torch.Tensor):
@@ -399,7 +399,7 @@ class ADOPTScheduleFree(BaseOptimizer):
                         # pack
                         if p.dtype in {torch.float16, torch.bfloat16}:
                             copy_stochastic_(p, p_fp32)
-                self.train_mode = False
+        self.train_mode = False  # after every group (was set inside the loop: C16)
 
     @torch.no_grad()
     def train(self):
@@ -423,7 +423,7 @@ class ADOPTScheduleFree(BaseOptimizer):
                         # pack
                         if p.dtype in {torch.float16, torch.bfloat16}:
                             copy_stochastic_(p, p_fp32)
-                self.train_mode = True
+        self.train_mode = True  # after every group (was set inside the loop: C16)
 
     @torch.no_grad()
     def reset(self):
@@ -685,7 +685,7 @@ class ADOPTEMAMixScheduleFree(BaseOptimizer):
                         # pack
                         if p.dtype in {torch.float16, torch.bfloat16}:
                             copy_stochastic_(p, p_fp32)
-                self.train_mode = False
+        self.train_mode = False  # after every group (was set inside the loop: C16)
 
     @torch.no_grad()
     def train(self):
@@ -709,7 +709,7 @@ class ADOPTEMAMixScheduleFree(BaseOptimizer):
                         # pack
                         if p.dtype in {torch.float16, torch.bfloat16}:
                             copy_stochastic_(p, p_fp32)
-                self.train_mode = True
+        self.train_mode = True  # after every group (was set inside the loop: C16)
 
     @torch.no_grad()
     def reset(self):
@@ -1005,7 +1005,7 @@ class ADOPTNesterovScheduleFree(BaseOptimizer):
                         # pack
                         if p.dtype in {torch.float16, torch.bfloat16}:
                             copy_stochastic_(p, p_fp32)
-                self.train_mode = False
+        self.train_mode = False  # after every group (was set inside the loop: C16)
 
     @torch.no_grad()
     def train(self):
@@ -1029,7 +1029,7 @@ class ADOPTNesterovScheduleFree(BaseOptimizer):
                         # pack
                         if p.dtype in {torch.float16, torch.bfloat16}:
                             copy_stochastic_(p, p_fp32)
-                self.train_mode = True
+        self.train_mode = True  # after every group (was set inside the loop: C16)
 
     @torch.no_grad()
     def reset(self):
@@ -1313,7 +1313,7 @@ class ADOPTMARSScheduleFree(BaseOptimizer):
                         # pack
                         if p.dtype in {torch.float16, torch.bfloat16}:
                             copy_stochastic_(p, p_fp32)
-                self.train_mode = False
+        self.train_mode = False  # after every group (was set inside the loop: C16)
 
     @torch.no_grad()
     def train(self):
@@ -1337,7 +1337,7 @@ class ADOPTMARSScheduleFree(BaseOptimizer):
                         # pack
                         if p.dtype in {torch.float16, torch.bfloat16}:
                             copy_stochastic_(p, p_fp32)
-                self.train_mode = True
+        self.train_mode = True  # after every group (was set inside the loop: C16)
 
     @torch.no_grad()
     def reset(self):
@@ -1598,7 +1598,7 @@ class FADOPTScheduleFree(BaseOptimizer):
                         # pack
                         if p.dtype in {torch.float16, torch.bfloat16}:
                             copy_stochastic_(p, p_fp32)
-                self.train_mode = False
+        self.train_mode = False  # after every group (was set inside the loop: C16)
 
     @torch.no_grad()
     def train(self):
@@ -1622,7 +1622,7 @@ class FADOPTScheduleFree(BaseOptimizer):
                         # pack
                         if p.dtype in {torch.float16, torch.bfloat16}:
                             copy_stochastic_(p, p_fp32)
-                self.train_mode = True
+        self.train_mode = True  # after every group (was set inside the loop: C16)
 
     @torch.no_grad()
     def reset(self):
@@ -1895,7 +1895,7 @@ class FADOPTEMAMixScheduleFree(BaseOptimizer):
                         # pack
                         if p.dtype in {torch.float16, torch.bfloat16}:
                             copy_stochastic_(p, p_fp32)
-                self.train_mode = False
+        self.train_mode = False  # after every group (was set inside the loop: C16)
 
     @torch.no_grad()
     def train(self):
@@ -1919,7 +1919,7 @@ class FADOPTEMAMixScheduleFree(BaseOptimizer):
                         # pack
                         if p.dtype in {torch.float16, torch.bfloat16}:
                             copy_stochastic_(p, p_fp32)
-                self.train_mode = True
+        self.train_mode = True  # after every group (was set inside the loop: C16)
 
     @torch.no_grad()
     def reset(self):
@@ -2223,7 +2223,7 @@ class FADOPTNesterovScheduleFree(BaseOptimizer):
                         # pack
                         if p.dtype in {torch.float16, torch.bfloat16}:
                             copy_stochastic_(p, p_fp32)
-                self.train_mode = False
+        self.train_mode = False  # after every group (was set inside the loop: C16)
 
     @torch.no_grad()
     def train(self):
@@ -2247,7 +2247,7 @@ class FADOPTNesterovScheduleFree(BaseOptimizer):
                         # pack
                         if p.dtype in {torch.float16, torch.bfloat16}:
                             copy_stochastic_(p, p_fp32)
-                self.train_mode = True
+        self.train_mode = True  # after every group (was set inside the loop: C16)
 
     @torch.no_grad()
     def reset(self):
@@ -2552,7 +2552,7 @@ class FADOPTMARSScheduleFree(BaseOptimizer):
                         # pack
                         if p.dtype in {torch.float16, torch.bfloat16}:
                             copy_stochastic_(p, p_fp32)
-                self.train_mode = False
+        self.train_mode = False  # after every group (was set inside the loop: C16)
 
     @torch.no_grad()
     def train(self):
@@ -2576,7 +2576,7 @@ class FADOPTMARSScheduleFree(BaseOptimizer):
                         # pack
                         if p.dtype in {torch.float16, torch.bfloat16}:
                             copy_stochastic_(p, p_fp32)
-                self.train_mode = True
+        self.train_mode = True  # after every group (was set inside the loop: C16)
 
     @torch.no_grad()
     def reset(self):
@@ -2988,7 +2988,7 @@ class _ADOPTAOScheduleFreeBase(Optimizer):
                                 torch.compile(self._eval, fullgraph=True, dynamic=False)(p=p, z=state["z"], beta1=group['betas'][0])
                             else:
                                 self._eval(p=p, z=state["z"], beta1=group['betas'][0])
-                    self.train_mode = False
+            self.train_mode = False  # after every group (was set inside the loop: C16)
 
     @staticmethod
     @torch.no_grad()
@@ -3014,7 +3014,7 @@ class _ADOPTAOScheduleFreeBase(Optimizer):
                                 torch.compile(self._train, fullgraph=True, dynamic=False)(p=p, z=state["z"], beta1=group['betas'][0])
                             else:
                                 self._train(p=p, z=state["z"], beta1=group['betas'][0])
-                    self.train_mode = True
+            self.train_mode = True  # after every group (was set inside the loop: C16)
 
     @torch.no_grad()
     def step(self, closure=None):

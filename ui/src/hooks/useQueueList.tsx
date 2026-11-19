@@ -1,20 +1,26 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Queue } from '@prisma/client';
 import { apiClient } from '@/utils/api';
+import { RequestOwner } from '@/utils/requestOwner';
 
+// Manual refreshes may overlap (e.g. after queue start/stop clicks); only the latest issued one is applied.
 export default function useQueueList() {
   const [queues, setQueues] = useState<Queue[]>([]);
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
+  const ownerRef = useRef<RequestOwner | null>(null);
+  if (ownerRef.current === null) ownerRef.current = new RequestOwner();
 
   const refreshQueues = () => {
+    const owner = ownerRef.current!;
+    const ticket = owner.mutate();
     setStatus('loading');
-    apiClient
+    return apiClient
       .get('/api/queue')
       .then(res => res.data)
       .then(data => {
-        console.log('Queues:', data);
+        if (!owner.accept(ticket)) return;
         if (data.error) {
           console.log('Error fetching queues:', data.error);
           setStatus('error');
@@ -24,6 +30,7 @@ export default function useQueueList() {
         }
       })
       .catch(error => {
+        if (!owner.accept(ticket)) return;
         console.error('Error fetching queues:', error);
         setStatus('error');
       });

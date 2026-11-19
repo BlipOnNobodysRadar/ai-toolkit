@@ -87,7 +87,7 @@ try:
     status='completed'
 except AcceptedStop:
     status='stopped_after_save'
-summary={'status':status,'device':'cpu' if os.environ.get('CUDA_VISIBLE_DEVICES')=='' else 'default',
+summary={'status':status,'device':'cpu' if os.environ.get('CUDA_VISIBLE_DEVICES') in ('', '-1') else 'default',
          'cuda_initialized':torch.cuda.is_initialized()}
 if torch.cuda.is_initialized():
     summary.update(peak_allocated=torch.cuda.max_memory_allocated(),peak_reserved=torch.cuda.max_memory_reserved())

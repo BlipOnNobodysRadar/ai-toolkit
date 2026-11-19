@@ -32,6 +32,8 @@ class ReferenceSliderConfig:
 
 
 class ImageReferenceSliderTrainerProcess(BaseSDTrainProcess):
+    # hook_train_loop zeroes gradients and steps every iteration (docs/STATE_MACHINES.md M27)
+    supports_gradient_accumulation_steps = False
     sd: StableDiffusion
     data_loader: DataLoader = None
 

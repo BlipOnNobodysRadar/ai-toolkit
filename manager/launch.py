@@ -51,21 +51,27 @@ def _headless():
     )
 
 
-def _open_browser_when_ready(stop_event):
-    """Poll the UI port in the background; open the browser once it responds."""
+def _open_browser_when_ready(stop_event, open_lock):
+    """Poll the UI port in the background; open the browser once it responds.
+
+    launch_ui sets stop_event while holding open_lock, and the browser is opened only under that lock after
+    re-checking the event: an open begun before the UI stopped may finish, but none starts after launch_ui's
+    cleanup has returned (a readiness request that was blocked when the UI stopped opens nothing)."""
     import time
     import urllib.request
     import webbrowser
 
-    waited = 0
-    while not stop_event.is_set() and waited < BROWSER_POLL_SECONDS:
+    deadline = time.monotonic() + BROWSER_POLL_SECONDS
+    while not stop_event.is_set() and time.monotonic() < deadline:
         try:
             urllib.request.urlopen(UI_URL, timeout=2).close()
-            webbrowser.open(UI_URL)
-            return
         except OSError:
-            time.sleep(2)
-            waited += 2
+            stop_event.wait(2)  # wakes at once when the UI stops
+            continue
+        with open_lock:
+            if not stop_event.is_set():
+                webbrowser.open(UI_URL)
+        return
 
 
 def launch_ui(open_browser=True):
@@ -93,22 +99,27 @@ def launch_ui(open_browser=True):
 
     info("Starting AI Toolkit UI (%s) ..." % UI_URL)
     stop_event = threading.Event()
-    if open_browser and not _headless():
-        threading.Thread(
-            target=_open_browser_when_ready, args=(stop_event,), daemon=True
-        ).start()
-
-    proc = subprocess.Popen(
-        [npm, "run", "db_build_start"], cwd=os.path.join(REPO_ROOT, "ui"), env=env
-    )
+    open_lock = threading.Lock()
+    # the watcher is owned from its start: any failure below (including Popen raising) still stops it
     try:
-        return proc.wait()
-    except KeyboardInterrupt:
-        proc.terminate()
+        if open_browser and not _headless():
+            threading.Thread(
+                target=_open_browser_when_ready, args=(stop_event, open_lock), daemon=True
+            ).start()
+
+        proc = subprocess.Popen(
+            [npm, "run", "db_build_start"], cwd=os.path.join(REPO_ROOT, "ui"), env=env
+        )
         try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        return 130
+            return proc.wait()
+        except KeyboardInterrupt:
+            # terminates npm itself; whether its descendants (the UI servers) exit with it is not verified here
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            return 130
     finally:
-        stop_event.set()
+        with open_lock:
+            stop_event.set()

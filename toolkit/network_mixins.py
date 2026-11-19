@@ -925,6 +925,14 @@ class ToolkitNetworkMixin:
             print(" Attempting to load with forced keymap")
             return self.load_weights(file, force_weight_mapping=True)
 
+        # The load stays non-strict (pretrained LoRAs load partially by design); resume reads this report and refuses
+        # a checkpoint that leaves trainable weights unloaded or carries weights for modules this network lacks
+        # (docs/STATE_MACHINES.md, OPUS-PARAM-ID-01). "unexpected" are the saved keys not loaded ("Missing keys" above).
+        self.last_load_report = {
+            'not_loaded': [name for name, _ in self.named_parameters() if name in current_state_dict
+                           and name not in load_sd],
+            'unexpected': list(extra_dict.keys()),
+        }
         info = self.load_state_dict(load_sd, False)
         if len(extra_dict.keys()) == 0:
             extra_dict = None

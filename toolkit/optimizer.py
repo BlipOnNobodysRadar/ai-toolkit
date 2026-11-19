@@ -16,15 +16,16 @@ def get_optimizer(
     if lower_type.startswith("dadaptation"):
         # dadaptation optimizer does not use standard learning rate. 1 is the default value
         import dadaptation
-        print("Using DAdaptAdam optimizer")
         use_lr = learning_rate
         if use_lr < 0.1:
             # dadaptation uses different lr that is values of 0.1 to 1.0. default to 1.0
             use_lr = 1.0
         if lower_type.endswith('lion'):
             optimizer = dadaptation.DAdaptLion(params, eps=1e-6, lr=use_lr, **optimizer_params)
+            print("Using DAdaptLion optimizer")
         elif lower_type.endswith('adam'):
-            optimizer = dadaptation.DAdaptLion(params, eps=1e-6, lr=use_lr, **optimizer_params)
+            optimizer = dadaptation.DAdaptAdam(params, eps=1e-6, lr=use_lr, **optimizer_params)
+            print("Using DAdaptAdam optimizer")
         elif lower_type == 'dadaptation':
             # backwards compatibility
             optimizer = dadaptation.DAdaptAdam(params, eps=1e-6, lr=use_lr, **optimizer_params)

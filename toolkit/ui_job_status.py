@@ -13,6 +13,8 @@ import threading
 import time
 from typing import Callable, Literal, Optional
 
+from toolkit.ui_run_fence import RunFence
+
 AITK_Status = Literal["running", "stopped", "error", "completed", "queued"]
 
 
@@ -21,12 +23,19 @@ class UIJobStatus:
         self.sqlite_db_path = sqlite_db_path
         job_id = os.environ.get("AITK_JOB_ID", None)
         self.job_id = job_id.strip() if job_id else None
+        # a UI run id fences every Job read/write to this launch; a fenced run must own its row to start
+        self.fence = RunFence(self.job_id)
+        self.fence.require_owned(sqlite_db_path)
         self.is_ui_job = self.job_id is not None and os.path.exists(sqlite_db_path)
         if self.is_ui_job:
             print(f"Using SQLite database at {sqlite_db_path}")
             print(f'Job ID: "{self.job_id}"')
         self._lock = threading.Lock()
         self._watcher = None
+        self._watcher_done = threading.Event()
+        # held while on_stop runs (never during DB reads): stop_stop_watcher waits for a callback in flight and none
+        # can start after it returns
+        self._watcher_callback = threading.Lock()
         # collapse bursts of identical writes (progress ticks)
         self._last_info = None
 
@@ -59,6 +68,7 @@ class UIJobStatus:
                 cur.execute("BEGIN IMMEDIATE")
                 try:
                     cur.execute(query, params)
+                    self.fence.wrote(cur)
                 finally:
                     cur.execute("COMMIT")
 
@@ -74,34 +84,36 @@ class UIJobStatus:
         def _do():
             with self._lock, self._connect() as conn:
                 cur = conn.cursor()
-                cur.execute(f"SELECT {column} FROM Job WHERE id = ?", (self.job_id,))
+                cur.execute(f"SELECT {column} FROM Job WHERE {self.fence.job_clause}", self.fence.params())
                 row = cur.fetchone()
-                return False if row is None else row[0] == 1
+                return self.fence.flag(row, stop=column == "stop")
 
         return self._retry(_do)
 
     # ---- public api ----
     def update_status(self, status: AITK_Status, info: Optional[str] = None):
         if info is None:
-            self._write("UPDATE Job SET status = ? WHERE id = ?", (status, self.job_id))
+            self._write(f"UPDATE Job SET status = ? WHERE {self.fence.job_clause}", self.fence.params(status))
         else:
             self._last_info = info
             self._write(
-                "UPDATE Job SET status = ?, info = ? WHERE id = ?",
-                (status, info, self.job_id),
+                f"UPDATE Job SET status = ?, info = ? WHERE {self.fence.job_clause}",
+                self.fence.params(status, info),
             )
 
     def update_info(self, info: str):
         if info == self._last_info:
             return
         self._last_info = info
-        self._write("UPDATE Job SET info = ? WHERE id = ?", (info, self.job_id))
+        self._write(f"UPDATE Job SET info = ? WHERE {self.fence.job_clause}", self.fence.params(info))
 
     def update_key(self, key: str, value):
         # key is a column name from our own code, never user input
-        self._write(f"UPDATE Job SET {key} = ? WHERE id = ?", (str(value), self.job_id))
+        self._write(f"UPDATE Job SET {key} = ? WHERE {self.fence.job_clause}", self.fence.params(str(value)))
 
     def should_stop(self) -> bool:
+        if self.fence.superseded:  # a fenced write matched no row: this run no longer owns the job
+            return True
         return self._read_flag("stop")
 
     def should_return_to_queue(self) -> bool:
@@ -113,18 +125,28 @@ class UIJobStatus:
         if not self.is_ui_job or self._watcher is not None:
             return
 
+        def _dispatch(reason):
+            with self._watcher_callback:
+                if not self._watcher_done.is_set():  # the read may have finished after stop_stop_watcher
+                    on_stop(reason)
+
         def _loop():
-            while True:
+            while not self._watcher_done.is_set():
                 try:
                     if self.should_stop():
-                        on_stop("stopped")
+                        _dispatch("stopped")
                         return
                     if self.should_return_to_queue():
-                        on_stop("queued")
+                        _dispatch("queued")
                         return
                 except Exception:
                     pass
-                time.sleep(interval_sec)
+                self._watcher_done.wait(interval_sec)
 
         self._watcher = threading.Thread(target=_loop, daemon=True)
         self._watcher.start()
+
+    def stop_stop_watcher(self):
+        """End the watcher: once this returns, on_stop has either finished or will never be called."""
+        with self._watcher_callback:
+            self._watcher_done.set()

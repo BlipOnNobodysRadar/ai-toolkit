@@ -1,6 +1,7 @@
 from collections import OrderedDict
 import os
 import sqlite3
+from toolkit.ui_run_fence import RunFence
 import asyncio
 import concurrent.futures
 from extensions_built_in.sd_trainer.SDTrainer import SDTrainer
@@ -20,6 +21,9 @@ class DiffusionTrainer(SDTrainer):
         self.sqlite_db_path = self.config.get("sqlite_db_path", "./aitk_db.db")
         self.job_id = os.environ.get("AITK_JOB_ID", None)
         self.job_id = self.job_id.strip() if self.job_id is not None else None
+        # a UI run id fences every Job read/write to this launch; a fenced run must own its row to start
+        self.fence = RunFence(self.job_id)
+        self.fence.require_owned(self.sqlite_db_path)
         self.is_ui_trainer = True
         if not os.path.exists(self.sqlite_db_path):
             self.is_ui_trainer = False
@@ -137,13 +141,15 @@ class DiffusionTrainer(SDTrainer):
     def should_stop(self):
         if not self.is_ui_trainer:
             return False
+        if self.fence.superseded:  # a fenced write matched no row: this run no longer owns the job
+            return True
         def _check_stop():
             with self._db_connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT stop FROM Job WHERE id = ?", (self.job_id,))
+                    f"SELECT stop FROM Job WHERE {self.fence.job_clause}", self.fence.params())
                 stop = cursor.fetchone()
-                return False if stop is None else stop[0] == 1
+                return self.fence.flag(stop, stop=True)
 
         return self._retry_db_operation(_check_stop)
 
@@ -154,9 +160,9 @@ class DiffusionTrainer(SDTrainer):
             with self._db_connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT return_to_queue FROM Job WHERE id = ?", (self.job_id,))
+                    f"SELECT return_to_queue FROM Job WHERE {self.fence.job_clause}", self.fence.params())
                 return_to_queue = cursor.fetchone()
-                return False if return_to_queue is None else return_to_queue[0] == 1
+                return self.fence.flag(return_to_queue, stop=False)
 
         return self._retry_db_operation(_check_return_to_queue)
 
@@ -164,14 +170,15 @@ class DiffusionTrainer(SDTrainer):
         if not self.is_ui_trainer:
             return
         if self.should_stop():
+            # before the blocking write: the stop watcher must not interrupt this graceful shutdown
+            self.is_stopping = True
             self._run_async_operation(
                 self._update_status("stopped", "Job stopped"))
-            self.is_stopping = True
             raise Exception("Job stopped")
         if self.should_return_to_queue():
+            self.is_stopping = True
             self._run_async_operation(
                 self._update_status("queued", "Job queued"))
-            self.is_stopping = True
             raise Exception("Job returning to queue")
 
     def should_save(self):
@@ -181,9 +188,9 @@ class DiffusionTrainer(SDTrainer):
             with self._db_connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT save_now FROM Job WHERE id = ?", (self.job_id,))
+                    f"SELECT save_now FROM Job WHERE {self.fence.job_clause}", self.fence.params())
                 save_now = cursor.fetchone()
-                return False if save_now is None else save_now[0] == 1
+                return self.fence.flag(save_now, stop=False)
 
         return self._retry_db_operation(_check_save)
 
@@ -195,9 +202,7 @@ class DiffusionTrainer(SDTrainer):
             if self.progress_bar is not None:
                 self.progress_bar.pause()
             print_acc(f"\nSaving at step {self.step_num}")
-            # clear any grads, except that RAWR checkpoints keep unfinished microbatches (as the periodic save does)
-            if getattr(self, '_rawr_checkpoint_config', None) is None:
-                self.optimizer.zero_grad()
+            # keep the unfinished accumulation window, as the periodic save does (RAWR checkpoints also carry it)
             self.save(self.step_num)
             self.ensure_params_requires_grad()
             flush()
@@ -211,9 +216,9 @@ class DiffusionTrainer(SDTrainer):
             with self._db_connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT sample_now FROM Job WHERE id = ?", (self.job_id,))
+                    f"SELECT sample_now FROM Job WHERE {self.fence.job_clause}", self.fence.params())
                 sample_now = cursor.fetchone()
-                return False if sample_now is None else sample_now[0] == 1
+                return self.fence.flag(sample_now, stop=False)
 
         return self._retry_db_operation(_check_sample)
 
@@ -225,8 +230,7 @@ class DiffusionTrainer(SDTrainer):
             if self.progress_bar is not None:
                 self.progress_bar.pause()
             print_acc(f"\nSampling at step {self.step_num}")
-            # clear any grads
-            self.optimizer.zero_grad()
+            # keep the unfinished accumulation window, as the periodic sample does
             if self.train_config.free_u:
                 self.sd.pipeline.disable_freeu()
             self.sample(self.step_num)
@@ -254,9 +258,10 @@ class DiffusionTrainer(SDTrainer):
                         value_to_insert = str(value)
 
                     # Use parameterized query for both the column name and value
-                    update_query = f"UPDATE Job SET {key} = ? WHERE id = ?"
+                    update_query = f"UPDATE Job SET {key} = ? WHERE {self.fence.job_clause}"
                     cursor.execute(
-                        update_query, (value_to_insert, self.job_id))
+                        update_query, self.fence.params(value_to_insert))
+                    self.fence.wrote(cursor)
                 finally:
                     cursor.execute("COMMIT")
 
@@ -283,14 +288,16 @@ class DiffusionTrainer(SDTrainer):
                 try:
                     if info is not None:
                         cursor.execute(
-                            "UPDATE Job SET status = ?, info = ? WHERE id = ?",
-                            (status, info, self.job_id)
+                            f"UPDATE Job SET status = ?, info = ? WHERE {self.fence.job_clause}",
+                            self.fence.params(status, info)
                         )
+                        self.fence.wrote(cursor)
                     else:
                         cursor.execute(
-                            "UPDATE Job SET status = ? WHERE id = ?",
-                            (status, self.job_id)
+                            f"UPDATE Job SET status = ? WHERE {self.fence.job_clause}",
+                            self.fence.params(status)
                         )
+                        self.fence.wrote(cursor)
                 finally:
                     cursor.execute("COMMIT")
 

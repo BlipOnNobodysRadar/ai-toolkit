@@ -343,7 +343,8 @@ def main():
 
     vocab = llm.get_output_embeddings().weight.shape[0]
 
-    from training_extras.optim import apply_run_length_defaults, create_optimizer, create_scheduler, evaluation_optimizer
+    from training_extras.optim import (apply_run_length_defaults, create_optimizer, create_scheduler,
+                                       enter_training_mode, evaluation_optimizer)
 
     if ratio != 1:
         groups=[{"params":[p for n,p in trainables if ".lora_B." not in n],"lr":a.lr},
@@ -362,6 +363,9 @@ def main():
         opt.load_state_dict(resume_state["optimizer"])
         set_rng_from_state(resume_state)
         log(f"resumed at step {start_step}")
+    # schedule-free: after load_state_dict an optimizer-level mode reads eval although the checkpoint holds training
+    # weights, and the loop's opt.train() would move them (docs/STATE_MACHINES.md, C12); a fresh one just flips the flag
+    enter_training_mode(opt)
     criterion = CaptionLoss(options.get("caption_loss", {}))
     use_kl = float(options.get("caption_loss", {}).get("kl_anchor", 0) or 0) > 0
 
@@ -519,6 +523,11 @@ def main():
 
     if not changed_any:
         raise SystemExit('No adapter tensor changed across this run; try enough steps to pass optimizer initialization, or inspect the configuration')
+    # The final checkpoint keeps TRAINING coordinates and is written before any final evaluation: an eval()/train()
+    # round trip is not an identity in bf16 (it moved 79/256 values in the CPU probe), and a run resumed from it with a
+    # larger --steps must continue from the trained values (--steps is not part of the options hash). Then one switch
+    # to evaluation coordinates, kept for the final loss, validation and the exported adapter (docs M15, C12).
+    checkpoint(a.steps)
     if callable(getattr(opt,"eval",None)):opt.eval()
     rec["final_train_loss"] = train_eval(a.steps)
     if val_rows and (not rec["validation_history"] or rec["validation_history"][-1]["step"] != a.steps):
@@ -527,9 +536,6 @@ def main():
     rec["peak_reserved_gib"] = torch.cuda.max_memory_reserved() / 2**30
     rec["runtime_s"] = time.time() - t0
 
-    if callable(getattr(opt,"train",None)):opt.train()
-    checkpoint(a.steps)
-    if callable(getattr(opt,"eval",None)):opt.eval()
     model.save_pretrained(out, safe_serialization=True)
     from safetensors.torch import load_file
     sd = load_file(os.path.join(out, "adapter_model.safetensors"))

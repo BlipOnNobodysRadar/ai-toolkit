@@ -153,15 +153,34 @@ def training_state(trainer, checkpoint_step):
     """Serialize unfinished microbatches, with the counter for the NEXT loop.
 
     Periodic saves precede the host's counter increment. UI/end-step/final
-    saves follow it. Completed loop metadata disambiguates those phases.
+    saves follow it. Completed loop metadata disambiguates those phases (an
+    OOM-skipped loop step counts as completed, see docs/STATE_MACHINES.md M1).
+    Pending gradients are read wherever they live: p.grad, or the hidden
+    stochastic-accumulation buffer of low-precision optimizers, whose location
+    is recorded so restore puts it back there.
     RNG, dataset iterators, and auxiliary optimizers are not captured here.
     """
+    from toolkit.memory_management.manager_modules import sync_grad_transfers
+    from toolkit.optimizers import pending_grads
+    gas = trainer.train_config.gradient_accumulation_steps
+    counter = trainer.grad_accumulation_step + int(checkpoint_step > trainer.step_num)
+    if counter < 1 or (gas != -1 and counter > max(1, gas)):
+        # restore_training_state would reject this pair; refuse to commit it as the resume point
+        raise ValueError(f'Refusing to checkpoint invalid RAWR accumulation position {counter} '
+                         f'(gradient_accumulation_steps={gas})')
+    # Memory-managed (offloaded) parameters get their grads by async D2H copies; join them before reading on the host.
+    sync_grad_transfers()
+    gradients, locations = [], []
+    for g in trainer.optimizer.param_groups:
+        captured = [pending_grads.capture(p) for p in g['params']]
+        gradients.append([None if grad is None else grad.detach().cpu().clone() for grad, _ in captured])
+        locations.append([location for _, location in captured])
     result = {
-        'gradient_accumulation_steps': trainer.train_config.gradient_accumulation_steps,
+        'gradient_accumulation_steps': gas,
         'gradient_accumulation': trainer.train_config.gradient_accumulation,
-        'next_accumulation_step': trainer.grad_accumulation_step + int(checkpoint_step > trainer.step_num),
-        'gradients': [[None if p.grad is None else p.grad.detach().cpu().clone()
-                       for p in g['params']] for g in trainer.optimizer.param_groups],
+        'next_accumulation_step': counter,
+        'gradients': gradients,
+        'gradient_locations': locations,
     }
     stochastic = getattr(trainer, '_rawr_stochastic', None)
     if stochastic is not None:
@@ -226,16 +245,30 @@ def restore_training_state(optimizer, captured, config, trainer_step):
     groups = optimizer.param_groups
     if not isinstance(gradients, list) or len(gradients) != len(groups):
         raise ValueError('Invalid RAWR gradient groups')
+    # Older pairs have no locations: their gradients were read from p.grad and go back there.
+    locations = state.get('gradient_locations')
+    if locations is None:
+        locations = [[None] * len(saved) if isinstance(saved, list) else None for saved in gradients]
+    from toolkit.optimizers import pending_grads
+    if not isinstance(locations, list) or len(locations) != len(groups):
+        raise ValueError('Invalid RAWR gradient locations')
     # Validate everything before changing any gradients.
-    for group, saved in zip(groups, gradients):
+    for group, saved, where in zip(groups, gradients, locations):
         if not isinstance(saved, list) or len(saved) != len(group['params']):
             raise ValueError('Invalid RAWR gradient parameter count')
+        if not isinstance(where, list) or len(where) != len(saved) or any(
+                w not in (None, pending_grads.GRAD, pending_grads.HIDDEN) for w in where):
+            raise ValueError('Invalid RAWR gradient locations')
         for p, grad in zip(group['params'], saved):
             if grad is not None and (not torch.is_tensor(grad) or grad.shape != p.shape or grad.dtype != p.dtype):
                 raise ValueError('Invalid RAWR gradient shape or dtype')
-    for group, saved in zip(groups, gradients):
-        for p, grad in zip(group['params'], saved):
-            p.grad = None if grad is None else grad.to(device=p.device).clone()
+    # A hidden buffer only means something to an optimizer that consumes it; anything else gets p.grad.
+    hidden_ok = isinstance(getattr(optimizer, 'optimizer', optimizer), pending_grads.PendingGradZeroGradMixin)
+    for group, saved, where in zip(groups, gradients, locations):
+        for p, grad, location in zip(group['params'], saved, where):
+            if location == pending_grads.HIDDEN and not hidden_ok:
+                location = pending_grads.GRAD
+            pending_grads.restore(p, None if grad is None else grad.to(device=p.device).clone(), location)
     return counter
 
 

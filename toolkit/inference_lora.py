@@ -18,11 +18,14 @@ The holder's convert_lora_weights_before_load hook runs first, so archs with
 their own conversions (anima, ltx2, hidream_o1) keep working.
 """
 
+import math
 import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
 from safetensors.torch import load_file
+
+from toolkit.cache_identity import cache_key_digest, file_generation
 
 _A_SUFFIXES = (".lora_A.weight", ".lora_down.weight", ".lora_A.default.weight")
 _B_SUFFIXES = (".lora_B.weight", ".lora_up.weight", ".lora_B.default.weight")
@@ -156,6 +159,40 @@ class InferenceLoRA:
         self.num_skipped_keys = 0  # keys with no recognized lora/diff/lokr suffix
         self.convert_error: Optional[str] = None
         self._hooks: List = []
+        # Admission-time generation of the file actually loaded.  A loaded
+        # stack keeps this value so merge-cleanup tags remain stable even after
+        # the path is replaced; an unloaded desired stack reads the current
+        # generation when its key is requested.
+        self._loaded_file_generation: Optional[dict] = None
+
+    def _local_generation_path(self) -> Optional[str]:
+        """Best local path for admission, without downloading a hub reference."""
+        if self.local_path and os.path.isfile(self.local_path):
+            return self.local_path
+        if os.path.isfile(self.path):
+            return self.path
+        try:
+            from toolkit.models.v2.resolver import MODELS_PATH
+            splits = self.path.split("/")
+            rel_path = "/".join(splits[2:]) if len(splits) >= 3 else splits[-1]
+            filename = splits[-1]
+            for candidate in (
+                os.path.join(MODELS_PATH, "loras", rel_path),
+                os.path.join(MODELS_PATH, rel_path),
+                os.path.join(MODELS_PATH, "loras", filename),
+                os.path.join(MODELS_PATH, self.path),
+            ):
+                if os.path.isfile(candidate):
+                    return candidate
+        except Exception:
+            pass
+        return None
+
+    def _key_generation(self) -> Optional[dict]:
+        if self._loaded_file_generation is not None:
+            return self._loaded_file_generation
+        local = self._local_generation_path()
+        return file_generation(local) if local is not None else None
 
     # ---- loading / key resolution ----
     def load(self, holder, status_fn=None) -> "InferenceLoRA":
@@ -168,7 +205,19 @@ class InferenceLoRA:
         self.local_path = resolve_lora_file(self.path, status_fn=status_fn)
         if status_fn:
             status_fn(f"Loading LoRA {self.name} from {self.local_path}")
+        # Bind the loaded weights to one file generation.  A replacement during
+        # load_file must not be accepted as a stable snapshot.  The stat is
+        # deliberately metadata-only: a same-size/mtime/inode rewrite cannot be
+        # detected, and the engine's reload key is no stronger than that.
+        generation_before = file_generation(self.local_path)
         sd = load_file(self.local_path)
+        generation_after = file_generation(self.local_path)
+        if generation_before != generation_after:
+            raise RuntimeError(
+                f"LoRA file changed while it was being loaded: {self.local_path}; "
+                "refusing to bind an unverified snapshot"
+            )
+        self._loaded_file_generation = generation_after
         self.num_keys = len(sd)
         convert = getattr(holder, "convert_lora_weights_before_load", None)
         if callable(convert):
@@ -216,6 +265,16 @@ class InferenceLoRA:
             ks = e.kron_shape()
             if ks is not None and w_shape is not None and len(w_shape) == 2 and tuple(ks) != tuple(w_shape):
                 self.unmatched.append(f"{base} (lokr shape {ks} vs {tuple(w_shape)})")
+                continue
+            # full-weight diffs: merge reshapes to the weight, hooks multiply by it as (out, in); refuse a mismatch
+            # here rather than fail half way through merging
+            if e.diff is not None and w_shape is not None and (
+                    e.diff.numel() != math.prod(w_shape) or (len(w_shape) == 2 and tuple(e.diff.shape) != tuple(w_shape))):
+                self.unmatched.append(f"{base} (diff shape {tuple(e.diff.shape)} vs {tuple(w_shape)})")
+                continue
+            b_shape = getattr(getattr(module, "bias", None), "shape", None)
+            if e.diff_b is not None and b_shape is not None and tuple(e.diff_b.shape) != tuple(b_shape):
+                self.unmatched.append(f"{base} (diff_b shape {tuple(e.diff_b.shape)} vs {tuple(b_shape)})")
                 continue
             if e.A is None and e.kron is None and e.diff is None and e.diff_b is None:
                 continue
@@ -451,7 +510,14 @@ class LoRAStack:
         self.loras: List[InferenceLoRA] = []
 
     def key(self) -> str:
-        return "|".join(f"{l.path}@{l.strength:.4f}" for l in self.loras) + f"#{self.mode}"
+        # Loaded entries use their bound generation; unloaded desired entries use
+        # the current local generation.  That lets an engine's desired-key check
+        # see a replaced file, while the old stack's key (and merge tag) stays
+        # stable until cleanup has evicted the exact prior set.
+        return "|".join(
+            f"{l.path}@{l.strength:.4f}@{cache_key_digest(l._key_generation())}"
+            for l in self.loras
+        ) + f"#{self.mode}"
 
     def load(self, specs: List[dict], status_fn=None):
         for spec in specs:
@@ -495,6 +561,11 @@ class LoRAStack:
             return False
         for lora, spec in zip(self.loras, specs):
             if spec["path"] != lora.path:
+                return False
+            # The file generation bound at load time must still be the current
+            # generation.  If the path was replaced, in-place strength update
+            # would keep the old weights behind the new name; force a reload.
+            if file_generation(lora.local_path or lora.path) != lora._loaded_file_generation:
                 return False
         for lora, spec in zip(self.loras, specs):
             lora.strength = float(spec.get("strength", 1.0))

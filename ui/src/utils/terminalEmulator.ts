@@ -112,6 +112,29 @@ export class TerminalEmulator {
     }
   }
 
+  // Cursor down that keeps the MAX_LINES scrollback cap: rows that would scroll off the top are dropped (existing ones)
+  // or never created (the part of a long jump's gap above the kept window), so ESC[100000B cannot allocate 100000 rows.
+  private moveDown(count: number): void {
+    if (!(count < 2 * MAX_LINES)) {
+      // Even from the top row, a jump this large scrolls every existing row off (also Infinity/NaN from an
+      // absurd parameter). Smaller jumps must account for the current cursor position before discarding rows.
+      this.lines = new Array(MAX_LINES).fill('');
+      this.row = MAX_LINES - 1;
+      return;
+    }
+    const target = this.row + Math.max(0, count);
+    const total = Math.max(this.lines.length, target + 1); // the length an uncapped grid would reach
+    const excess = Math.max(0, total - MAX_LINES);
+    if (excess > 0) {
+      this.lines.splice(0, Math.min(excess, this.lines.length));
+    }
+    const kept = total - excess;
+    while (this.lines.length < kept) {
+      this.lines.push('');
+    }
+    this.row = target - excess;
+  }
+
   private ensureRow(): void {
     while (this.lines.length <= this.row) {
       this.lines.push('');
@@ -178,8 +201,7 @@ export class TerminalEmulator {
       case 'B': // cursor down
       case 'e':
       case 'E': // cursor to start of next line
-        this.row += arg(0, 1);
-        this.ensureRow();
+        this.moveDown(arg(0, 1));
         if (final === 'E') this.col = 0;
         break;
       case 'C': // cursor forward

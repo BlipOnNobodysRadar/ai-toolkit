@@ -2,9 +2,14 @@
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 
-// if route starts with these, approve
-// album art is fetched by plain <img> tags, which cannot send the bearer token
-const publicRoutes = ['/api/img/', '/api/files/', '/api/audio/art/'];
+// Album art and dataset media are fetched by plain <img>/<video> tags, which cannot send the bearer token. These are
+// read-only exemptions only: a mutating route must never become public merely because it shares a prefix.
+const publicReadPrefixes = ['/api/img/', '/api/files/', '/api/audio/art/'];
+const PUBLIC_READ_METHODS = new Set(['GET', 'HEAD']);
+
+const isPublicRead = (request: NextRequest) =>
+  PUBLIC_READ_METHODS.has(request.method.toUpperCase()) &&
+  publicReadPrefixes.some(route => request.nextUrl.pathname.startsWith(route));
 
 export function middleware(request: NextRequest) {
   // check env var for AI_TOOLKIT_AUTH, if not set, approve all requests
@@ -17,8 +22,8 @@ export function middleware(request: NextRequest) {
   // Get the token from the headers
   const token = request.headers.get('Authorization')?.split(' ')[1];
 
-  // allow public routes to pass through
-  if (publicRoutes.some(route => request.nextUrl.pathname.startsWith(route))) {
+  // allow public read routes to pass through
+  if (isPublicRead(request)) {
     return NextResponse.next();
   }
 

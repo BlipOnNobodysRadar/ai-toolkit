@@ -44,28 +44,61 @@ def _paths(root, slot):
     return os.path.join(base, 'model.safetensors'), os.path.join(base, 'optimizer.pt')
 
 
-def begin(trainer):
-    if getattr(trainer, '_rawr_checkpoint_config', None) is None:
-        return None
-    previous = _manifest(trainer.save_root)
+def refuse_stale_manifest(root):
+    """Ordinary (non-RAWR) training must not share a folder with a committed pair: the manifest would stay the
+    resume point, so switching back to RAWR later would silently rewind past this run's saves. The pair is the
+    user's data, so refuse instead of deleting or renaming it."""
+    if _manifest(root) is not None:
+        raise ValueError(f'{root} holds a committed RAWR resume pair ({MANIFEST}). Training here without the RAWR '
+                         'scheduler would leave that pair as the resume point, and a later RAWR resume would discard '
+                         'this run. Use a new output folder, or keep the RAWR scheduler.')
+
+
+def _pair_mode(trainer):
     # Learnable SNR state now travels in the pair either way (recorded-state path or training_state['snr']);
     # only custom SNR classes, whose state isn't captured, keep the pair off.
     from training_extras.rawr_stochastic import snr_capturable
-    if (trainer.network is None or trainer.is_fine_tuning
-            or trainer.train_config.merge_network_on_save
-            or not snr_capturable(trainer)
-            # training_extras state (EDM2 etc.) travels in the pair as a third, hashed file (commit extras=).
-            or any(getattr(trainer, attr, None) is not None for attr in
-                   ('embedding', 'adapter', 'decorator', 'ema'))):
+    return not (trainer.network is None or trainer.is_fine_tuning
+                or trainer.train_config.merge_network_on_save
+                or not snr_capturable(trainer)
+                # training_extras state (EDM2 etc.) travels in the pair as a third, hashed file (commit extras=).
+                or any(getattr(trainer, attr, None) is not None for attr in
+                       ('embedding', 'adapter', 'decorator', 'ema')))
+
+
+def _split_lora_layout(trainer):
+    declared = getattr(getattr(trainer, 'sd', None), 'lora_save_suffixes', None)
+    return declared is not None and tuple(declared()) != ('',)
+
+
+def refuse_unsupported_writer(trainer):
+    """A pair slot is one model file; a model whose save_lora splits a LoRA (Wan 2.2 14B with split_multistage_loras)
+    writes other files, and commit then aborted the run at its first save (docs/STATE_MACHINES.md, OPUS-RAWR-01).
+    Called at startup and again by begin, before anything is written."""
+    if getattr(trainer, '_rawr_checkpoint_config', None) is None or not _pair_mode(trainer):
+        return
+    if _split_lora_layout(trainer):
+        raise ValueError('RAWR resume pairs need the LoRA in one file, but this model saves it split '
+                         '(_high_noise/_low_noise). Set network.split_multistage_loras: false, or use another '
+                         'learning-rate scheduler')
+
+
+def begin(trainer):
+    if getattr(trainer, '_rawr_checkpoint_config', None) is None:
+        refuse_stale_manifest(trainer.save_root)
+        return None
+    previous = _manifest(trainer.save_root)
+    if not _pair_mode(trainer):
         if previous is not None:
             raise ValueError('Cannot replace a committed RAWR pair with an unsupported save mode; use a new output folder')
         return None
+    refuse_unsupported_writer(trainer)
     slot = 'b' if previous is not None and previous['slot'] == 'a' else 'a'
     model, optimizer = _paths(trainer.save_root, slot)
     os.makedirs(os.path.dirname(model), exist_ok=True)
     # A crash between creating an alias temp and replacing the alias leaves a .rawr-export.* name, which as a hard
-    # link pins a whole old optimizer (and atomic_save can leave .optimizer.*.tmp). One trainer writes a save root,
-    # so nothing else can own these at the start of a save.
+    # link pins a whole old optimizer (and atomic_save can leave .optimizer.*.tmp). The save-root lease
+    # (toolkit/save_root_lease.py) makes this trainer the folder's only writer, so nothing else owns these now.
     for stale in (glob.glob(os.path.join(glob.escape(trainer.save_root), '.rawr-export.*'))
                   + glob.glob(os.path.join(glob.escape(os.path.dirname(model)), '.optimizer.*.tmp'))):
         try:

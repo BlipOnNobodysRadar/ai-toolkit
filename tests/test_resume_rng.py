@@ -32,6 +32,10 @@ CASES = {
     "epoch_boundary_b2_ga2": ([(64, 64)] * 8, {"batch_size": 2, "gradient_accumulation": 2}, 8, 3),
     "two_buckets_b2": ([(64, 64)] * 4 + [(64, 96)] * 4, {"batch_size": 2}, 10, 4),
     "non_rawr": ([(64, 64)] * 6, {"lr_scheduler": "constant"}, 12, 4),
+    # whole-epoch windows (C13): epochs of 5 update at steps 4 and 9, the last step (10) applies its partial window;
+    # saved right after the step-9 update. Non-RAWR: RAWR refuses -1 resume. (gradient_accumulation > 1 cannot be
+    # combined with -1: TrainConfig rejects it.)
+    "whole_epoch": ([(64, 64)] * 5, {"lr_scheduler": "constant", "gradient_accumulation_steps": -1}, 11, 9),
 }
 
 
@@ -52,10 +56,13 @@ def _config(tmp, name, train, steps, save_every):
 
 
 def _run(cfg, evidence, *extra):
-    env = dict(os.environ, ACCELERATE_USE_CPU="true", CUDA_VISIBLE_DEVICES="")
+    # -1, not "": on this Windows PyTorch build an empty value leaves the GPUs visible and the probe initialized CUDA
+    env = dict(os.environ, ACCELERATE_USE_CPU="true", CUDA_VISIBLE_DEVICES="-1")
     subprocess.run([sys.executable, str(REPO / "testing" / "resume_rng_probe.py"), "--repo", str(REPO), "--config", str(cfg),
                     "--evidence", str(evidence), *extra], check=True, env=env, cwd=REPO, timeout=1500,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # CPU probe: it must never have created a CUDA context (an empty CUDA_VISIBLE_DEVICES once did)
+    assert json.loads((evidence / "result.json").read_text(encoding="utf-8"))["cuda_initialized"] is False
     return [json.loads(line) for line in (evidence / "draws.jsonl").read_text(encoding="utf-8").splitlines()]
 
 

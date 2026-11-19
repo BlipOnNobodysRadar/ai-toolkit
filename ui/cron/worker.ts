@@ -1,5 +1,13 @@
 import processQueue from './actions/processQueue';
+import { launchesInFlight } from './actions/startJob';
 import prisma from './prisma';
+import { TOOLKIT_ROOT, getTrainingFolder } from './paths';
+import { resolvePythonPath } from './pythonPath';
+import { makeProcCtl } from './ownership/procctl';
+import { WorkerSelf, reconcile } from './ownership/reconcile';
+
+const procctl = makeProcCtl(resolvePythonPath(), TOOLKIT_ROOT);
+const backstopAttempts = new Map<string, number>();
 
 // Journal mode for the main sqlite db. WAL keeps readers from blocking while
 // the trainer/worker write, which is what we want on a local disk. Users on
@@ -62,8 +70,33 @@ class CronWorker {
     this.is_running = false;
   }
 
+  tick = 0;
+  // this worker's pid@creation and boot identity: recorded on every run it admits, so a later worker can prove it
+  // gone (and a restart can prove the run gone)
+  self: WorkerSelf | null = null;
+
   async loop() {
-    await processQueue();
+    if (!this.self) {
+      const me = await procctl.self(process.pid);
+      if (!me) {
+        console.error('Cannot read this worker process identity; not reconciling or admitting jobs this tick.');
+        return;
+      }
+      this.self = { pid: process.pid, identity: me.identity, boot_id: me.boot_id };
+    }
+    const self = this.self;
+    // reconcile before admission, every tick (the first tick is the startup pass)
+    await reconcile({
+      db: prisma,
+      procctl,
+      self,
+      inFlight: launchesInFlight,
+      trainingRoot: await getTrainingFolder(),
+      tick: this.tick++,
+      backstopAttempts,
+      log: message => console.warn(message),
+    });
+    await processQueue(self);
   }
 }
 

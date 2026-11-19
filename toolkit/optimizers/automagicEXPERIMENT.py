@@ -6,6 +6,7 @@ from toolkit.optimizers.optimizer_utils import (
     copy_stochastic,
     stochastic_grad_accummulation,
 )
+from toolkit.optimizers.pending_grads import PendingGradZeroGradMixin
 from toolkit.util.convrot_quant import (
     largest_pow4_divisor,
     quantize_int8_rows_fused,
@@ -74,7 +75,7 @@ class _ConvRot8State:
         return self
 
 
-class AutomagicEXPERIMENT(torch.optim.Optimizer):
+class AutomagicEXPERIMENT(PendingGradZeroGradMixin, torch.optim.Optimizer):
     """
     Automagic3's learning-rate controller with a FULL per-element second
     moment (AdamW-style, stored in ConvRot int8) instead of Adafactor's
@@ -202,6 +203,11 @@ class AutomagicEXPERIMENT(torch.optim.Optimizer):
             for param in group['params']:
                 total += torch.numel(param)
         print(f"Total training paramiters: {total:,}")
+
+    @property
+    def steps_in_backward(self):
+        # fused updates happen inside backward; the trainer refuses multi-backward accumulation for them
+        return bool(self.fused)
 
     # ------------------------------------------------------------------ utils
 

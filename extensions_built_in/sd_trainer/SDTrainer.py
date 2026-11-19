@@ -22,6 +22,7 @@ from toolkit.image_utils import show_tensors, show_latents
 from toolkit.ip_adapter import IPAdapter
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.memory_management import sync_grad_transfers
+from toolkit.optimizers import pending_grads
 from toolkit.print import print_acc
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
@@ -31,6 +32,7 @@ from toolkit.train_tools import get_torch_dtype, apply_snr_weight, add_all_snr_t
 import gc
 import torch
 from jobs.process import BaseSDTrainProcess
+from jobs.process.BaseSDTrainProcess import mark_update_commit
 from torchvision import transforms
 from diffusers import EMAModel
 import math
@@ -58,6 +60,7 @@ def latent_mask_multiplier(mask: torch.Tensor, latent_shape, mode: str = 'neares
     # latents are B,C,H,W or video B,C,T,H,W
     h, w = latent_shape[-2], latent_shape[-1]
     mask = mask.to(dtype=torch.float32).detach()
+    has_support = (mask > 0).any()
     if mode == 'area':
         mask = torch.nn.functional.interpolate(mask, size=(h, w), mode='area')
     elif mode == 'nearest':
@@ -66,11 +69,24 @@ def latent_mask_multiplier(mask: torch.Tensor, latent_shape, mode: str = 'neares
         raise ValueError(f"mask_resize_mode must be 'nearest' or 'area', got {mode!r}")
     mask = mask.expand(-1, latent_shape[1], -1, -1)
     # make avg 1.0 (float32: bf16 normalisation rounds each weight by up to ~0.4%)
-    return (mask / mask.mean()).detach()
+    return _mean_one(mask, has_support).detach()
+
+
+def _mean_one(weight, has_support):
+    """weight / weight.mean(); all zeros when the mask leaves nothing to weight (no pixel in support, or no mass
+    after resizing), so such a batch contributes zero loss instead of 0/0 = NaN weights (docs/STATE_MACHINES.md,
+    INV-MASK-01). Support is read from the pixel mask: resizing to a non-integer factor leaves float residue (up to
+    ~4e-3 in bf16) where the mask is all one. Chosen on the device, without a host sync; ordinary masks are unchanged
+    bit for bit."""
+    mass = weight.mean()
+    usable = has_support & (mass > 0)
+    return torch.where(usable, weight / torch.where(usable, mass, torch.ones_like(mass)), torch.zeros_like(weight))
 
 
 def inverted_prior_mask_multiplier(mask: torch.Tensor, latent_shape, pred_shape) -> torch.Tensor:
     """Pixel mask (B,1,H,W) -> mean-1 prior-preservation weight (1 - mask), per sample, shaped like pred."""
+    # the prior region is where the subject mask is below one
+    has_support = (mask < 1).any()
     # resize to size of noise_pred (latents are B,C,H,W or video B,C,T,H,W)
     prior_mask = torch.nn.functional.interpolate(mask, size=(latent_shape[-2], latent_shape[-1]), mode='bicubic')
     # stack the mask channel to match channels of noise_pred; keep every batch item's own mask
@@ -79,8 +95,8 @@ def inverted_prior_mask_multiplier(mask: torch.Tensor, latent_shape, pred_shape)
         prior_mask = prior_mask.unsqueeze(2)  # add time dimension back for video
         prior_mask = prior_mask.repeat(1, 1, pred_shape[2], 1, 1)
     prior_mask_multiplier = 1.0 - prior_mask
-    # scale so it is a mean of 1
-    return prior_mask_multiplier / prior_mask_multiplier.mean()
+    # scale so it is a mean of 1 (a mask covering everything leaves no prior region: all zero, not NaN)
+    return _mean_one(prior_mask_multiplier, has_support)
 
 
 class SDTrainer(BaseSDTrainProcess):
@@ -1315,20 +1331,33 @@ class SDTrainer(BaseSDTrainProcess):
             v_target.float(),
             reduction='none'
         )
-
-        with torch.no_grad():
-            pure_loss = loss.mean().detach()
-            pure_loss.requires_grad_(True)
-
-        loss = loss.mean()
-        if loss.item() > 1e3:
-            pass
-        self.accelerator.backward(loss)
-        return pure_loss
+        # Per-sample dataset weights, as calculate_loss applies them. The caller owns the rest, as for every other
+        # loss: the non-finite check, the reg weight, the accumulation scale and the single backward. A backward here
+        # (returning a detached stand-in) gave the parameters the unweighted, unscaled gradient, and a NaN loss its
+        # gradients before the caller's check (docs/STATE_MACHINES.md, OPUS-MF-01).
+        loss = loss.mean(dim=list(range(1, loss.dim())))
+        loss = loss * torch.tensor(batch.loss_multiplier_list, device=loss.device, dtype=loss.dtype)
+        return loss.mean()
 
 
 
-    def get_prior_prediction(
+    def get_prior_prediction(self, *args, **kwargs):
+        # The prior pass switches the network/adapter off and the unet to eval. A tolerated OOM inside it must not
+        # leave them that way for the rest of training (docs/STATE_MACHINES.md, SM-05).
+        was_unet_training = self.sd.unet.training
+        was_network_active = self.network.is_active if self.network is not None else None
+        was_adapter_active = getattr(self.adapter, 'is_active', None) if self.adapter is not None else None
+        try:
+            return self._get_prior_prediction(*args, **kwargs)
+        finally:
+            if was_unet_training:
+                self.sd.unet.train()
+            if was_network_active is not None:
+                self.network.is_active = was_network_active
+            if was_adapter_active is not None:
+                self.adapter.is_active = was_adapter_active
+
+    def _get_prior_prediction(
             self,
             noisy_latents: torch.Tensor,
             conditional_embeds: PromptEmbeds,
@@ -2363,27 +2392,33 @@ class SDTrainer(BaseSDTrainProcess):
 
                         loss = loss + preservation_loss
 
-                # check if nan
-                if not torch.isfinite(loss):
-                    print_acc("loss is nan")
-                    loss = torch.zeros_like(loss).requires_grad_(True)
-
-                with self.timer('backward'):
-                    # todo we have multiplier seperated. works for now as res are not in same batch, but need to change
-                    loss = loss * loss_multiplier.mean()
-                    # IMPORTANT if gradient checkpointing do not leave with network when doing backward
-                    # it will destroy the gradients. This is because the network is a context manager
-                    # and will change the multipliers back to 0.0 when exiting. They will be
-                    # 0.0 for the backward pass and the gradients will be 0.0
-                    # I spent weeks on fighting this. DON'T DO IT
-                    # with fsdp_overlap_step_with_backward():
-                    # if self.is_bfloat:
-                    # loss.backward()
-                    # else:
-                    self.accelerator.backward(loss * accum_scale if accum_scale != 1.0 else loss)
+                # IMPORTANT if gradient checkpointing do not leave with network when doing backward
+                # it will destroy the gradients. This is because the network is a context manager
+                # and will change the multipliers back to 0.0 when exiting. They will be
+                # 0.0 for the backward pass and the gradients will be 0.0
+                # I spent weeks on fighting this. DON'T DO IT
+                loss = self.backward_weighted_loss(loss, loss_multiplier, accum_scale)
 
         return loss.detach()
         # flush()
+
+    def backward_weighted_loss(self, loss, loss_multiplier, accum_scale):
+        """The one backward of a microbatch, for every loss path (mean flow included): a non-finite loss becomes a
+        zero, then the reg weight and the accumulation scale apply exactly once. Returns the weighted loss."""
+        # check if nan
+        if not torch.isfinite(loss):
+            print_acc("loss is nan")
+            loss = torch.zeros_like(loss).requires_grad_(True)
+
+        with self.timer('backward'):
+            # todo we have multiplier seperated. works for now as res are not in same batch, but need to change
+            loss = loss * loss_multiplier.mean()
+            # with fsdp_overlap_step_with_backward():
+            # if self.is_bfloat:
+            # loss.backward()
+            # else:
+            self.accelerator.backward(loss * accum_scale if accum_scale != 1.0 else loss)
+        return loss
 
     def hook_train_loop(self, batch: Union[DataLoaderBatchDTO, List[DataLoaderBatchDTO]]):
         if isinstance(batch, list):
@@ -2428,6 +2463,8 @@ class SDTrainer(BaseSDTrainProcess):
             sync_grad_transfers()
             # fix this for multi params
             if self.train_config.optimizer != 'adafactor' and self.train_config.max_grad_norm > 0:
+                # low-precision optimizers hold the accumulated grads in a hidden buffer; clipping must see them
+                pending_grads.materialize(self.optimizer)
                 if isinstance(self.params[0], dict):
                     for i in range(len(self.params)):
                         self.accelerator.clip_grad_norm_(self.params[i]['params'], self.train_config.max_grad_norm)
@@ -2435,6 +2472,7 @@ class SDTrainer(BaseSDTrainProcess):
                     self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
+                mark_update_commit(self, 'optimizer.step()')
                 self.optimizer.step()
                 if getattr(self, 'training_extras', None) is not None:
                     self.training_extras.step()
@@ -2451,6 +2489,7 @@ class SDTrainer(BaseSDTrainProcess):
 
         # TODO Should we only step scheduler on grad step? If so, need to recalculate last step
         with self.timer('scheduler_step'):
+            mark_update_commit(self, 'the scheduler step')
             self.lr_scheduler.step()
 
         if self.embedding is not None:

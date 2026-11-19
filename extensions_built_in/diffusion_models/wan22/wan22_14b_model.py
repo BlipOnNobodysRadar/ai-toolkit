@@ -234,16 +234,13 @@ class Wan2214bModel(Wan21):
         # names are relative to each individual transformer (they quantize separately)
         return ["condition_embedder*", "proj_out*"]
 
-    @property
-    def max_step_saves_to_keep_multiplier(self):
-        # the cleanup mechanism checks this to see how many saves to keep
-        # if we are training a LoRA, we need to set this to 2 so we keep both the high noise and low noise LoRAs at saves to keep
-        if (
-            self.network is not None
-            and self.network.network_config.split_multistage_loras
-        ):
-            return 2
-        return 1
+    def lora_save_suffixes(self):
+        # the files save_lora writes for one LoRA save: resume discovery and pruning treat them as one save, complete
+        # only when every one exists (docs/STATE_MACHINES.md, OPUS-RES-01)
+        if not self.network.network_config.split_multistage_loras:
+            return ('',)
+        return tuple(suffix for suffix, trained in (('_high_noise', self.train_high_noise),
+                                                    ('_low_noise', self.train_low_noise)) if trained)
 
     def load_model(self):
         # load model from patent parent. Wan21 not immediate parent

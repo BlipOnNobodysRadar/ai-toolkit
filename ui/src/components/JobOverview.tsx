@@ -4,7 +4,7 @@ import useCPUInfo from '@/hooks/useCPUInfo';
 import GPUWidget from '@/components/GPUWidget';
 import CPUWidget from '@/components/CPUWidget';
 import FilesWidget from '@/components/FilesWidget';
-import { getTotalSteps } from '@/utils/jobs';
+import { displayStatus, getTotalSteps } from '@/utils/jobs';
 import { Cpu, HardDrive, Info, Gauge } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import useJobLog from '@/hooks/useJobLog';
@@ -29,7 +29,6 @@ export default function JobOverview({ job }: JobOverviewProps) {
   const { cpuInfo, isCPUInfoLoaded } = useCPUInfo(5000);
   const totalSteps = getTotalSteps(job);
   const progress = (job.step / totalSteps) * 100;
-  const isStopping = job.stop && job.status === 'running';
 
   const logLines: string[] = useMemo(() => {
     // Log is already terminal-rendered by useJobLog — one entry per line.
@@ -65,6 +64,11 @@ export default function JobOverview({ job }: JobOverviewProps) {
     switch (status.toLowerCase()) {
       case 'running':
         return 'bg-emerald-500/10 text-emerald-500';
+      case 'starting':
+        return 'bg-sky-500/10 text-sky-400';
+      case 'deleting':
+      case 'delete_failed':
+        return 'bg-rose-500/10 text-rose-400';
       case 'stopping':
         return 'bg-amber-500/10 text-amber-500';
       case 'stopped':
@@ -80,10 +84,6 @@ export default function JobOverview({ job }: JobOverviewProps) {
 
   const jobType = job?.job_type || 'unknown';
 
-  let status = job.status;
-  if (isStopping) {
-    status = 'stopping';
-  }
 
   return (
     <div className="grid grid-cols-1 gap-4 md:gap-6 md:grid-cols-3">
@@ -93,8 +93,12 @@ export default function JobOverview({ job }: JobOverviewProps) {
           <h2 className="text-gray-100">
             <Info className="w-5 h-5 mr-2 -mt-1 text-amber-600 dark:text-amber-400 inline-block" /> {job.info}
           </h2>
-          <span className={`px-3 py-1 rounded-full text-sm ${getStatusColor(job.status)}`}>{job.status}</span>
+          <span className={`px-3 py-1 rounded-full text-sm ${getStatusColor(job.status)}`}>{displayStatus(job)}</span>
         </div>
+        {job.ownership_note ? (
+          // why the job still owns its GPUs/folder (or why it is waiting for them)
+          <div className="px-4 py-2 text-sm text-amber-300 bg-amber-500/5 border-b border-gray-800">{job.ownership_note}</div>
+        ) : null}
 
         <div className="p-4 space-y-6 flex flex-col flex-grow">
           {/* Progress Bar */}
