@@ -17,7 +17,7 @@ const getNotesPath = async (jobID: string): Promise<string | null> => {
   return path.join(trainingFolder, job.name, 'notes.md');
 };
 
-export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
+export async function GET(request: NextRequest, { params }: { params: Promise<{ jobID: string }> }) {
   const { jobID } = await params;
   const notesPath = await getNotesPath(jobID);
 
@@ -35,7 +35,7 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
   return NextResponse.json({ content });
 }
 
-export async function POST(request: NextRequest, { params }: { params: { jobID: string } }) {
+export async function POST(request: NextRequest, { params }: { params: Promise<{ jobID: string }> }) {
   const { jobID } = await params;
   const notesPath = await getNotesPath(jobID);
 

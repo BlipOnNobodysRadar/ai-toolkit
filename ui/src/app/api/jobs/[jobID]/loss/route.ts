@@ -56,7 +56,7 @@ const gzip = promisify(zlib.gzip);
 // {steps: number[], values: (number|null)[]}}}. Points with step >= since_step
 // are included (default 0 = everything). The body is gzipped when the client
 // accepts it; a 150k-step run with a dozen keys is tens of MB uncompressed.
-export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
+export async function GET(request: NextRequest, { params }: { params: Promise<{ jobID: string }> }) {
   // this must be awaited to avoid TS error
   const { jobID } = await params;
 
@@ -122,7 +122,7 @@ function run(db: sqlite3.Database, sql: string, params: any[] = []) {
 
 // Delete every logged step in [min_step, max_step] (inclusive) across all
 // metric keys. Used by the loss graph's "Delete Selected Range" action.
-export async function DELETE(request: NextRequest, { params }: { params: { jobID: string } }) {
+export async function DELETE(request: NextRequest, { params }: { params: Promise<{ jobID: string }> }) {
   const { jobID } = await params;
 
   const job = await prisma.job.findUnique({ where: { id: jobID } });

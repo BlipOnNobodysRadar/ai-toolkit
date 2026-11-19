@@ -454,7 +454,9 @@ export const readJobReportDownload = async (
       throw new PreferenceFeedbackError('The requested report file is not a regular file.', 403, 'UNSAFE_REPORT_FILE');
     }
     return {
-      stream: handle.createReadStream(),
+      // Pin the stream to the size observed on the already-open handle so append-only reports cannot exceed
+      // the Content-Length sent to the browser.
+      stream: opened.size > 0 ? handle.createReadStream({ start: 0, end: opened.size - 1 }) : handle.createReadStream(),
       size: opened.size,
       fileName: reportName,
       contentType: REPORT_CONTENT_TYPES[reportName],

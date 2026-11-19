@@ -7,7 +7,7 @@ import { deleteJob } from '../../../../../../cron/ownership/store';
 // (case-insensitive where the file system is, through junctions), then folder removal, then the row. The whole
 // operation runs under the job's crash-released deletion lock (ownership/store.ts deleteJob): an interrupted or failed
 // deletion is resumed by the next Delete, and a Delete while another is running is refused (409).
-export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
+export async function GET(request: NextRequest, { params }: { params: Promise<{ jobID: string }> }) {
   const { jobID } = await params;
   const out = await deleteJob(prisma, jobID, await getTrainingFolder());
   return NextResponse.json(out.body, { status: out.status });

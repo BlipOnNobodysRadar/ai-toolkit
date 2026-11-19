@@ -12,7 +12,7 @@ export const revalidate = 0;
 
 const noStore = { 'Cache-Control': 'no-store, max-age=0' };
 
-export async function GET(_request: NextRequest, { params }: { params: Promise<{ jobID: string }> | { jobID: string } }) {
+export async function GET(_request: NextRequest, { params }: { params: Promise<{ jobID: string }> }) {
   const { jobID } = await params;
   if (!isUuidV4(jobID)) {
     return NextResponse.json({ error: 'Invalid job id.' }, { status: 400, headers: noStore });

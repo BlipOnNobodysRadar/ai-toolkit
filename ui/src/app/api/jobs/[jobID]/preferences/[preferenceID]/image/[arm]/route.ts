@@ -15,7 +15,7 @@ const noStore = { 'Cache-Control': 'no-store, max-age=0' };
 
 export async function GET(
   _request: NextRequest,
-  { params }: { params: Promise<{ jobID: string; preferenceID: string; arm: string }> | { jobID: string; preferenceID: string; arm: string } },
+  { params }: { params: Promise<{ jobID: string; preferenceID: string; arm: string }> },
 ) {
   const { jobID, preferenceID, arm } = await params;
   if (!isUuidV4(jobID)) {

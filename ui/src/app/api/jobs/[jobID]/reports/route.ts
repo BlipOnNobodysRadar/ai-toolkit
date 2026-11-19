@@ -15,7 +15,7 @@ const noStore = { 'Cache-Control': 'no-store, max-age=0' };
 // The only paths read are fixed names inside this job's own verified run folder.
 export async function GET(
   _request: NextRequest,
-  { params }: { params: Promise<{ jobID: string }> | { jobID: string } },
+  { params }: { params: Promise<{ jobID: string }> },
 ) {
   const { jobID } = await params;
   if (!isUuidV4(jobID)) {

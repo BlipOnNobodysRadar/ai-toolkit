@@ -15,7 +15,7 @@ const noStore = { 'Cache-Control': 'no-store, max-age=0' };
 // The report segment is one of two exact fixed names. No caller-supplied filesystem path is accepted.
 export async function GET(
   _request: NextRequest,
-  { params }: { params: Promise<{ jobID: string; report: string }> | { jobID: string; report: string } },
+  { params }: { params: Promise<{ jobID: string; report: string }> },
 ) {
   const { jobID, report } = await params;
   if (!isUuidV4(jobID)) {

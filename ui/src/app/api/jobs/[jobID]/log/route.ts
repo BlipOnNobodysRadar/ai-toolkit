@@ -32,7 +32,7 @@ const completeUtf8Length = (buf: Buffer, n: number): number => {
   return i;
 };
 
-export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
+export async function GET(request: NextRequest, { params }: { params: Promise<{ jobID: string }> }) {
   const { jobID } = await params;
 
   const job = await prisma.job.findUnique({

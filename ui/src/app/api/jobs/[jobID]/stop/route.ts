@@ -7,7 +7,7 @@ import { requestStop } from '../../../../../../cron/ownership/store';
 // signalled from here, so a reused pid can never be hit. The run keeps its GPUs and folder until the worker has
 // verified that its processes exited; a run still alive long after the request gets an identity-checked force
 // stop from the worker (docs/STATE_MACHINES.md M10).
-export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
+export async function GET(request: NextRequest, { params }: { params: Promise<{ jobID: string }> }) {
   const { jobID } = await params;
   const out = await requestStop(prisma, jobID);
   return NextResponse.json(out.body, { status: out.status });

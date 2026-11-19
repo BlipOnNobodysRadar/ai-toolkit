@@ -19,8 +19,8 @@ class TestResponse {
 }
 
 const JOB_ID = '11111111-1111-4111-8111-111111111111';
-
 ts.mock('next/server', { NextRequest: class {}, NextResponse: TestResponse });
+
 let jobRow = { id: JOB_ID, name: 'job' };
 let trainingRoot = '';
 ts.mock('@/server/prisma', { __esModule: true, default: { job: { findUnique: async () => jobRow } } });
@@ -136,10 +136,33 @@ test('validation parser summarizes native and DPO metrics and counts malformed l
   assert.equal(dpo.bySigma[0].sampleCount, 2);
 });
 
-test('EDM2 CSV parser validates the documented columns, filters bad rows, and bounds chart points', () => {
-  const sample = '1,0.25,0,1.5\n';
-  const csv = 'timestep,sigma,log_variance,prediction_weight\n' + sample.repeat(Math.ceil(9 * 1024 * 1024 / sample.length));
-  fs.writeFileSync(path.join(jobFolder, 'edm2-weighting.csv'), csv);
+test('EDM2 CSV parser validates documented columns, filters bad rows, and bounds chart points', () => {
+  const rows = ['timestep,sigma,log_variance,prediction_weight'];
+  for (let index = 0; index < 1000; index += 1) {
+    rows.push(`${index},${index / 999},${Math.log(1 + index / 100)},${1 + index / 1000}`);
+  }
+  rows.push('bad,row');
+  const edm = reports.summarizeEdm2Csv(rows.join('\n'));
+  assert.equal(edm.pointCount, 1000);
+  assert.ok(edm.points.length <= 360);
+  assert.equal(edm.points[0].timestep, 0);
+  assert.equal(edm.points[edm.points.length - 1].timestep, 999);
+  assert.equal(edm.minWeight, 1);
+  assert.equal(edm.maxWeight, 1.999);
+});
+
+test('small reports use the bound job folder and expose no filesystem path', async () => {
+  const jobFolder = setupJob();
+  jobRow = { id: JOB_ID, name: 'job', run_dir: jobFolder };
+  fs.writeFileSync(
+    path.join(jobFolder, 'validation.jsonl'),
+    JSON.stringify({ step: 5, phase: 'final', raw_metrics: [{ sigma: 0.5, video_mse: 0.123 }] }) + '\n',
+  );
+  fs.writeFileSync(
+    path.join(jobFolder, 'edm2-weighting.csv'),
+    'timestep,sigma,log_variance,prediction_weight\n1,0.1,0.2,1.5\n2,0.2,0.3,1.7\n',
+  );
+
   const response = await route.GET({}, { params: { jobID: JOB_ID } });
   assert.equal(response.status, 200);
   assert.equal(response.body.validation.exists, true);
@@ -157,7 +180,7 @@ test('EDM2 CSV parser validates the documented columns, filters bad rows, and bo
   assert.equal(serialized.includes(trainingRoot), false);
 });
 
-test('large validation reports expose a bounded recent tail instead of failing the preview', async () => {
+test('large validation reports expose a bounded recent tail', async () => {
   const jobFolder = setupJob();
   const recent = [
     JSON.stringify({ step: 100, phase: 'periodic', raw_metrics: [{ sigma: 0.5, video_mse: 0.111 }] }),
@@ -179,9 +202,12 @@ test('large validation reports expose a bounded recent tail instead of failing t
 test('large EDM2 reports remain discoverable without an unbounded preview read', async () => {
   const jobFolder = setupJob();
   const rows = ['timestep,sigma,log_variance,prediction_weight'];
-  while (rows.join('\n').length <= 8 * 1024 * 1024 + 1024) {
+  let totalBytes = Buffer.byteLength(rows[0]) + 1;
+  while (totalBytes <= 8 * 1024 * 1024 + 1024) {
     const index = rows.length - 1;
-    rows.push(`${index},${index / 1000},0,${1 + index / 1000}`);
+    const row = `${index},${index / 1000},0,${1 + index / 1000}`;
+    rows.push(row);
+    totalBytes += Buffer.byteLength(row) + 1;
   }
   fs.writeFileSync(path.join(jobFolder, 'edm2-weighting.csv'), rows.join('\n'));
   const response = await route.GET({}, { params: { jobID: JOB_ID } });
@@ -191,7 +217,7 @@ test('large EDM2 reports remain discoverable without an unbounded preview read',
   assert.equal(response.body.edm2.pointCount, 0);
 });
 
-test('raw report download streams exactly one fixed report name without path headers', async () => {
+test('raw report download streams a fixed report name without path headers', async () => {
   const jobFolder = setupJob();
   const payload = '{"step":1,"phase":"final","raw_metrics":[{"sigma":0.5,"video_mse":0.25}]}\n';
   fs.writeFileSync(path.join(jobFolder, 'validation.jsonl'), payload);
@@ -213,7 +239,7 @@ test('raw download rejects any name other than the two fixed report files', asyn
   }
 });
 
-test('stale or foreign run bindings are refused cleanly and do not reveal configured paths', async () => {
+test('foreign run bindings are refused without leaking configured paths', async () => {
   setupJob();
   const otherRoot = makeRoot();
   jobRow = { id: JOB_ID, name: 'job', run_dir: path.join(otherRoot, 'job') };
@@ -235,16 +261,15 @@ test('a missing claimed run folder is an ordinary empty report response', async 
   assert.equal(JSON.stringify(response.body).includes(trainingRoot), false);
 });
 
-test('link or non-file report entries are refused', async t => {
+test('a symlink at a fixed report name is refused', async t => {
   const jobFolder = setupJob();
   const outside = path.join(makeRoot(), 'outside-validation.jsonl');
   fs.writeFileSync(
     outside,
     JSON.stringify({ step: 1, phase: 'final', raw_metrics: [{ sigma: 0.5, video_mse: 0.5 }] }),
   );
-  const reportPath = path.join(jobFolder, 'validation.jsonl');
   try {
-    fs.symlinkSync(outside, reportPath, 'file');
+    fs.symlinkSync(outside, path.join(jobFolder, 'validation.jsonl'), 'file');
   } catch (error) {
     t.skip(`file symlink unavailable on this platform: ${error.code || error.message}`);
     return;
@@ -256,6 +281,27 @@ test('link or non-file report entries are refused', async t => {
   const download = await downloadRoute.GET({}, { params: { jobID: JOB_ID, report: 'validation.jsonl' } });
   assert.equal(download.status, 403);
   assert.equal(download.body.code, 'UNSAFE_REPORT_FILE');
+});
+
+test('a junction/reparse job folder is refused', async t => {
+  trainingRoot = makeRoot();
+  jobRow = { id: JOB_ID, name: 'job' };
+  const outside = makeRoot();
+  fs.writeFileSync(
+    path.join(outside, 'validation.jsonl'),
+    JSON.stringify({ step: 1, phase: 'final', raw_metrics: [{ sigma: 0.5, video_mse: 0.5 }] }),
+  );
+  try {
+    fs.symlinkSync(outside, path.join(trainingRoot, 'job'), 'junction');
+  } catch (error) {
+    t.skip(`directory junction unavailable on this platform: ${error.code || error.message}`);
+    return;
+  }
+
+  const response = await route.GET({}, { params: { jobID: JOB_ID } });
+  assert.equal(response.status, 403);
+  assert.equal(response.body.code, 'UNSAFE_JOB_FOLDER');
+  assert.equal(JSON.stringify(response.body).includes(outside), false);
 });
 
 test('a directory at a fixed report name is not treated as a regular file', async () => {
