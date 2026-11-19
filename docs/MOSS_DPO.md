@@ -41,6 +41,12 @@ turns sampling on. If the normal sample list has no usable prompt, the editor ap
 preserves the user's prompts, sample cadence, dimensions and other normal sample settings. You can edit the prompt
 list before launching, and the saved job config is ordinary YAML/JSON that can be reopened in the GUI.
 
+With cached text embeddings, use the regular sample prompt list for the initial samples too. On this release
+a separate `first_sample` prompt list can pick embeddings by position from the regular list. Different list
+orders can condition an image on the wrong text, and a longer initial list can fail. If a quantized job uses
+an accuracy recovery adapter, pin the actual adapter file locally for the duration of the job so that
+reopening it uses the same weights.
+
 ### Voting is delayed
 
 For example, with **Feedback Every** set to 10, a pair generated at update 100 can be ranked at update 137.
