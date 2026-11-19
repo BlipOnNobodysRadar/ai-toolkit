@@ -205,14 +205,16 @@ class SDTrainer(BaseSDTrainProcess):
     def cache_sample_prompts(self):
         if self.train_config.disable_sampling:
             return
-        if self.sample_config is not None and self.sample_config.samples is not None and len(self.sample_config.samples) > 0:
-            # cache all the samples
-            self.sd.sample_prompts_cache = []
+        self.sd.sample_prompts_cache = self._encode_sample_prompts(self.sample_config)
+        if self.has_first_sample_requested:
+            self._first_sample_prompts_cache = self._encode_sample_prompts(self.first_sample_config)
+
+    def _encode_sample_prompts(self, sample_config):
+        if sample_config is not None and sample_config.samples:
+            cached = []
             sample_folder = os.path.join(self.save_root, 'samples')
             output_path = os.path.join(sample_folder, 'test.jpg')
-            for i in range(len(self.sample_config.prompts)):
-                sample_item = self.sample_config.samples[i]
-                prompt = self.sample_config.prompts[i]
+            for sample_item, prompt in zip(sample_config.samples, sample_config.prompts):
                 
                 if self.trigger_word is not None:
                     prompt = self.sd.inject_trigger_into_prompt(
@@ -322,10 +324,12 @@ class SDTrainer(BaseSDTrainProcess):
                     positive = self.sd.encode_prompt(gen_img_config.prompt).to('cpu')
                     negative = self.sd.encode_prompt(gen_img_config.negative_prompt).to('cpu')
                 
-                self.sd.sample_prompts_cache.append({
+                cached.append({
                     'conditional': positive,
                     'unconditional': negative
                 })
+            return cached
+        return None
         
 
     def before_dataset_load(self):
