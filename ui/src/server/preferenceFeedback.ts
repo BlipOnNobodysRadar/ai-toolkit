@@ -1,6 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'crypto';
+import { once } from 'events';
+import archiver from 'archiver';
 import sqlite3 from 'sqlite3';
 import { jobFolderError } from '../../cron/ownership/resources';
 
@@ -435,6 +437,7 @@ const projectVote = async (pair: PairPath, preferenceID: string, vote: Preferenc
 const readVoteForPair = async (
   pair: PairPath,
   preferenceID: string,
+  options: { healProjection?: boolean } = {},
 ): Promise<{ vote: PreferenceVote | null; invalid: boolean }> => {
   const votePath = path.join(pair.lexical, VOTE_FILENAME);
   const voteStat = await lstatOptional(votePath);
@@ -459,6 +462,9 @@ const readVoteForPair = async (
   if (!decision.present) return { vote: null, invalid: false };
   if (!decision.vote) return { vote: null, invalid: true };
 
+  // Exports are strictly read-only. They still honor a committed decision, but must not heal its top-level receipt.
+  if (options.healProjection === false) return { vote: decision.vote, invalid: false };
+
   // A crash can leave the committed decision without its top-level receipt. Serve the committed choice even when the
   // receipt cannot currently be healed (for example on a temporarily read-only checkout).
   try {
@@ -469,7 +475,12 @@ const readVoteForPair = async (
   return { vote: decision.vote, invalid: false };
 };
 
-const readPair = async (bound: BoundRoot, preferenceID: string, pair: PairPath) => {
+const readPair = async (
+  bound: BoundRoot,
+  preferenceID: string,
+  pair: PairPath,
+  options: { healProjection?: boolean } = {},
+) => {
   const metadata = parsePairMetadata(
     await readJsonFile(path.join(pair.lexical, 'pair.json'), pair.real, MAX_PAIR_JSON_BYTES, 'INVALID_PAIR'),
     preferenceID,
@@ -478,7 +489,7 @@ const readPair = async (bound: BoundRoot, preferenceID: string, pair: PairPath) 
   await assertRegularFile(path.join(pair.lexical, 'a.png'), pair.real, 'INVALID_PAIR_IMAGE');
   await assertRegularFile(path.join(pair.lexical, 'b.png'), pair.real, 'INVALID_PAIR_IMAGE');
 
-  const { vote, invalid: voteInvalid } = await readVoteForPair(pair, preferenceID);
+  const { vote, invalid: voteInvalid } = await readVoteForPair(pair, preferenceID, options);
   const status: PreferenceStatus = voteInvalid ? 'invalid' : vote === null ? 'pending' : vote.choice === 'skip' ? 'skipped' : 'rated';
   return { metadata, vote, status };
 };
@@ -639,6 +650,135 @@ export const readPreferenceImage = async (
   return { bytes, contentType: 'image/png' };
 };
 
+type ExportImage = { path: string; identity: fs.Stats };
+type PreferenceExportPair = {
+  id: string;
+  step: number;
+  createdAt: string;
+  chosen: ExportImage;
+  rejected: ExportImage;
+  prompt: string;
+};
+
+// Export eligibility deliberately reuses the same trusted job binding, strict pair-id rule, metadata parser, image
+// checks and vote resolver as the gallery. The read-only resolver is important: exporting must never heal or create a
+// vote receipt as a side effect.
+const listPreferenceExportPairs = async (bound: BoundRoot): Promise<PreferenceExportPair[]> => {
+  if (!bound.preferencesReal) return [];
+
+  let entries: fs.Dirent[];
+  try {
+    entries = await fs.promises.readdir(bound.preferencesLexical, { withFileTypes: true });
+  } catch {
+    throw new PreferenceFeedbackError('The preferences folder could not be listed.', 500, 'PREFERENCES_UNREADABLE');
+  }
+
+  const pairs: PreferenceExportPair[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !isPreferenceID(entry.name)) continue;
+    try {
+      const pair = await resolvePairDirectory(bound, entry.name);
+      const { metadata, vote, status } = await readPair(bound, entry.name, pair, { healProjection: false });
+      if (status !== 'rated' || !vote || (vote.choice !== 'a' && vote.choice !== 'b')) continue;
+
+      // The winning arm becomes chosen; the other original PNG becomes rejected. Fixed arm names prevent any
+      // browser- or manifest-supplied path from reaching the filesystem or the archive entry names.
+      const chosenArm = vote.choice;
+      const rejectedArm = chosenArm === 'a' ? 'b' : 'a';
+      const chosenPath = path.join(pair.real, `${chosenArm}.png`);
+      const rejectedPath = path.join(pair.real, `${rejectedArm}.png`);
+
+      pairs.push({
+        id: entry.name,
+        step: metadata.step,
+        createdAt: metadata.created_at,
+        chosen: { path: chosenPath, identity: await assertRegularFile(chosenPath, pair.real, 'INVALID_PAIR_IMAGE') },
+        rejected: { path: rejectedPath, identity: await assertRegularFile(rejectedPath, pair.real, 'INVALID_PAIR_IMAGE') },
+        prompt: metadata.prompt,
+      });
+    } catch (error) {
+      // Pending/skipped/invalid/malformed pairs are omitted individually, matching gallery behavior.
+      if (!(error instanceof PreferenceFeedbackError)) {
+        console.error('Unexpected preference export pair read failure:', error);
+      }
+    }
+  }
+
+  pairs.sort((a, b) => b.step - a.step || b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+  return pairs;
+};
+
+export interface PreferenceFeedbackExportStream {
+  archive: ReturnType<typeof archiver>;
+  pairCount: number;
+  fileName: string;
+}
+
+// Prepare a streamed ZIP without writing a server-side artifact. Image bytes are appended as file streams so archiver
+// applies backpressure as the response is consumed; only the small validated metadata and prompt are held in memory.
+export const createPreferenceFeedbackExport = async (
+  job: BoundJob,
+  trainingRoot: string,
+): Promise<PreferenceFeedbackExportStream> => {
+  const bound = await resolveBoundJobRoot(job, trainingRoot);
+  const pairs = await listPreferenceExportPairs(bound);
+  if (pairs.length === 0) {
+    throw new PreferenceFeedbackError(
+      'No rated preference pairs are available to export.',
+      404,
+      'NO_RATED_PREFERENCE_PAIRS',
+    );
+  }
+
+  const archive = archiver('zip', { store: true });
+  const lifetime = new AbortController();
+  archive.once('close', () => {
+    lifetime.abort();
+    archive.abort();
+  });
+
+  const appendEntry = async (name: string, source: fs.ReadStream | Buffer) => {
+    const processed = once(archive, 'entry', { signal: lifetime.signal });
+    if (!Buffer.isBuffer(source)) {
+      source.once('error', error => archive.destroy(error));
+    }
+    try {
+      archive.append(source, { name });
+      await processed;
+    } finally {
+      if (!Buffer.isBuffer(source)) source.destroy();
+    }
+  };
+
+  const appendImage = async (name: string, image: ExportImage) => {
+    const file = await fs.promises.open(image.path, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    try {
+      const stat = await file.stat();
+      if (!stat.isFile() || stat.dev !== image.identity.dev || stat.ino !== image.identity.ino) {
+        throw new Error('The rated image changed during export.');
+      }
+      await appendEntry(name, fs.createReadStream(image.path, { fd: file }));
+    } finally {
+      await file.close();
+    }
+  };
+
+  // Archiver starts consuming appended streams immediately. Waiting for each entry keeps file handles and
+  // buffered image data bounded, including when an authenticated client downloads slowly or disconnects.
+  const writeEntries = async () => {
+    for (const pair of pairs) {
+      await appendImage(`chosen/${pair.id}.png`, pair.chosen);
+      await appendEntry(`chosen/${pair.id}.txt`, Buffer.from(pair.prompt, 'utf8'));
+      await appendImage(`rejected/${pair.id}.png`, pair.rejected);
+    }
+    await archive.finalize();
+  };
+  void writeEntries().catch(error => {
+    if (!archive.destroyed) archive.destroy(error);
+  });
+
+  return { archive, pairCount: pairs.length, fileName: 'preference-feedback.zip' };
+};
 export const castPreferenceVote = async (
   job: BoundJob,
   trainingRoot: string,

@@ -6,7 +6,7 @@ import { Dialog, DialogBackdrop, DialogPanel, DialogTitle } from '@headlessui/re
 import { apiClient } from '@/utils/api';
 import usePollLoop from '@/hooks/usePollLoop';
 import { RequestOwner, Ticket } from '@/utils/requestOwner';
-import { LuChevronLeft, LuChevronRight, LuImage, LuLoader, LuMaximize2, LuVote, LuX } from 'react-icons/lu';
+import { LuChevronLeft, LuChevronRight, LuDownload, LuImage, LuLoader, LuMaximize2, LuVote, LuX } from 'react-icons/lu';
 
 type PreferenceChoice = 'a' | 'b' | 'skip';
 type PreferenceStatus = 'pending' | 'rated' | 'skipped' | 'invalid';
@@ -160,7 +160,11 @@ export default function PreferenceFeedback({ job }: { job: Job }) {
   const [comparison, setComparison] = useState<PreferenceComparison | null>(null);
   const [votingID, setVotingID] = useState<string | null>(null);
   const [voteError, setVoteError] = useState<string | null>(null);
+  const [downloadingExport, setDownloadingExport] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [exportNotice, setExportNotice] = useState<string | null>(null);
   const ownerRef = useRef<RequestOwner | null>(null);
+  const exportAbortRef = useRef<AbortController | null>(null);
   // Synchronous guard: two click events can arrive before React paints the disabled state.
   const votingRef = useRef<string | null>(null);
   if (ownerRef.current === null) ownerRef.current = new RequestOwner();
@@ -198,7 +202,14 @@ export default function PreferenceFeedback({ job }: { job: Job }) {
     votingRef.current = null;
     setVotingID(null);
     setVoteError(null);
+    exportAbortRef.current?.abort();
+    exportAbortRef.current = null;
+    setDownloadingExport(false);
+    setExportError(null);
+    setExportNotice(null);
   }, [job.id]);
+
+  useEffect(() => () => exportAbortRef.current?.abort(), []);
 
   usePollLoop(() => fetchFeedback(ownerRef.current!.begin()), 5000, [job.id]);
 
@@ -257,6 +268,54 @@ export default function PreferenceFeedback({ job }: { job: Job }) {
     [fetchFeedback, job.id, tab, visible],
   );
 
+  const ratedCount = feedback?.counts.rated ?? 0;
+  const exportRatedPairs = useCallback(async () => {
+    if (downloadingExport || ratedCount === 0) return;
+    const controller = new AbortController();
+    exportAbortRef.current?.abort();
+    exportAbortRef.current = controller;
+    setDownloadingExport(true);
+    setExportError(null);
+    setExportNotice(null);
+    try {
+      // Use the app's bearer-aware client, matching report downloads. The server streams the ZIP; the browser holds
+      // only the downloaded Blob needed for a normal authenticated download.
+      const response = await apiClient.get(`/api/jobs/${encodeURIComponent(job.id)}/preferences/export`, {
+        responseType: 'blob',
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) return;
+      const blob = response.data instanceof Blob ? response.data : new Blob([response.data], { type: 'application/zip' });
+      const href = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = href;
+      link.download = 'preference-feedback.zip';
+      link.rel = 'noreferrer';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(href), 0);
+      setExportNotice('Rated pairs downloaded.');
+    } catch (error: any) {
+      if (error?.code === 'ERR_CANCELED' || controller.signal.aborted) return;
+      let message = 'The rated pairs could not be exported.';
+      const data = error?.response?.data;
+      if (data instanceof Blob) {
+        try {
+          const parsed = JSON.parse(await data.text());
+          if (typeof parsed?.error === 'string') message = parsed.error;
+        } catch {
+          // Keep the clear generic message for a non-JSON error body.
+        }
+      } else if (typeof data?.error === 'string') {
+        message = data.error;
+      }
+      setExportError(message);
+    } finally {
+      if (exportAbortRef.current === controller) exportAbortRef.current = null;
+      setDownloadingExport(false);
+    }
+  }, [downloadingExport, job.id, ratedCount]);
   const shouldShow = configured || !!feedback?.enabled || (feedback?.pairs.length ?? 0) > 0;
   if (!shouldShow) return null;
 
@@ -309,12 +368,41 @@ export default function PreferenceFeedback({ job }: { job: Job }) {
               );
             })}
           </div>
+          <button
+            type="button"
+            title={
+              ratedCount > 0
+                ? 'Download rated A/B pairs as a chosen/rejected ZIP for offline DPO'
+                : 'Rate at least one A/B pair to enable export'
+            }
+            aria-label="Download rated preference pairs for offline DPO"
+            disabled={ratedCount === 0 || downloadingExport}
+            onClick={() => void exportRatedPairs()}
+            className="inline-flex items-center gap-1.5 rounded border border-gray-600 px-2 py-1 text-xs text-gray-200 hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {downloadingExport ? (
+              <LuLoader className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <LuDownload className="h-3.5 w-3.5" />
+            )}
+            {downloadingExport ? 'Exporting...' : 'Export DPO ZIP'}
+          </button>
         </div>
       </div>
 
       {voteError && (
         <div role="alert" className="border-b border-amber-700/40 bg-amber-900/20 px-4 py-2 text-xs text-amber-200">
           {voteError}
+        </div>
+      )}
+      {exportError && (
+        <div role="alert" className="border-b border-red-700/40 bg-red-900/20 px-4 py-2 text-xs text-red-200">
+          {exportError}
+        </div>
+      )}
+      {exportNotice && (
+        <div role="status" className="border-b border-gray-700 px-4 py-2 text-xs text-gray-400">
+          {exportNotice}
         </div>
       )}
 
