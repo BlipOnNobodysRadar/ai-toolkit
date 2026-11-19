@@ -2609,6 +2609,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         )
         
         self.hook_after_sd_init_before_load()
+        if hasattr(self.sd, "track_feedback_sources"):
+            self.sd.track_feedback_sources = self.train_config.dpo_feedback is not None
         # run base sd process run
         self.sd.load_model()
         

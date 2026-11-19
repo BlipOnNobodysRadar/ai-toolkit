@@ -1,4 +1,4 @@
-"""Candidate image-pair capture for hybrid MOSS text-to-image preference training.
+"""Candidate image-pair capture for hybrid text-to-image preference training.
 
 The ordinary sample path stays untouched.  At an eligible ordinary sampling
 event this module reuses the first sample for every configured prompt, asks the
@@ -127,10 +127,10 @@ def _encode_archived_image(sd, path):
     # Use the same one-image VAE working set as normal dataset caching.
     encoded = sd.encode_images([_png_tensor(path)])
     if not torch.is_tensor(encoded) or encoded.ndim != 4 or encoded.shape[0] != 1:
-        raise ValueError("MOSS VAE must return a single [1,C,H,W] latent")
+        raise ValueError("VAE must return a single [1,C,H,W] latent")
     latent = encoded.detach().to(device="cpu", dtype=sd.torch_dtype).contiguous()
     if not torch.isfinite(latent).all():
-        raise FloatingPointError("MOSS VAE produced a non-finite feedback latent")
+        raise FloatingPointError("VAE produced a non-finite feedback latent")
     return latent
 
 
@@ -188,7 +188,7 @@ def _publish_pair(
     a_latent = _encode_archived_image(sd, a_path)
     b_latent = _encode_archived_image(sd, b_path)
     if a_latent.shape != b_latent.shape:
-        raise ValueError("MOSS feedback pair has mismatched latent shapes")
+        raise ValueError("feedback pair has mismatched latent shapes")
     latent_path = os.path.join(pair_stage, "latents.safetensors")
     save_file({"a": a_latent, "b": b_latent}, latent_path)
 
@@ -293,7 +293,7 @@ def capture_feedback_samples(
                     raise RuntimeError("uuid4 produced an unexpected id")
                 embedding = second_config.feedback_conditioning
                 if not isinstance(embedding, AdvancedPromptEmbeds):
-                    raise RuntimeError(f"missing MOSS sample conditioning for pair {index}")
+                    raise RuntimeError(f"missing sample conditioning for pair {index}")
                 prompt = getattr(first_config, "prompt", None)
                 if prompt is None:
                     prompt = sample_config.prompts[index]

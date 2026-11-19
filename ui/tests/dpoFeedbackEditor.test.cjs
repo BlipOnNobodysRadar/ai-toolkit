@@ -314,3 +314,16 @@ test('SimpleJob disables online feedback while offline DPO is selected and its s
   assert.deepEqual(h.state.config.process[0].sample.samples, [{ prompt: DPO_FEEDBACK_PROMPT_FALLBACK }]);
   r.unmount();
 });
+
+test('only the Krea Raw T2I preset adds eligibility alongside the existing MOSS presets', () => {
+  const { isImageDpoEligible, isMossImageDpoEligible } = require(ts.uiPath('src/app/jobs/new/utils.ts'));
+  for (const arch of ['moss_image', 'moss_image:base']) {
+    assert.equal(isImageDpoEligible(arch), true);
+    assert.equal(isMossImageDpoEligible(arch), true);
+  }
+  assert.equal(isMossImageDpoEligible('krea2'), false);
+  assert.equal(isImageDpoEligible('krea2'), true);
+  for (const arch of ['krea2:turbo', 'krea2:o_edit', 'krea2:o_edit_turbo', 'moss_image:edit', undefined]) {
+    assert.equal(isImageDpoEligible(arch), false);
+  }
+});

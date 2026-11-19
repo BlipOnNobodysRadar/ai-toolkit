@@ -8,10 +8,11 @@ export const DPO_FEEDBACK_START_AFTER_DEFAULT = 0;
 /** Used only when enabling feedback would otherwise leave no sample to rank. */
 export const DPO_FEEDBACK_PROMPT_FALLBACK = 'a high quality, detailed image';
 
-/** Only the text-to-image MOSS registrations are eligible; the edit variants
- * share the moss_image backend arch but are excluded from DPO. */
 export const isMossImageDpoEligible = (archName: string | undefined): boolean =>
   archName === 'moss_image' || archName === 'moss_image:base';
+
+export const isImageDpoEligible = (archName: string | undefined): boolean =>
+  isMossImageDpoEligible(archName) || archName === 'krea2';
 
 export const isValidDpoBeta = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value) && value > 0;
@@ -33,7 +34,7 @@ export const isValidDpoFeedbackConfig = (value: unknown): value is DpoFeedbackCo
   isValidDpoFeedbackEvery((value as DpoFeedbackConfig).every) &&
   isValidDpoFeedbackStartAfter((value as DpoFeedbackConfig).start_after);
 
-/** Enforce the transformer-LoRA invariants shared by offline and online MOSS
+/** Enforce the transformer-LoRA invariants shared by offline and online image
  * preference training, without changing the selected ordinary loss. */
 const applyTransformerLoraMode = (
   jobConfig: JobConfig,
@@ -215,9 +216,9 @@ export const handleModelArchChange = (
   // update the defaults when a model is selected
   const newArch = modelArchs.find(model => model.name === newArchName);
 
-  const newArchSupportsDpo = isMossImageDpoEligible(newArchName);
+  const newArchSupportsDpo = isImageDpoEligible(newArchName);
 
-  // DPO fields are only valid on an eligible non-edit MOSS text-to-image arch.
+  // DPO fields are only valid on an eligible non-edit image text-to-image arch.
   // This covers both offline DPO and periodic ranked-sample feedback.
   if (!newArchSupportsDpo) {
     if (jobConfig.config.process[0].train.loss_type === 'dpo') {

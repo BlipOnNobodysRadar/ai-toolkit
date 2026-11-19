@@ -13,11 +13,15 @@ Flow-matching convention matches ai-toolkit exactly (t=1 noise -> t=0 clean,
 target = noise - clean), so ``get_noise_prediction`` does no time flip / negation.
 """
 
+import hashlib
 import math
 import os
+import re
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+
+from toolkit.cache_identity import cache_key_digest
 import torch.nn.functional as F
 from PIL import Image
 from torchvision.transforms.functional import to_tensor
@@ -55,7 +59,13 @@ from .src.mmdit import (
     SingleMMDiTConfig,
     SingleStreamDiT,
 )
-from .src.text_encoder import encode_krea_prompt, SELECT_LAYERS
+from .src.text_encoder import (
+    PROMPT_TEMPLATE_ENCODE_PREFIX,
+    PROMPT_TEMPLATE_ENCODE_START_IDX,
+    PROMPT_TEMPLATE_ENCODE_SUFFIX,
+    SELECT_LAYERS,
+    encode_krea_prompt,
+)
 from .src.pipeline import Krea2Pipeline, pad_text_features, predict_velocity
 
 if TYPE_CHECKING:
@@ -102,22 +112,22 @@ QWEN_IMAGE_VAE_PATH = "Qwen/Qwen-Image"
 HF_TOKEN = os.getenv("HF_TOKEN", None)
 
 
-def _load_mmdit_state_dict(name_or_path: str, filename: Optional[str]) -> dict:
-    """Load the MMDiT weights from a local safetensors file/dir or the HF hub.
+def _resolve_mmdit_file(name_or_path: str, filename: Optional[str]) -> str:
+    """Resolve the MMDiT weights from a local safetensors file/dir or the HF hub.
 
     ``name_or_path`` may be: a ``.safetensors`` file, a directory containing one
     (``filename`` or the lone ``.safetensors`` in it), or a hub repo id (the
-    file ``filename`` is downloaded, defaulting to ``model.safetensors``).
+    file ``filename`` is downloaded, defaulting to the lowercased variant name).
     """
     if name_or_path.endswith(".safetensors") and os.path.isfile(name_or_path):
-        return load_file(name_or_path)
+        return os.path.realpath(name_or_path)
 
     if os.path.isdir(name_or_path):
         if filename is not None:
-            return load_file(os.path.join(name_or_path, filename))
+            return os.path.realpath(os.path.join(name_or_path, filename))
         candidates = [f for f in os.listdir(name_or_path) if f.endswith(".safetensors")]
         if len(candidates) == 1:
-            return load_file(os.path.join(name_or_path, candidates[0]))
+            return os.path.realpath(os.path.join(name_or_path, candidates[0]))
         raise FileNotFoundError(
             f"Could not pick an MMDiT checkpoint in {name_or_path}: found "
             f"{candidates}. Set model.model_kwargs.checkpoint_filename."
@@ -138,7 +148,53 @@ def _load_mmdit_state_dict(name_or_path: str, filename: Optional[str]) -> dict:
             f"Could not find {fname!r} in hub repo {name_or_path!r}. Set "
             "model.model_kwargs.checkpoint_filename to the weight file name."
         ) from e
-    return load_file(path)
+    return os.path.realpath(path)
+
+
+def _load_mmdit_state_dict(name_or_path: str, filename: Optional[str], *, return_source=False):
+    path = _resolve_mmdit_file(name_or_path, filename)
+    weights = load_file(path)
+    return (weights, path) if return_source else weights
+
+
+def _loaded_source(source, obj, kind):
+    """Identify the actual loaded component, including unpinned remote inputs."""
+    if os.path.exists(source):
+        return os.path.realpath(source)
+    config = getattr(obj, "config", None)
+    kwargs = getattr(obj, "init_kwargs", {})
+    revision = getattr(config, "_commit_hash", None) or kwargs.get("_commit_hash")
+    if not revision and kind == "tokenizer":
+        for value in kwargs.values():
+            match = re.search(r"[\\/]snapshots[\\/]([0-9a-fA-F]{7,64})[\\/]", value) if isinstance(value, str) else None
+            if match:
+                revision = match.group(1)
+                break
+    if revision:
+        return f"{source}@{revision}"
+
+    # Diffusers can discard the source commit. Identify what actually loaded,
+    # without consulting a mutable Hub ref or downloading the weights again.
+    if kind == "config":
+        values = config.to_dict() if hasattr(config, "to_dict") else dict(config)
+        digest = cache_key_digest({k: v for k, v in values.items() if not k.startswith("_")})
+    elif kind == "tokenizer":
+        digest = cache_key_digest({
+            "backend": hashlib.sha256(obj.backend_tokenizer.to_str().encode()).hexdigest(),
+            "special_tokens": obj.special_tokens_map,
+            "padding_side": obj.padding_side, "truncation_side": obj.truncation_side,
+        })
+    else:
+        hasher = hashlib.sha256()
+        for name, tensor in sorted(obj.state_dict().items()):
+            if tensor.is_meta:
+                raise ValueError(f"Cannot identify unloaded {kind} weights from {source} for ranked feedback. "
+                                 "Select a local checkpoint or pinned snapshot directory.")
+            hasher.update(f"{name}\0{tensor.dtype}\0{tuple(tensor.shape)}\0".encode())
+            data = tensor.detach().contiguous().reshape(-1).view(torch.uint8).cpu().numpy()
+            hasher.update(memoryview(data))
+        digest = hasher.hexdigest()
+    return f"{kind}-sha256:{digest}"
 
 
 class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
@@ -160,6 +216,7 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
         self.is_transformer = True
         self.target_lora_modules = ["SingleStreamDiT"]
 
+        self.mmdit_config = {**KREA2_MMDIT_CONFIG, **self.model_config.model_kwargs.get("mmdit_config", {})}
         self.patch_size = KREA2_MMDIT_CONFIG["patch"]
         self.vae_scale_factor = 8  # Qwen-Image VAE is f8
         # Safety cap on prompt token length (truncation only); embeds are stored
@@ -167,6 +224,16 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
         self.max_text_length = int(
             self.model_config.model_kwargs.get("max_text_length", 512)
         )
+        self.track_feedback_sources = False
+        self.feedback_component_sources = {}
+        self.feedback_reference_metadata = {
+            "mmdit_config": self.mmdit_config, "selected_feature_layers": list(SELECT_LAYERS),
+            "prompt_preprocess": {
+                "name": "krea2-qwen3vl-assistant", "version": 1,
+                "prefix": PROMPT_TEMPLATE_ENCODE_PREFIX, "suffix": PROMPT_TEMPLATE_ENCODE_SUFFIX,
+                "start_idx": PROMPT_TEMPLATE_ENCODE_START_IDX, "max_text_length": self.max_text_length,
+            },
+        }
         # Qwen2TokenizerFast used to tokenize the assistant suffix (matches the
         # reference's separate processor pass).
         self.processor = None
@@ -212,15 +279,15 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading transformer (SingleStreamDiT)")
 
-        mmdit_kwargs = dict(KREA2_MMDIT_CONFIG)
-        mmdit_kwargs.update(self.model_config.model_kwargs.get("mmdit_config", {}))
-        config = SingleMMDiTConfig(**mmdit_kwargs)
+        config = SingleMMDiTConfig(**self.mmdit_config)
 
         self.print_and_status_update("  - fetching transformer weights")
-        state_dict = _load_mmdit_state_dict(
-            self.model_config.name_or_path,
-            self.model_config.model_kwargs.get("checkpoint_filename", None),
+        state_dict, path = _load_mmdit_state_dict(
+            self.model_config.name_or_path, self.model_config.model_kwargs.get("checkpoint_filename"),
+            return_source=True,
         )
+        if self.track_feedback_sources:
+            self.feedback_component_sources["transformer"] = path
         for prefix in ("model.diffusion_model.", "diffusion_model."):
             if any(k.startswith(prefix) for k in state_dict):
                 state_dict = {k.removeprefix(prefix): v for k, v in state_dict.items()}
@@ -235,6 +302,9 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
     def _load_text_encoder(self):
         dtype = self.torch_dtype
         te_path = self.model_config.model_kwargs.get("text_encoder_path", QWEN3_VL_PATH)
+        te_weight_path = self.model_config.model_kwargs.get(
+            "text_encoder_weight_path", te_path
+        )
         self.print_and_status_update(f"Loading Qwen3-VL text encoder from {te_path}")
 
         tokenizer = AutoTokenizer.from_pretrained(
@@ -244,7 +314,7 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
             te_path, max_length=self.max_text_length, token=HF_TOKEN
         )
         text_encoder = Qwen3VLTextEncoder.load_model(
-            self.model_config.model_kwargs.get("text_encoder_weight_path", te_path),
+            te_weight_path,
             dtype=dtype, config_path=te_path, subfolder="", token=HF_TOKEN
         )
         vl_processor = None
@@ -260,18 +330,39 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
             text_encoder.drop_vision_tower()
         text_encoder.eval()
         text_encoder.requires_grad_(False)
+
+        if self.track_feedback_sources:
+            source = getattr(text_encoder, "_aitk_weight_source", None) or te_weight_path
+            # Directory loads take their own config; single-file loads use te_path.
+            config_source = te_path if os.path.isfile(source) else source
+            self.feedback_component_sources.update(
+                text_encoder=_loaded_source(source, text_encoder, "weights"),
+                text_encoder_config=_loaded_source(config_source, text_encoder, "config"),
+                tokenizer=_loaded_source(te_path, tokenizer, "tokenizer"),
+                processor_tokenizer=_loaded_source(te_path, processor, "tokenizer"),
+            )
         flush()
         return tokenizer, processor, vl_processor, text_encoder
 
     def _load_vae(self):
         vae_path = self.model_config.model_kwargs.get("vae_path", QWEN_IMAGE_VAE_PATH)
+        vae_config_path = self.model_config.model_kwargs.get(
+            "vae_config_path", QWEN_IMAGE_VAE_PATH
+        )
         self.print_and_status_update(f"Loading Qwen-Image VAE from {vae_path}")
         vae = QwenImageVAE.load_model(
             vae_path, dtype=self.vae_torch_dtype, token=HF_TOKEN,
-            config_path=self.model_config.model_kwargs.get("vae_config_path", QWEN_IMAGE_VAE_PATH),
+            config_path=vae_config_path,
         )
         vae.eval()
         vae.requires_grad_(False)
+        if self.track_feedback_sources:
+            source = getattr(vae, "_aitk_weight_source", None) or vae_path
+            config_source = vae_config_path if os.path.isfile(source) else source
+            self.feedback_component_sources.update(
+                vae=_loaded_source(source, vae, "weights"),
+                vae_config=_loaded_source(config_source, vae, "config"),
+            )
         return vae
 
     def load_training_adapter(self, transformer: SingleStreamDiT):
@@ -426,6 +517,12 @@ class Krea2Model(QwenImageVAEHolderMixin, BaseModel):
         generator: torch.Generator,
         extra: dict,
     ):
+        if hasattr(gen_config, "feedback_conditioning"):
+            # Archive exactly the positive conditioning used by the displayed
+            # sample. The attribute itself is the capture-active marker: when
+            # DPO is off, neither this copy nor its CPU transfer happens.
+            gen_config.feedback_conditioning = conditional_embeds.detach().to("cpu")
+
         if self.model.device == torch.device("cpu"):
             self.model.to(self.device_torch)
 

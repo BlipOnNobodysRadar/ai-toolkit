@@ -50,11 +50,11 @@ def test_dpo_rejects_invalid_beta(beta):
         TrainConfig(loss_type="dpo", dpo_beta=beta)
 
 
-@pytest.mark.parametrize("variant", ["moss_image:edit", "moss_image:base_edit"])
-def test_dpo_rejects_edit_variant_even_after_arch_normalization(variant):
+@pytest.mark.parametrize("variant", ["moss_image:edit", "moss_image:base_edit", "krea2:turbo", "krea2:o_edit", "krea2:o_edit_turbo"])
+def test_dpo_rejects_unsupported_variant_even_after_arch_normalization(variant):
     trainer = SimpleNamespace(
         config={"model": {"arch": variant}},
-        model_config=SimpleNamespace(arch="moss_image", model_kwargs={}),
+        model_config=SimpleNamespace(arch=variant.split(":")[0], model_kwargs={}),
         train_config=TrainConfig(loss_type="dpo"),
         dataset_configs=[],
     )
