@@ -50,10 +50,15 @@ LoRA and with the frozen base, and applies the preference gradient to the curren
 step-100 LoRA is needed.
 
 Each scheduled slot takes one complete optimizer window. A slot with no eligible votes does ordinary training.
-Eligible pairs rotate through later slots. Skip excludes a pair. Votes added after the final update are available
-if you extend and resume the same job. A changed frozen reference makes its earlier pairs ineligible. The
-reference identifier tracks the base and encoding setup. Learning rate, total steps and feedback cadence can
-change on resume without invalidating a vote.
+Eligible pairs rotate through later slots. Skip excludes a pair. A vote after the final update stays saved
+and can train the model if the job can resume for more updates. RAWR checkpoints require the original
+planned training length and scheduler configuration. With RAWR, rate pairs before the run ends, or pause
+and resume within the existing plan. To use later ratings in a new offline DPO job, use the selected PNGs
+and their original prompts as chosen/rejected pairs.
+
+The reference identifier tracks the frozen base and encoding setup. Changing the frozen reference makes
+its earlier votes ineligible. The learning rate, step budget and feedback cadence do not enter the vote
+identity. The optimizer and scheduler can impose their own checkpoint compatibility requirements.
 
 ### Training progress in the feedback panel
 
