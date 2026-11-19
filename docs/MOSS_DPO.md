@@ -47,11 +47,10 @@ turns sampling on. If the normal sample list has no usable prompt, the editor ap
 preserves the user's prompts, sample cadence, dimensions and other normal sample settings. You can edit the prompt
 list before launching, and the saved job config is ordinary YAML/JSON that can be reopened in the GUI.
 
-With cached text embeddings, use the regular sample prompt list for the initial samples too. On this release
-a separate `first_sample` prompt list can pick embeddings by position from the regular list. Different list
-orders can condition an image on the wrong text, and a longer initial list can fail. If a quantized job uses
-an accuracy recovery adapter, pin the actual adapter file locally for the duration of the job so that
-reopening it uses the same weights.
+You can give `first_sample` its own prompts when caching text embeddings. Initial pairs use the cached
+conditioning for that list, and later pairs use the regular sample list. For quantized jobs that use
+an accuracy recovery adapter, the frozen reference records the loaded adapter. A different adapter
+revision can make older votes ineligible when you resume.
 
 ### Voting is delayed
 
