@@ -21,11 +21,12 @@ def validate_dpo_config(trainer):
     model = trainer.model_config
     # ModelConfig strips the UI variant suffix, including on hand-written YAML.
     selected_arch = getattr(trainer, 'config', {}).get('model', {}).get('arch')
-    if (model.arch != 'moss_image' or model.model_kwargs.get('edit')
-            or selected_arch in ('moss_image:edit', 'moss_image:base_edit')):
-        raise ValueError('DPO currently supports MOSS-Image text-to-image training')
+    moss_t2i = model.arch == 'moss_image' and selected_arch not in ('moss_image:edit', 'moss_image:base_edit')
+    krea_raw_t2i = model.arch == 'krea2' and selected_arch in (None, 'krea2') and not getattr(model, 'assistant_lora_path', None)
+    if model.model_kwargs.get('edit') or not (moss_t2i or krea_raw_t2i):
+        raise ValueError('DPO supports MOSS-Image and Krea 2 Raw text-to-image LoRAs')
     if train.noise_scheduler != 'flowmatch' or train.loss_target != 'noise':
-        raise ValueError("MOSS DPO requires noise_scheduler: flowmatch and the default flow target")
+        raise ValueError("DPO requires noise_scheduler: flowmatch and the default flow target")
     if (trainer.network_config is None or trainer.network_config.type != 'lora'
             or not train.train_unet or train.train_text_encoder
             or trainer.adapter_config or trainer.embed_config or trainer.decorator_config):

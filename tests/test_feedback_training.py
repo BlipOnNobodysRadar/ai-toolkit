@@ -260,6 +260,41 @@ def test_reference_identity_uses_only_frozen_model_and_encoding_identity(tmp_pat
     assert feedback.feedback_reference_id(changed_components) != ref
 
 
+def test_krea_reference_tracks_frozen_conditioning_and_each_loaded_asset(tmp_path):
+    def reference(*, source=None, layers=(8, 16), **settings):
+        trainer = _fake_trainer(tmp_path, **settings)
+        trainer.model_config.arch = "krea2"
+        trainer.sd.feedback_reference_metadata = {
+            "mmdit_config": {"layers": 28},
+            "selected_feature_layers": list(layers),
+        }
+        if source:
+            trainer.sd.feedback_component_sources[source] = "frozen/asset@changed"
+        return feedback.feedback_reference_id(trainer)
+
+    baseline = reference()
+    assert reference(beta=5, every=3, lr=1e-4) == baseline
+    assert reference(layers=(9, 16)) != baseline
+    for asset in ("transformer", "text_encoder", "text_encoder_config", "tokenizer", "vae", "vae_config"):
+        assert reference(source=asset) != baseline, asset
+    assert feedback.feedback_reference_id(_fake_trainer(tmp_path)) != baseline
+
+
+def test_feedback_reference_follows_the_loaded_recovery_adapter(tmp_path):
+    def reference(source):
+        trainer = _fake_trainer(tmp_path)
+        trainer.model_config.accuracy_recovery_adapter = "org/repo/adapter.safetensors"
+        trainer.sd.accuracy_recovery_adapter = SimpleNamespace(_aitk_weight_source=str(source))
+        return feedback.feedback_reference_id(trainer)
+
+    first = tmp_path / "adapter.safetensors"
+    first.write_bytes(b"first revision")
+    before = reference(first)
+    assert reference(first) == before
+    first.write_bytes(b"second revision")
+    assert reference(first) != before
+
+
 def test_reference_identity_ignores_transient_loaded_encoder_state(tmp_path):
     trainer = _fake_trainer(tmp_path)
     loaded = feedback.feedback_reference_id(trainer)
@@ -349,8 +384,10 @@ def test_polling_does_not_read_tensor_payloads(tmp_path, monkeypatch):
     assert feedback.voted_feedback_ids(trainer) == [pair_id]
 
 
-def test_load_batch_uses_real_dtos_neutral_dataset_and_native_collation(tmp_path):
+@pytest.mark.parametrize("arch", ["moss_image", "krea2"])
+def test_load_batch_uses_real_dtos_neutral_dataset_and_native_collation(tmp_path, arch):
     trainer = _fake_trainer(tmp_path)
+    trainer.model_config.arch = arch
     pair_id, pair_dir, prompt_embeds, latents_a, latents_b = _write_pair(
         tmp_path, trainer, choice="b", prompt="normal pipeline prompt"
     )
@@ -373,6 +410,9 @@ def test_load_batch_uses_real_dtos_neutral_dataset_and_native_collation(tmp_path
     torch.testing.assert_close(batch.rejected_latents, latents_a)
     assert batch.tensor is None
     assert batch.rejected_tensor is None
+
+    for item in (chosen, chosen.rejected_item):
+        assert item.latent_space_version == item.text_embedding_space_version == arch
 
     assert chosen.path == str(pair_dir / "b.png")
     assert chosen.rejected_path == str(pair_dir / "a.png")

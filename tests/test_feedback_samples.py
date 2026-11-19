@@ -114,6 +114,45 @@ def _pair_metadata(pair_dir):
     return json.loads((pair_dir / "pair.json").read_text(encoding="utf-8"))
 
 
+@pytest.mark.parametrize("fail", [False, True])
+def test_custom_first_samples_use_their_own_embeddings_and_restore_regular_cache(tmp_path, fail):
+    from extensions_built_in.sd_trainer.SDTrainer import SDTrainer
+
+    trainer = _trainer(tmp_path, [])
+    trainer.first_sample_config = SampleConfig(samples=[
+        {"prompt": "second prompt"}, {"prompt": "first prompt"}, {"prompt": "new third prompt", "neg": "mist"}
+    ])
+    trainer.has_first_sample_requested = True
+    trainer.train_config.disable_sampling = False
+    trainer._feedback_schedule = None
+    trainer.sd.encode_control_in_text_embeddings = False
+    trainer.sd.encode_prompt = lambda prompt: torch.tensor(list(prompt.encode()), dtype=torch.uint8)
+    trainer._encode_sample_prompts = SDTrainer._encode_sample_prompts.__get__(trainer)
+    SDTrainer.cache_sample_prompts(trainer)
+    regular = trainer.sd.sample_prompts_cache
+    seen = []
+
+    def generate(configs, sampler):
+        for config, entry in zip(configs, trainer.sd.sample_prompts_cache, strict=True):
+            assert bytes(entry["conditional"].tolist()).decode() == config.prompt
+            assert bytes(entry["unconditional"].tolist()).decode() == config.negative_prompt
+            seen.append(config.prompt)
+        if fail:
+            raise RuntimeError("injected sample failure")
+
+    trainer.sd.generate_images = generate
+    if fail:
+        with pytest.raises(RuntimeError, match="injected sample failure"):
+            BaseSDTrainProcess.sample(trainer, 0, is_first=True)
+    else:
+        BaseSDTrainProcess.sample(trainer, 0, is_first=True)
+    assert seen == ["second prompt", "first prompt", "new third prompt"]
+    assert trainer.sd.sample_prompts_cache is regular
+    if not fail:
+        BaseSDTrainProcess.sample(trainer, 10)
+        assert seen[-2:] == ["first prompt", "second prompt"]
+
+
 def test_base_sample_publishes_two_prompts_with_cache_ordering(tmp_path, monkeypatch):
     monkeypatch.setattr(feedback_training, "feedback_reference_id", lambda trainer: REFERENCE_ID)
     monkeypatch.setattr(feedback_samples.secrets, "randbelow", lambda n: 0)

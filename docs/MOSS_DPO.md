@@ -1,20 +1,26 @@
-# Preference tuning MOSS-Image
+# Preference tuning MOSS-Image and Krea 2 Raw
 
-This trainer supports two related preference workflows. They share a frozen MOSS-Image reference and the same
-positive `dpo_beta` objective, but they obtain pairs differently.
+This trainer supports two related preference workflows for ordinary text-to-image transformer LoRAs. They share a
+frozen reference checkpoint and the same positive `dpo_beta` objective, but they obtain pairs differently.
 
-- **Interactive ranked sample feedback** (the normal GUI workflow): a standard MOSS text-to-image transformer LoRA
+- **Interactive ranked sample feedback** (the normal GUI workflow): a standard text-to-image transformer LoRA
   is trained with its ordinary loss while the job generates regular sample images. You rank those images later in
   the job gallery. This is also called interleaved or periodic online DPO.
 - **Offline dataset DPO**: chosen and rejected image folders are paired by matching relative paths and trained as
   `loss_type: dpo`. This remains available for curated datasets and held-out scoring.
 
-Both workflows train MOSS-Image text-to-image transformer LoRAs. Preference updates use paired velocity errors.
+Both workflows train ordinary text-to-image transformer LoRAs. Preference updates use paired velocity errors.
 Ordinary updates in an interleaved run can still use their dataset masks and loss weighting.
+
+## Krea 2 Raw
+
+Choose **Krea 2 (raw)** (`krea2`) for text-to-image preference training. This preset supports both gallery voting
+and matched offline datasets. Use the base Raw weights with the assistant adapter field empty. Turbo and edit
+checkpoints use different training inputs and are outside the supported presets.
 
 ## Interactive ranked sample feedback (GUI)
 
-Use the normal **New Job** editor, choose an ordinary MOSS-Image text-to-image checkpoint, and keep the normal
+Use the normal **New Job** editor, choose a MOSS-Image or Krea 2 Raw text-to-image checkpoint, and keep the normal
 target dataset folder. In the Training card, enable **Periodic ranked sample feedback (online DPO)**. This is a
 separate switch from the Loss Type dropdown: MSE/MAE/Wavelet/Stepped Recovery remain selectable. Online feedback and
 offline DPO cannot run together, so choosing offline DPO clears the online switch; choose an ordinary loss before

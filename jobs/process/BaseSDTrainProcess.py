@@ -481,6 +481,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if ema_was_training:
             give_back.append(self.ema.train)
         try:
+            if is_first and hasattr(self, '_first_sample_prompts_cache'):
+                regular_cache = self.sd.sample_prompts_cache
+                self.sd.sample_prompts_cache = self._first_sample_prompts_cache
+                give_back.append(lambda: setattr(self.sd, 'sample_prompts_cache', regular_cache))
             # send to be generated
             self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
             if getattr(self, '_feedback_schedule', None) is not None:
@@ -2609,6 +2613,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         )
         
         self.hook_after_sd_init_before_load()
+        if hasattr(self.sd, "track_feedback_sources"):
+            self.sd.track_feedback_sources = self.train_config.dpo_feedback is not None
         # run base sd process run
         self.sd.load_model()
         

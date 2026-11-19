@@ -298,11 +298,11 @@ def _source_identity(source):
 
 
 def _feedback_reference_identity(trainer):
-    """Frozen MOSS weights and the preprocessing that produced the archived tensors."""
+    """Frozen weights and the preprocessing that produced the archived tensors."""
     sd = trainer.sd
     config = trainer.model_config
     sources = dict(getattr(sd, "feedback_component_sources", {}) or {})
-    # The native MOSS loader records the exact shards. Alternative loaders can
+    # Native model loaders record the exact component sources. Alternative loaders can
     # still identify the base and encoders from their configured sources.
     if not any(name == "transformer" or name.startswith("transformer/") for name in sources):
         sources["transformer"] = config.name_or_path
@@ -311,6 +311,9 @@ def _feedback_reference_identity(trainer):
     sources.setdefault("vae", getattr(config, "vae_path", None))
     for name in ("lora_path", "assistant_lora_path", "accuracy_recovery_adapter", "unconditional_lora_path"):
         value = getattr(config, name, None)
+        if name == "accuracy_recovery_adapter":
+            adapter = getattr(sd, name, None)
+            value = getattr(adapter, "_aitk_weight_source", None) or value
         if isinstance(value, str) and value:
             sources[name] = value
     precision = {key: getattr(config, key, None) for key in (
@@ -320,13 +323,19 @@ def _feedback_reference_identity(trainer):
     # Adapter source was identified above; the option can also be a boolean switch.
     if "accuracy_recovery_adapter" in sources:
         precision.pop("accuracy_recovery_adapter")
-    return {
+    identity = {
         "schema": "moss-feedback-reference-v3", "architecture": config.arch,
         "sources": {key: _source_identity(source) for key, source in sources.items() if source},
         "precision": precision,
         "max_text_length": int(getattr(sd, "max_text_length", kw.get("max_text_length", 4096))),
         "edit": bool(kw.get("edit", False)), "kv_cache": bool(kw.get("kv_cache", False)),
     }
+    if config.arch == "krea2":
+        identity["schema"] = "krea2-feedback-reference-v1"
+        # A Krea checkpoint supplies weights; the configured architecture and
+        # conditioning also determine the frozen prediction for a given pair.
+        identity["conditioning"] = getattr(sd, "feedback_reference_metadata", {"mmdit_config": kw.get("mmdit_config") or {}})
+    return identity
 
 
 def feedback_reference_id(trainer: Any) -> str:
@@ -736,6 +745,7 @@ def _feedback_file_item(
     path: str,
     pair_dir: str,
     dataset_config: DatasetConfig,
+    architecture: str,
     prompt: str,
     pair_id: str,
     role: str,
@@ -758,8 +768,8 @@ def _feedback_file_item(
             scale_to_height=height,
             crop_width=width,
             crop_height=height,
-            latent_space_version="moss_image",
-            text_embedding_space_version="moss_image",
+            latent_space_version=architecture,
+            text_embedding_space_version=architecture,
         )
         item.raw_caption = prompt
         item.raw_caption_short = prompt
@@ -830,6 +840,7 @@ def load_feedback_batch(trainer: Any, pair_id: str) -> DataLoaderBatchDTO:
         path=chosen_path,
         pair_dir=pair_dir,
         dataset_config=dataset_config,
+        architecture=trainer.model_config.arch,
         prompt=record.prompt,
         pair_id=pair_id,
         role="chosen",
@@ -842,6 +853,7 @@ def load_feedback_batch(trainer: Any, pair_id: str) -> DataLoaderBatchDTO:
         path=rejected_path,
         pair_dir=pair_dir,
         dataset_config=dataset_config,
+        architecture=trainer.model_config.arch,
         prompt=record.prompt,
         pair_id=pair_id,
         role="rejected",

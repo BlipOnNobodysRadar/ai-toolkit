@@ -42,7 +42,7 @@ import {
   applyDpoMode,
   clearDpoConfig,
   handleModelArchChange,
-  isMossImageDpoEligible,
+  isImageDpoEligible,
   isValidDpoBeta,
 } from './utils';
 import { IoFlaskSharp } from 'react-icons/io5';
@@ -81,7 +81,11 @@ export default function SimpleJob({
   }, [modelArchs, jobConfig.config.process[0].model.arch]);
 
   const model = jobConfig.config.process[0].model;
-  const dpoEligible = isMossImageDpoEligible(model.arch) && !model.model_kwargs?.edit;
+  const hasAssistantAdapter =
+    typeof model.assistant_lora_path === 'string' && model.assistant_lora_path.trim() !== '';
+  const dpoEligible =
+    isImageDpoEligible(model.arch) && !model.model_kwargs?.edit && (model.arch !== 'krea2' || !hasAssistantAdapter);
+  const dpoReferenceName = model.arch === 'krea2' ? 'Krea 2 Raw' : 'MOSS';
   const isDpoActive = dpoEligible && jobConfig.config.process[0].train.loss_type === 'dpo';
   const dpoFeedback = jobConfig.config.process[0].train.dpo_feedback;
   const isDpoFeedbackActive = dpoEligible && isDpoFeedbackEnabled(dpoFeedback);
@@ -940,9 +944,9 @@ export default function SimpleJob({
                       />
                       <p className="pt-2 text-xs text-gray-400">
                         {isDpoActive && isDpoFeedbackActive
-                          ? 'Offline DPO and periodic sample feedback share this positive beta; both compare against the frozen reference MOSS checkpoint.'
+                          ? `Offline DPO and periodic sample feedback share this positive beta; both compare against the frozen reference ${dpoReferenceName} checkpoint.`
                           : isDpoActive
-                            ? 'Offline DPO compares the trainable LoRA with the frozen MOSS checkpoint using rejected dataset pairs.'
+                            ? `Offline DPO compares the trainable LoRA with the frozen ${dpoReferenceName} checkpoint using rejected dataset pairs.`
                             : 'Scales the online preference margin. The frozen reference is fixed by checkpoint content and configuration identity, not by the current trainable LoRA.'}
                       </p>
                     </>
