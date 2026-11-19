@@ -54,3 +54,18 @@ test('selection is keyed per tab and reset for a different job', () => {
   assert.match(source, /setTab\('pending'\)/);
   assert.match(source, /}, \[job\.id\]\);/);
 });
+
+test('training summary shows recorded cumulative values and steps without fabricating state', () => {
+  assert.match(source, /training\?: PreferenceFeedbackTrainingLog/);
+  assert.match(source, /const training = feedback\?\.training \?\? null/);
+  assert.match(source, />Latest training log</);
+  for (const key of ['preference_updates', 'optimizer_updates', 'foreign_votes']) {
+    assert.ok(source.includes('metric: training.' + key));
+  }
+  assert.match(source, /metric && \(/);
+  assert.match(source, /at log step \{metric.step\}/);
+  assert.match(source, /!hasLoggedProgress && recordedVoteCount > 0/);
+  assert.match(source, /Waiting for a training log entry/);
+  assert.doesNotMatch(source, /training\.preference_updates\.value \?\? 0/, 'missing metrics must not become zero');
+  assert.doesNotMatch(source, /pair (?:was )?trained|caused .*training/i, 'never claim a specific pair trained');
+});

@@ -34,10 +34,22 @@ interface PreferencePair {
   image_urls: { a: string; b: string };
 }
 
+interface PreferenceTrainingMetric {
+  value: number;
+  step: number;
+}
+
+interface PreferenceFeedbackTrainingLog {
+  preference_updates: PreferenceTrainingMetric | null;
+  optimizer_updates: PreferenceTrainingMetric | null;
+  foreign_votes: PreferenceTrainingMetric | null;
+}
+
 interface PreferenceFeedbackList {
   enabled: boolean;
   pairs: PreferencePair[];
   counts: Record<TabKey, number>;
+  training?: PreferenceFeedbackTrainingLog;
 }
 
 interface PreferenceComparison {
@@ -248,6 +260,10 @@ export default function PreferenceFeedback({ job }: { job: Job }) {
   const shouldShow = configured || !!feedback?.enabled || (feedback?.pairs.length ?? 0) > 0;
   if (!shouldShow) return null;
 
+  const training = feedback?.training ?? null;
+  const hasLoggedProgress = !!training && !!(training.preference_updates || training.optimizer_updates);
+  const recordedVoteCount = (feedback?.counts.rated ?? 0) + (feedback?.counts.skipped ?? 0);
+
   const tabs: Array<{ key: TabKey; label: string }> = [
     { key: 'pending', label: 'Pending' },
     { key: 'rated', label: 'Rated' },
@@ -302,6 +318,31 @@ export default function PreferenceFeedback({ job }: { job: Job }) {
         </div>
       )}
 
+      {training && (
+        <div className="border-b border-gray-700 bg-gray-900/40 px-4 py-3" aria-label="Latest training log">
+          <h3 className="text-xs font-semibold text-gray-300">Latest training log</h3>
+          <dl className="mt-1 flex flex-wrap gap-x-5 gap-y-1 text-xs">
+            {[
+              { label: 'Preference updates', metric: training.preference_updates },
+              { label: 'Total optimizer updates', metric: training.optimizer_updates },
+              { label: 'Votes incompatible with the reference', metric: training.foreign_votes },
+            ].map(({ label, metric }) => metric && (
+              <div key={label} className="flex items-baseline gap-1.5">
+                <dt className="text-gray-400">{label}</dt>
+                <dd className="text-gray-100">
+                  {metric.value} <span className="text-gray-500">at log step {metric.step}</span>
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+      )}
+
+      {feedback && !hasLoggedProgress && recordedVoteCount > 0 && (
+        <div role="status" className="border-b border-gray-700 px-4 py-2 text-xs text-gray-400">
+          Vote saved. Waiting for a training log entry.
+        </div>
+      )}
       <div id="preference-feedback-panel">
         {status === 'loading' && feedback === null && (
           <div className="flex items-center gap-2 px-4 py-6 text-sm text-gray-300">

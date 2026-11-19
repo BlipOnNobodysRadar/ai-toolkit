@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'crypto';
+import sqlite3 from 'sqlite3';
 import { jobFolderError } from '../../cron/ownership/resources';
 
 // Job-scoped reader/writer for MOSS preference-feedback pairs.
@@ -33,10 +34,28 @@ export interface PreferencePair {
   image_urls: { a: string; b: string };
 }
 
+export interface PreferenceTrainingMetric {
+  /** Trainer value recorded at this exact loss-log step; each metric has its own semantics and step. */
+  value: number;
+  /** The loss-log step that owns the row, never the job's current step. */
+  step: number;
+}
+
+export interface PreferenceFeedbackTrainingLog {
+  /** Completed preference updates reported by the latest feedback/updates row. */
+  preference_updates: PreferenceTrainingMetric | null;
+  /** Successful optimizer updates reported by the latest feedback/optimizer_updates row. */
+  optimizer_updates: PreferenceTrainingMetric | null;
+  /** Aggregate incompatible votes at the last recorded feedback/foreign_votes scan. */
+  foreign_votes: PreferenceTrainingMetric | null;
+}
+
 export interface PreferenceFeedbackList {
   enabled: boolean;
   pairs: PreferencePair[];
   counts: { pending: number; rated: number; skipped: number; invalid: number };
+  /** Present only when at least one real feedback metric row exists in the job's loss log. */
+  training?: PreferenceFeedbackTrainingLog;
 }
 
 type BoundJob = {
@@ -469,6 +488,94 @@ const imageUrls = (jobID: string, preferenceID: string) => ({
   b: `/api/jobs/${encodeURIComponent(jobID)}/preferences/${encodeURIComponent(preferenceID)}/image/b`,
 });
 
+const TRAINING_METRIC_KEYS = ['feedback/updates', 'feedback/optimizer_updates', 'feedback/foreign_votes'] as const;
+const SQLITE_SIDECAR_SUFFIXES = ['-wal', '-shm', '-journal'] as const;
+// Each lookup seeks to the end of one (key, step) index range even on long runs.
+const TRAINING_METRIC_LOOKUP_SQL = TRAINING_METRIC_KEYS.map(() => `
+  SELECT * FROM (
+    SELECT key, step, value_real FROM metrics
+    WHERE key = ? AND value_real IS NOT NULL
+    ORDER BY step DESC LIMIT 1
+  )
+`).join(' UNION ALL ');
+
+type TrainingMetricRow = { key: string; step: number; value_real: number | null };
+
+const latestTrainingMetric = (
+  rows: TrainingMetricRow[],
+  key: (typeof TRAINING_METRIC_KEYS)[number],
+): PreferenceTrainingMetric | null => {
+  const row = rows.find(candidate => candidate.key === key);
+  if (!row || !isSafeInteger(row.step) || row.step < 0) return null;
+  if (typeof row.value_real !== 'number' || !Number.isFinite(row.value_real)) return null;
+  return { value: row.value_real, step: row.step };
+};
+
+// Query only the three latest feedback rows by the metrics (key, step) index. The read-only connection and bounded
+// LIMIT keep this independent of the potentially large loss graph/history. Any open/query/lock failure is soft: the
+// preference gallery remains usable and the panel simply has no recorded-training summary.
+const readLatestTrainingMetrics = (dbPath: string): Promise<PreferenceFeedbackTrainingLog | undefined> =>
+  new Promise(resolve => {
+    const db = new sqlite3.Database(dbPath, sqlite3.OPEN_READONLY, openError => {
+      if (openError) {
+        resolve(undefined);
+        return;
+      }
+      db.all(TRAINING_METRIC_LOOKUP_SQL, [...TRAINING_METRIC_KEYS], (queryError, rows: TrainingMetricRow[]) => {
+        if (queryError) {
+          db.close(() => resolve(undefined));
+          return;
+        }
+        const metricRows = Array.isArray(rows) ? rows : [];
+        const training: PreferenceFeedbackTrainingLog = {
+          preference_updates: latestTrainingMetric(metricRows, 'feedback/updates'),
+          optimizer_updates: latestTrainingMetric(metricRows, 'feedback/optimizer_updates'),
+          foreign_votes: latestTrainingMetric(metricRows, 'feedback/foreign_votes'),
+        };
+
+        const present = training.preference_updates || training.optimizer_updates || training.foreign_votes;
+        db.close(() => resolve(present ? training : undefined));
+      });
+    });
+    // A locked/corrupt/hostile log must not stall pair listing indefinitely.
+    db.configure('busyTimeout', 750);
+  });
+
+const readSafeTrainingLog = async (bound: BoundRoot): Promise<PreferenceFeedbackTrainingLog | undefined> => {
+  const lexical = path.join(bound.lexical, 'loss_log.db');
+  let stat: fs.Stats;
+  try {
+    stat = await fs.promises.lstat(lexical);
+  } catch {
+    return undefined;
+  }
+  // The trainer owns a regular pre-existing SQLite file. Never follow a linked DB or a linked WAL/SHM/journal.
+  if (stat.isSymbolicLink() || !stat.isFile()) return undefined;
+  const real = await fs.promises.realpath(lexical).catch(() => null);
+  if (!real || !isContained(bound.real, real)) return undefined;
+
+  for (const suffix of SQLITE_SIDECAR_SUFFIXES) {
+    const sidecar = `${lexical}${suffix}`;
+    let sidecarStat: fs.Stats | null;
+    try {
+      sidecarStat = await fs.promises.lstat(sidecar);
+    } catch (error: any) {
+      if (error?.code === 'ENOENT') continue;
+      return undefined;
+    }
+    if (!sidecarStat) continue;
+    if (sidecarStat.isSymbolicLink() || !sidecarStat.isFile()) return undefined;
+    const sidecarReal = await fs.promises.realpath(sidecar).catch(() => null);
+    if (!sidecarReal || !isContained(bound.real, sidecarReal)) return undefined;
+  }
+
+  try {
+    return await readLatestTrainingMetrics(real);
+  } catch {
+    return undefined;
+  }
+};
+
 export const listPreferenceFeedback = async (
   job: BoundJob,
   trainingRoot: string,
@@ -476,7 +583,12 @@ export const listPreferenceFeedback = async (
   const enabled = isDpoFeedbackEnabled(job.job_config);
   const bound = await resolveBoundJobRoot(job, trainingRoot);
   const counts = { pending: 0, rated: 0, skipped: 0, invalid: 0 };
-  if (!bound.preferencesReal) return { enabled, pairs: [], counts };
+  if (!bound.preferencesReal) {
+    const empty = { enabled, pairs: [], counts };
+    if (!enabled) return empty;
+    const training = await readSafeTrainingLog(bound);
+    return training ? { ...empty, training } : empty;
+  }
 
   let entries: fs.Dirent[];
   try {
@@ -503,7 +615,10 @@ export const listPreferenceFeedback = async (
   }
 
   pairs.sort((a, b) => b.step - a.step || b.created_at.localeCompare(a.created_at) || b.id.localeCompare(a.id));
-  return { enabled, pairs, counts };
+  const result = { enabled, pairs, counts };
+  if (!enabled && pairs.length === 0) return result;
+  const training = await readSafeTrainingLog(bound);
+  return training ? { ...result, training } : result;
 };
 
 export const readPreferenceImage = async (

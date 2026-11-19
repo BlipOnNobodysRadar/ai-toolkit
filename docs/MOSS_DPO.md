@@ -55,6 +55,20 @@ if you extend and resume the same job. A changed frozen reference makes its earl
 reference identifier tracks the base and encoding setup. Learning rate, total steps and feedback cadence can
 change on resume without invalidating a vote.
 
+### Training progress in the feedback panel
+
+When a job has enabled feedback (or still has published pairs), the Preference feedback panel may show a **Latest
+training log** summary read from the job's existing `loss_log.db`. It includes the following metrics.
+
+- `feedback/updates`: completed preference optimizer updates, cumulative at the latest recorded row.
+- `feedback/optimizer_updates`: successful optimizer updates, cumulative at its latest recorded row.
+- `feedback/foreign_votes`: aggregate incompatible votes found by the most recent recorded scan. The count reflects the latest recorded scan.
+
+Each value is shown with the loss-log step that owns its row. The two update counts are cumulative. Logging can lag training, and a rewind can leave
+older rows in the log. These job-wide counts report activity across all eligible pairs. If the log
+is absent, disabled, unreadable, corrupt, or locked, the pair gallery and voting continue to work and the summary is
+omitted. If votes exist before any feedback metric row, the panel only notes that the votes are recorded.
+
 ### On-disk pair contract
 
 Each new independent sample pair belongs to the current job and is stored under:

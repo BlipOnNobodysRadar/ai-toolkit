@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 const { randomUUID } = require('crypto');
+const sqlite3 = require('sqlite3');
 const { setupDb, makeJob, ts } = require('./harness/fixture.cjs');
 const { SCRATCH } = require('./harness/env.cjs');
 
@@ -127,6 +128,50 @@ const writePair = (jobFolder, preferenceID, overrides = {}, bytes = null) => {
   return pairDir;
 };
 
+const sqliteRun = (db, sql, params = []) =>
+  new Promise((resolve, reject) => db.run(sql, params, error => (error ? reject(error) : resolve())));
+const sqliteOpen = file => new Promise((resolve, reject) => {
+  const db = new sqlite3.Database(file, error => (error ? reject(error) : resolve(db)));
+});
+const sqliteClose = db => new Promise((resolve, reject) => db.close(error => (error ? reject(error) : resolve())));
+
+const writeLossMetrics = async (jobFolder, rows) => {
+  const file = path.join(jobFolder, 'loss_log.db');
+  const db = await sqliteOpen(file);
+  try {
+    await sqliteRun(db, 'CREATE TABLE steps (step INTEGER PRIMARY KEY, wall_time REAL NOT NULL);');
+    await sqliteRun(db, 'CREATE TABLE metric_keys (key TEXT PRIMARY KEY, first_seen_step INTEGER, last_seen_step INTEGER);');
+    await sqliteRun(
+      db,
+      'CREATE TABLE metrics (step INTEGER NOT NULL, key TEXT NOT NULL, value_real REAL, value_text TEXT, PRIMARY KEY (step, key));',
+    );
+    await sqliteRun(db, 'CREATE INDEX idx_metrics_key_step ON metrics (key, step);');
+    const bounds = new Map();
+    for (const row of rows) {
+      await sqliteRun(db, 'INSERT OR REPLACE INTO steps(step, wall_time) VALUES(?, ?);', [row.step, row.wall_time ?? row.step]);
+      await sqliteRun(
+        db,
+        'INSERT OR REPLACE INTO metrics(step, key, value_real, value_text) VALUES(?, ?, ?, NULL);',
+        [row.step, row.key, row.value],
+      );
+      const prior = bounds.get(row.key);
+      bounds.set(row.key, {
+        first: prior ? Math.min(prior.first, row.step) : row.step,
+        last: prior ? Math.max(prior.last, row.step) : row.step,
+      });
+    }
+    for (const [key, bound] of bounds) {
+      await sqliteRun(
+        db,
+        'INSERT OR REPLACE INTO metric_keys(key, first_seen_step, last_seen_step) VALUES(?, ?, ?);',
+        [key, bound.first, bound.last],
+      );
+    }
+  } finally {
+    await sqliteClose(db);
+  }
+  return file;
+};
 test('positive contract: enabled feedback lists one exact pair, serves its exact images, and accepts an immutable idempotent vote', async () => {
   const job = await makeFeedbackJob('positive-pairs');
   const pairID = randomUUID().replaceAll('-', '');
@@ -471,6 +516,123 @@ test('linked .decision directories are rejected without reading outside or writi
   assert.equal(fs.existsSync(path.join(pairDir, 'vote.json')), false, 'linked decision cannot create a top-level receipt');
 });
 
+test('training summary uses latest real feedback metrics, keeps exact own steps, and preserves actual zeros', async () => {
+  const job = await makeFeedbackJob('training-metrics-latest');
+  const pairID = randomUUID().replaceAll('-', '');
+  writePair(job.run_dir, pairID);
+  await writeLossMetrics(job.run_dir, [
+    { step: 3, key: 'feedback/updates', value: 0 },
+    { step: 9, key: 'feedback/updates', value: 0 },
+    { step: 4, key: 'feedback/optimizer_updates', value: 12 },
+    { step: 8, key: 'feedback/optimizer_updates', value: 41 },
+    { step: 6, key: 'feedback/foreign_votes', value: 0 },
+    { step: 10, key: 'feedback/foreign_votes', value: 2 },
+    { step: 12, key: 'loss/total', value: 0.5 },
+  ]);
+
+  const listed = await callList(job.id);
+  assert.equal(listed.status, 200);
+  const list = await bodyOf(listed);
+  assert.deepEqual(list.training, {
+    preference_updates: { value: 0, step: 9 },
+    optimizer_updates: { value: 41, step: 8 },
+    foreign_votes: { value: 2, step: 10 },
+  });
+  assert.equal(list.pairs.length, 1, 'metrics and pair listing coexist');
+
+  // A rewind/stale-job display must keep the log row's own steps rather than borrowing the job's current step.
+  await F.db.job.update({ where: { id: job.id }, data: { step: 1 } });
+  const afterRewind = await bodyOf(await callList(job.id));
+  assert.deepEqual(afterRewind.training, list.training);
+});
+
+
+test('missing feedback metrics stay absent while a present zero is not treated as missing', async () => {
+  const partial = await makeFeedbackJob('training-metrics-partial');
+  writePair(partial.run_dir, randomUUID().replaceAll('-', ''));
+  await writeLossMetrics(partial.run_dir, [{ step: 7, key: 'feedback/updates', value: 0 }]);
+  const partialList = await bodyOf(await callList(partial.id));
+  assert.deepEqual(partialList.training, {
+    preference_updates: { value: 0, step: 7 },
+    optimizer_updates: null,
+    foreign_votes: null,
+  });
+
+  const ordinaryLog = await makeFeedbackJob('training-metrics-unrelated');
+  writePair(ordinaryLog.run_dir, randomUUID().replaceAll('-', ''));
+  await writeLossMetrics(ordinaryLog.run_dir, [{ step: 5, key: 'loss/total', value: 1 }]);
+  const ordinaryList = await bodyOf(await callList(ordinaryLog.id));
+  assert.equal(Object.hasOwn(ordinaryList, 'training'), false, 'no fabricated summary without feedback metrics');
+});
+
+test('corrupt training log fails soft: list and voting still work', async () => {
+  const job = await makeFeedbackJob('training-metrics-corrupt');
+  const pairID = randomUUID().replaceAll('-', '');
+  writePair(job.run_dir, pairID);
+  fs.writeFileSync(path.join(job.run_dir, 'loss_log.db'), 'not a sqlite database');
+
+  const listed = await callList(job.id);
+  assert.equal(listed.status, 200);
+  const list = await bodyOf(listed);
+  assert.equal(list.pairs.length, 1);
+  assert.equal(Object.hasOwn(list, 'training'), false);
+
+  const vote = await callVote(job.id, pairID, { choice: 'a' });
+  assert.equal(vote.status, 200, JSON.stringify(await bodyOf(vote)));
+  assert.equal((await bodyOf(vote)).vote.choice, 'a');
+});
+
+test('linked loss logs and unsafe sidecars are not followed', async () => {
+  const outside = fs.mkdtempSync(path.join(SCRATCH, 'training-metrics-outside-'));
+  roots.push(outside);
+  await writeLossMetrics(outside, [{ step: 11, key: 'feedback/updates', value: 7 }]);
+  const outsideDb = path.join(outside, 'loss_log.db');
+
+  const linkedJob = await makeFeedbackJob('training-metrics-linked');
+  writePair(linkedJob.run_dir, randomUUID().replaceAll('-', ''));
+  let linked = false;
+  try {
+    fs.symlinkSync(outsideDb, path.join(linkedJob.run_dir, 'loss_log.db'), 'file');
+    linked = true;
+  } catch (error) {
+    if (error?.code !== 'EPERM' && error?.code !== 'EACCES') throw error;
+  }
+  if (!linked) return;
+  const linkedList = await bodyOf(await callList(linkedJob.id));
+  assert.equal(linkedList.pairs.length, 1);
+  assert.equal(Object.hasOwn(linkedList, 'training'), false, 'linked DB is refused without hiding the gallery');
+
+  const sidecarJob = await makeFeedbackJob('training-metrics-sidecar');
+  writePair(sidecarJob.run_dir, randomUUID().replaceAll('-', ''));
+  await writeLossMetrics(sidecarJob.run_dir, [{ step: 4, key: 'feedback/updates', value: 3 }]);
+  try {
+    fs.symlinkSync(outsideDb, path.join(sidecarJob.run_dir, 'loss_log.db-wal'), 'file');
+  } catch (error) {
+    if (error?.code !== 'EPERM' && error?.code !== 'EACCES') throw error;
+    return;
+  }
+  const sidecarList = await bodyOf(await callList(sidecarJob.id));
+  assert.equal(sidecarList.pairs.length, 1);
+  assert.equal(Object.hasOwn(sidecarList, 'training'), false, 'linked WAL sidecar is refused');
+});
+
+test('a locked training log does not break the preference gallery', async () => {
+  const job = await makeFeedbackJob('training-metrics-locked');
+  writePair(job.run_dir, randomUUID().replaceAll('-', ''));
+  const dbFile = await writeLossMetrics(job.run_dir, [{ step: 3, key: 'feedback/updates', value: 1 }]);
+  const lock = await sqliteOpen(dbFile);
+  try {
+    await sqliteRun(lock, 'BEGIN EXCLUSIVE;');
+    const listed = await callList(job.id);
+    assert.equal(listed.status, 200);
+    const list = await bodyOf(listed);
+    assert.equal(list.pairs.length, 1);
+    assert.equal(Object.hasOwn(list, 'training'), false);
+  } finally {
+    await sqliteRun(lock, 'ROLLBACK;').catch(() => {});
+    await sqliteClose(lock);
+  }
+});
 test('Samples integration is opt-in and the browser component never handles filesystem paths', () => {
   const samples = fs.readFileSync(ts.uiPath('src/components/SampleImages.tsx'), 'utf8');
   assert.match(samples, /import PreferenceFeedback from '\.\/PreferenceFeedback'/);
