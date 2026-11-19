@@ -69,3 +69,13 @@ test('training summary shows recorded cumulative values and steps without fabric
   assert.doesNotMatch(source, /training\.preference_updates\.value \?\? 0/, 'missing metrics must not become zero');
   assert.doesNotMatch(source, /pair (?:was )?trained|caused .*training/i, 'never claim a specific pair trained');
 });
+test('rated-pair export is visible, gated by rated count, and uses the authenticated download path', () => {
+  assert.match(source, /Export DPO ZIP/);
+  assert.match(source, /disabled=\{ratedCount === 0 \|\| downloadingExport\}/);
+  assert.match(source, /const ratedCount = feedback\?\.counts\.rated \?\? 0/);
+  assert.match(source, /apiClient\.get\(`\/api\/jobs\/\$\{encodeURIComponent\(job\.id\)\}\/preferences\/export`/);
+  assert.match(source, /responseType: 'blob'/);
+  assert.match(source, /link\.download = 'preference-feedback\.zip'/);
+  assert.match(source, /setExportError\(message\)/);
+  assert.match(source, /role="alert"/);
+});

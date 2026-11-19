@@ -171,6 +171,8 @@ pairs to measure whether images improve.
 
 ## Offline dataset DPO
 
+To reuse your gallery ratings, open **Job → Samples → Preference feedback** and select **Export DPO ZIP**. Extract the ZIP and point `folder_path` at `chosen/` and `rejected_path` at `rejected/`. Each A or B rating contributes the two original PNGs and their shared prompt. The download excludes skipped and pending pairs. You can use the dataset with another compatible text-to-image LoRA.
+
 Put the image you want MOSS to favor in the chosen folder and its alternative in the rejected folder. Save the shared
 prompt next to the chosen image.
 
