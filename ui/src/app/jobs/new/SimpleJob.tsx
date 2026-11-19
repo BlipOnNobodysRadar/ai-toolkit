@@ -804,11 +804,11 @@ export default function SimpleJob({
                 <NumberInput
                   label="Weight Decay"
                   className="pt-2"
-                  value={jobConfig.config.process[0].train.optimizer_params.weight_decay}
-                  onChange={value => setJobConfig(value, 'config.process[0].train.optimizer_params.weight_decay')}
-                  placeholder="eg. 0.0001"
+                  value={jobConfig.config.process[0].train.optimizer_params?.weight_decay ?? null}
+                  onChange={value => setJobConfig(value ?? undefined, 'config.process[0].train.optimizer_params.weight_decay')}
+                  placeholder="Optimizer default"
                   min={0}
-                  required
+                  allowEmpty
                 />
               </div>
               {!isLlmModel && (
