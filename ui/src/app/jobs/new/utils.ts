@@ -2,6 +2,44 @@ import { GroupedSelectOption, JobConfig, SelectOption } from '@/types';
 import { ModelArch } from './options';
 import { objectCopy } from '@/utils/basic';
 
+export const DPO_BETA_DEFAULT = 100;
+
+/** Only the text-to-image MOSS registrations are eligible; the edit variants
+ * share the moss_image backend arch but are excluded from DPO. */
+export const isMossImageDpoEligible = (archName: string | undefined): boolean =>
+  archName === 'moss_image' || archName === 'moss_image:base';
+
+export const isValidDpoBeta = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value) && value > 0;
+
+/** Apply the invariants DPO needs without touching unrelated training options. */
+export const applyDpoMode = (
+  jobConfig: JobConfig,
+  setJobConfig: (value: any, key: string) => void,
+) => {
+  const process = jobConfig.config.process[0];
+  setJobConfig('dpo', 'config.process[0].train.loss_type');
+  setJobConfig('flowmatch', 'config.process[0].train.noise_scheduler');
+  if (!isValidDpoBeta(process.train.dpo_beta)) {
+    setJobConfig(DPO_BETA_DEFAULT, 'config.process[0].train.dpo_beta');
+  }
+  setJobConfig('lora', 'config.process[0].network.type');
+  setJobConfig(true, 'config.process[0].network.transformer_only');
+  setJobConfig(true, 'config.process[0].train.train_unet');
+  setJobConfig(false, 'config.process[0].train.train_text_encoder');
+};
+
+/** Remove DPO-only fields when leaving DPO or an eligible architecture. */
+export const clearDpoConfig = (
+  jobConfig: JobConfig,
+  setJobConfig: (value: any, key: string) => void,
+) => {
+  setJobConfig(undefined, 'config.process[0].train.dpo_beta');
+  jobConfig.config.process[0].datasets.forEach((_, i) => {
+    setJobConfig(undefined, `config.process[0].datasets[${i}].rejected_path`);
+  });
+};
+
 const expandDatasetDefaults = (
   defaults: { [key: string]: any },
   numDatasets: number,
@@ -35,6 +73,16 @@ export const handleModelArchChange = (
 
   // update the defaults when a model is selected
   const newArch = modelArchs.find(model => model.name === newArchName);
+
+  const newArchSupportsDpo = isMossImageDpoEligible(newArchName);
+
+  // DPO fields are only valid on an eligible non-edit MOSS text-to-image arch.
+  if (!newArchSupportsDpo) {
+    if (jobConfig.config.process[0].train.loss_type === 'dpo') {
+      setJobConfig('mse', 'config.process[0].train.loss_type');
+    }
+    setJobConfig(undefined, 'config.process[0].train.dpo_beta');
+  }
 
   // update vram setting
   if (!newArch?.additionalSections?.includes('model.low_vram')) {
@@ -76,6 +124,9 @@ export const handleModelArchChange = (
   const datasets = jobConfig.config.process[0].datasets.map(dataset => {
     const newDataset = objectCopy(dataset);
     newDataset.controls = controls;
+    if (!newArchSupportsDpo) {
+      delete newDataset.rejected_path;
+    }
     if (hasMultiControlPaths) {
       // make sure the config has the multi control paths
       newDataset.control_path_1 = newDataset.control_path_1 || null;

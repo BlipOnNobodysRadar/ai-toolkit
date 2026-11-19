@@ -29,7 +29,14 @@ import { openPromptBoxEditor } from '@/components/PromptBoxEditorModal';
 import AddSingleImageModal, { openAddImageModal } from '@/components/AddSingleImageModal';
 import SampleControlImage from '@/components/SampleControlImage';
 import { FlipHorizontal2, FlipVertical2 } from 'lucide-react';
-import { handleModelArchChange } from './utils';
+import {
+  DPO_BETA_DEFAULT,
+  applyDpoMode,
+  clearDpoConfig,
+  handleModelArchChange,
+  isMossImageDpoEligible,
+  isValidDpoBeta,
+} from './utils';
 import { IoFlaskSharp } from 'react-icons/io5';
 import { isMac } from '@/helpers/basic';
 
@@ -64,6 +71,22 @@ export default function SimpleJob({
   const modelArch = useMemo(() => {
     return modelArchs.find(a => a.name === jobConfig.config.process[0].model.arch) as ModelArch;
   }, [modelArchs, jobConfig.config.process[0].model.arch]);
+
+  const model = jobConfig.config.process[0].model;
+  const dpoEligible = isMossImageDpoEligible(model.arch) && !model.model_kwargs?.edit;
+  const isDpoActive = dpoEligible && jobConfig.config.process[0].train.loss_type === 'dpo';
+  const lossTypeOptions = useMemo(() => {
+    const options: SelectOption[] = [
+      { value: 'mse', label: 'Mean Squared Error' },
+      { value: 'mae', label: 'Mean Absolute Error' },
+      { value: 'wavelet', label: 'Wavelet' },
+      { value: 'stepped', label: 'Stepped Recovery' },
+    ];
+    if (dpoEligible) {
+      options.push({ value: 'dpo', label: 'DPO (Direct Preference Optimization)' });
+    }
+    return options;
+  }, [dpoEligible]);
 
   const jobType = useMemo(() => {
     return jobTypeOptions.find(j => j.value === jobConfig.config.process[0].type);
@@ -589,6 +612,7 @@ export default function SimpleJob({
             <SelectInput
               label="Target Type"
               value={jobConfig.config.process[0].network?.type ?? 'lora'}
+              disabled={isDpoActive}
               onChange={value => setJobConfig(value, 'config.process[0].network.type')}
               options={[
                 { value: 'lora', label: 'LoRA' },
@@ -801,14 +825,41 @@ export default function SimpleJob({
                     label="Loss Type"
                     className="pt-2"
                     value={jobConfig.config.process[0].train.loss_type}
-                    onChange={value => setJobConfig(value, 'config.process[0].train.loss_type')}
-                    options={[
-                      { value: 'mse', label: 'Mean Squared Error' },
-                      { value: 'mae', label: 'Mean Absolute Error' },
-                      { value: 'wavelet', label: 'Wavelet' },
-                      { value: 'stepped', label: 'Stepped Recovery' },
-                    ]}
+                    onChange={value => {
+                      if (value === 'dpo') {
+                        applyDpoMode(jobConfig, setJobConfig);
+                      } else {
+                        setJobConfig(value, 'config.process[0].train.loss_type');
+                        clearDpoConfig(jobConfig, setJobConfig);
+                      }
+                    }}
+                    options={lossTypeOptions}
                   />
+                  {isDpoActive && (
+                    <>
+                      <NumberInput
+                        label="DPO Beta"
+                        className="pt-2"
+                        docKey="train.dpo_beta"
+                        value={
+                          isValidDpoBeta(jobConfig.config.process[0].train.dpo_beta)
+                            ? (jobConfig.config.process[0].train.dpo_beta as number)
+                            : DPO_BETA_DEFAULT
+                        }
+                        onChange={value => {
+                          if (value !== null) {
+                            setJobConfig(value, 'config.process[0].train.dpo_beta');
+                          }
+                        }}
+                        placeholder="eg. 100"
+                        min={Number.MIN_VALUE}
+                        required
+                      />
+                      <p className="pt-2 text-xs text-gray-400">
+                        DPO compares the trainable LoRA with the frozen MOSS checkpoint.
+                      </p>
+                    </>
+                  )}
                   {modelArch?.additionalSections?.includes('train.audio_loss_multiplier') && (
                     <NumberInput
                       label="Audio Loss Multiplier"
@@ -1211,11 +1262,36 @@ export default function SimpleJob({
                   <div className={datasetStyleClass}>
                     <div>
                       <SelectInput
-                        label="Target Dataset"
+                        label={isDpoActive ? 'Chosen Dataset' : 'Target Dataset'}
                         value={dataset.folder_path}
-                        onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].folder_path`)}
+                        onChange={value => {
+                          setJobConfig(value, `config.process[0].datasets[${i}].folder_path`);
+                          if (dataset.rejected_path === value) {
+                            setJobConfig(undefined, `config.process[0].datasets[${i}].rejected_path`);
+                          }
+                        }}
                         options={datasetOptions}
                       />
+                      {isDpoActive && (
+                        <>
+                          <SelectInput
+                            label="Rejected Dataset"
+                            docKey="datasets.rejected_path"
+                            value={dataset.rejected_path ?? ''}
+                            className="pt-2"
+                            onChange={value =>
+                              setJobConfig(value === '' ? null : value, `config.process[0].datasets[${i}].rejected_path`)
+                            }
+                            options={[
+                              { value: '', label: '- Select rejected folder -' },
+                              ...datasetOptions.filter((option: SelectOption) => option.value !== dataset.folder_path),
+                            ]}
+                          />
+                          <p className="pt-2 text-xs text-gray-400">
+                            Keep the same relative filename in the chosen and rejected folders.
+                          </p>
+                        </>
+                      )}
                       {modelArch?.additionalSections?.includes('datasets.control_path') && (
                         <SelectInput
                           label="Control Dataset"

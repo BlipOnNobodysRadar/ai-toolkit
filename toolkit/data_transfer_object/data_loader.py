@@ -61,6 +61,16 @@ class FileItemDTO(
     def __init__(self, *args, **kwargs):
         self.path = kwargs.get("path", "")
         self.dataset_config: "DatasetConfig" = kwargs.get("dataset_config", None)
+        # DPO pairs keep the rejected image as a sibling FileItemDTO. The batch
+        # owns only the chosen item in file_items, and collates the rejected arm
+        # into separate rejected_* fields.
+        self.rejected_item: Union["FileItemDTO", None] = None
+        self.rejected_path: Union[str, None] = None
+        # The rejected arm uses the same geometry but must never share a latent
+        # cache identity with the chosen arm.
+        self.latent_cache_role: str = kwargs.get("latent_cache_role", "chosen")
+        self.dpo_source_digest = kwargs.get("dpo_source_digest")
+        self.dpo_pair_signature: Union[str, None] = kwargs.get("dpo_pair_signature", None)
         # a video dataset can contain both videos and images. Images are
         # treated as single-frame items and bucketed separately from videos
         dataset_is_video = self.dataset_config.num_frames > 1 or self.dataset_config.auto_frame_count
@@ -100,7 +110,9 @@ class FileItemDTO(
         else:
             file_key = os.path.basename(self.path)
 
-        file_signature = get_quick_signature_string(self.path)
+        if self.dpo_source_digest is not None:
+            file_key = f"dpo:{self.latent_cache_role}:{file_key}"
+        file_signature = self.dpo_source_digest or get_quick_signature_string(self.path)
         if file_signature is None:
             raise Exception("Error: Could not get file signature for {self.path}")
 
@@ -151,7 +163,13 @@ class FileItemDTO(
         elif use_db_entry:
             w, h, _ = db_entry[:3]
         else:
-            if self.dataset_config.fast_image_size:
+            if self.dpo_source_digest is not None:
+                # A digest-qualified size entry records a successful decode in displayed orientation.
+                with Image.open(self.path) as source:
+                    oriented = exif_transpose(source)
+                    oriented.load()
+                    w, h = oriented.size
+            elif self.dataset_config.fast_image_size:
                 # original method is significantly faster, but some images are read sideways. Not sure why. Do slow method by default.
                 try:
                     w, h = image_utils.get_image_size(self.path)
@@ -233,7 +251,6 @@ class FileItemDTO(
     def tensor(self):
         self._tensor = None
 
-
 class DataLoaderBatchDTO:
     def __init__(self, **kwargs):
         try:
@@ -242,6 +259,10 @@ class DataLoaderBatchDTO:
             self._tensor: Union[torch.Tensor, None] = None
             self._tensor_uint8: Union[torch.Tensor, None] = None
             self.latents: Union[torch.Tensor, None] = None
+            # DPO preference arms are deliberately separate from the chosen
+            # tensor/latents and from all conditioning tensors.
+            self.rejected_tensor: Union[torch.Tensor, None] = None
+            self.rejected_latents: Union[torch.Tensor, None] = None
             self.control_tensor: Union[torch.Tensor, None] = None
             self.control_tensor_list: Union[List[List[torch.Tensor]], None] = None
             self.clip_image_tensor: Union[torch.Tensor, None] = None
@@ -280,6 +301,14 @@ class DataLoaderBatchDTO:
 
             self.num_frames: int = self.file_items[0].num_frames
 
+            # Load cached latents before the optional pixel-tensor branch. With
+            # cache_tensors_to_disk a fresh worker item has not read its cache
+            # file yet, so _cached_tensor_uint8 would otherwise look absent.
+            loaded_latents = (
+                [x.get_latent() for x in self.file_items]
+                if is_latents_cached else None
+            )
+
             if (
                 not is_latents_cached
                 or self.file_items[0].dataset_config.load_image_when_caching_latents
@@ -295,9 +324,8 @@ class DataLoaderBatchDTO:
             # if we have encoded latents, we concatenate them
             self.latents: Union[torch.Tensor, None] = None
             if is_latents_cached:
-                # this get_latent call with trigger loading all cached items from the disk.
-                # DTO.stack keeps any extra streams (audio, ...) riding on the batch latents
-                self.latents = DTO.stack([x.get_latent() for x in self.file_items])
+                # DTO.stack keeps any extra streams (audio, ...) riding on the batch latents.
+                self.latents = DTO.stack(loaded_latents)
                 if any(
                     [x._cached_first_frame_latent is not None for x in self.file_items]
                 ):
@@ -315,6 +343,36 @@ class DataLoaderBatchDTO:
                             for x in self.file_items
                         ]
                     )
+            dpo_items = [x for x in self.file_items if getattr(x, 'rejected_item', None) is not None]
+            if dpo_items:
+                if len(dpo_items) != len(self.file_items):
+                    raise ValueError(
+                        "Refusing to collate a batch that mixes DPO pairs with ordinary items: "
+                        + ", ".join(getattr(x, 'path', '<unknown>') for x in self.file_items)
+                    )
+                rejected_latents = None
+                if is_latents_cached:
+                    # Load rejected disk caches before the optional pixel-tensor
+                    # branch, which may need _cached_tensor_uint8 from the same
+                    # cache file.
+                    rejected_latents = [x.rejected_item.get_latent() for x in self.file_items]
+                if (
+                    not is_latents_cached
+                    or self.file_items[0].dataset_config.load_image_when_caching_latents
+                    or self.file_items[0].dataset_config.cache_tensors_to_disk
+                ):
+                    rejected = [x.rejected_item for x in self.file_items]
+                    if all(
+                        y.__dict__.get('_tensor') is None and getattr(y, '_cached_tensor_uint8', None) is not None
+                        for y in rejected
+                    ):
+                        rejected_uint8 = torch.cat([y._cached_tensor_uint8.unsqueeze(0) for y in rejected])
+                        self.rejected_tensor = _latent_from_uint8(rejected_uint8, dtype=torch.float16)
+                    else:
+                        self.rejected_tensor = torch.cat([y.tensor.unsqueeze(0) for y in rejected])
+                if is_latents_cached:
+                    self.rejected_latents = DTO.stack(rejected_latents)
+
             self.prompt_embeds: Union[PromptEmbeds, None] = None
             # diff output preservation embeds (trigger word replaced with class)
             self.dop_prompt_embeds: Union[PromptEmbeds, None] = None
@@ -611,12 +669,16 @@ class DataLoaderBatchDTO:
     def cleanup(self):
         del self.latents
         del self.tensor
+        del self.rejected_latents
+        del self.rejected_tensor
         del self.control_tensor
         del self.audio_tensor
         del self.audio_data
         del self.first_frame_latents
         for file_item in self.file_items:
             file_item.cleanup()
+            if getattr(file_item, 'rejected_item', None) is not None:
+                file_item.rejected_item.cleanup()
 
     @property
     def dataset_config(self) -> "DatasetConfig":

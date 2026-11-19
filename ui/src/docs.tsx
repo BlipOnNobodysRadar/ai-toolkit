@@ -153,6 +153,27 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'datasets.rejected_path': {
+    title: 'Rejected Dataset',
+    description: (
+      <>
+        DPO preference training pairs each chosen image in the target dataset with a rejected image in this folder. The
+        rejected folder must contain the same relative filenames (and matching image extensions) as the chosen folder.
+        Prefer ordinary image pairs with a shared caption next to the chosen image. MOSS-Image edit training is not
+        supported for DPO.
+      </>
+    ),
+  },
+  'train.dpo_beta': {
+    title: 'DPO Beta',
+    description: (
+      <>
+        Scales the preference margin for Diffusion DPO. It must be a finite number greater than zero; 100 is the default.
+        Larger values put more weight on separating chosen from rejected predictions. Start with the default and judge
+        the result on held-out prompts.
+      </>
+    ),
+  },
   'train.unload_text_encoder': {
     title: 'Unload Text Encoder',
     description: (

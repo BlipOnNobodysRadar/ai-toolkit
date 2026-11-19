@@ -1,0 +1,48 @@
+job: extension
+config:
+  name: moss_image_dpo
+  process:
+    - type: sd_trainer
+      training_folder: output
+      device: cuda:0
+      network:
+        type: lora
+        linear: 16
+        linear_alpha: 16
+      model:
+        arch: moss_image
+        name_or_path: OpenMOSS-Team/MOSS-Image-SFT
+        quantize: true
+        qtype: convrot8
+        quantize_te: true
+        qtype_te: convrot8
+      datasets:
+        - folder_path: /path/to/preferences/chosen
+          rejected_path: /path/to/preferences/rejected
+          caption_ext: txt
+          resolution: 512
+          cache_latents_to_disk: true
+          cache_text_embeddings: true
+      train:
+        loss_type: dpo
+        dpo_beta: 100
+        noise_scheduler: flowmatch
+        timestep_type: logit_normal
+        logit_normal_mean: 1.09
+        logit_normal_std: 0.95
+        logit_normal_cutoff: 0.95
+        logit_normal_uniform: 0.01
+        batch_size: 1  # preference pairs per microbatch
+        gradient_accumulation: 1
+        gradient_checkpointing: true
+        train_unet: true
+        train_text_encoder: false
+        steps: 100
+        lr: 0.00001
+        optimizer: adamw
+        dtype: bf16
+        disable_sampling: true
+      save:
+        dtype: bf16
+        save_every: 50
+        max_step_saves_to_keep: 2
