@@ -56,10 +56,10 @@ const responseJson = async res => {
   return res.body;
 };
 const post = (route, body) => route.POST({ json: async () => body });
-const middlewareRequest = (method, pathname, token) => ({
+const middlewareRequest = (method, pathname, token, readKey) => ({
   method,
   headers: new Headers(token ? { Authorization: `Bearer ${token}` } : {}),
-  nextUrl: { pathname },
+  nextUrl: { pathname, searchParams: new URLSearchParams(readKey ? { k: readKey } : {}) },
 });
 const uploadRequest = (datasetName, entries) => ({
   formData: async () => {
@@ -74,42 +74,70 @@ const uploadRequest = (datasetName, entries) => ({
   },
 });
 
-test('middleware exempts only public GET/HEAD media reads; mutating routes require the configured bearer token', () => {
-  const old = process.env.AI_TOOLKIT_AUTH;
+// Upstream 73c84b09 (merged 20 Nov 2026): with a password set, media reads no longer pass bare. They need the
+// rolling read key (?k=), the bearer token, or AI_TOOLKIT_DISABLE_READ_PROTECTION=1. The read key never opens a
+// mutating route.
+test('middleware: public media reads need a live read key; mutating routes require the configured bearer token', async () => {
+  const { getReadKeys } = require(ts.uiPath('src/server/readKey.ts'));
+  const names = ['AI_TOOLKIT_AUTH', 'AI_TOOLKIT_READ_SECRET', 'AI_TOOLKIT_DISABLE_READ_PROTECTION'];
+  const saved = Object.fromEntries(names.map(name => [name, process.env[name]]));
+  const reads = [
+    ['GET', '/api/img/a.png'],
+    ['HEAD', '/api/files/a.png'],
+    ['GET', '/api/audio/art/a.png'],
+  ];
+  const protectedRoutes = [
+    ['POST', '/api/img/delete'],
+    ['POST', '/api/files/delete'],
+    ['POST', '/api/img/caption'],
+    ['PATCH', '/api/files/delete'],
+    ['DELETE', '/api/img/a.png'],
+    ['GET', '/api/img-other/a.png'],
+    ['GET', '/api/jobs'],
+  ];
   try {
     process.env.AI_TOOLKIT_AUTH = 'fixture-only-token';
-    for (const [method, url] of [
-      ['GET', '/api/img/a.png'],
-      ['HEAD', '/api/files/a.png'],
-      ['GET', '/api/audio/art/a.png'],
-    ]) {
-      assert.equal(middleware(middlewareRequest(method, url)).next, true, `${method} ${url}`);
-    }
-    for (const [method, url] of [
-      ['POST', '/api/img/delete'],
-      ['POST', '/api/files/delete'],
-      ['POST', '/api/img/caption'],
-      ['PATCH', '/api/files/delete'],
-      ['DELETE', '/api/img/a.png'],
-      ['GET', '/api/img-other/a.png'],
-      ['GET', '/api/jobs'],
-    ]) {
-      const res = middleware(middlewareRequest(method, url));
-      assert.equal(res.status, 401, `${method} ${url} must be protected`);
-    }
-    assert.equal(middleware(middlewareRequest('POST', '/api/img/delete', 'fixture-only-token')).next, true);
-    assert.equal(middleware(middlewareRequest('GET', '/api/jobs', 'fixture-only-token')).next, true);
-  } finally {
-    if (old === undefined) delete process.env.AI_TOOLKIT_AUTH;
-    else process.env.AI_TOOLKIT_AUTH = old;
-  }
+    process.env.AI_TOOLKIT_READ_SECRET = 'fixture-only-read-secret';
+    delete process.env.AI_TOOLKIT_DISABLE_READ_PROTECTION;
+    const [currentKey, previousKey] = await getReadKeys();
+    assert.match(currentKey, /^[0-9a-f]{32}$/);
 
-  const oldNoAuth = process.env.AI_TOOLKIT_AUTH;
-  try {
+    for (const [method, url] of reads) {
+      assert.equal((await middleware(middlewareRequest(method, url))).status, 401, `${method} ${url} bare`);
+      assert.equal((await middleware(middlewareRequest(method, url, null, 'f'.repeat(32)))).status, 401, `${method} ${url} wrong key`);
+      assert.equal((await middleware(middlewareRequest(method, url, null, currentKey))).next, true, `${method} ${url} key`);
+      assert.equal((await middleware(middlewareRequest(method, url, null, previousKey))).next, true, `${method} ${url} previous key`);
+      assert.equal((await middleware(middlewareRequest(method, url, 'fixture-only-token'))).next, true, `${method} ${url} token`);
+    }
+    for (const [method, url] of protectedRoutes) {
+      assert.equal((await middleware(middlewareRequest(method, url))).status, 401, `${method} ${url} must be protected`);
+      // a read key is for reads on the media prefixes only
+      assert.equal((await middleware(middlewareRequest(method, url, null, currentKey))).status, 401, `${method} ${url} with a read key`);
+    }
+    assert.equal((await middleware(middlewareRequest('POST', '/api/img/delete', 'fixture-only-token'))).next, true);
+    assert.equal((await middleware(middlewareRequest('GET', '/api/jobs', 'fixture-only-token'))).next, true);
+
+    // no launch secret: no key validates, reads fall back to the token
+    delete process.env.AI_TOOLKIT_READ_SECRET;
+    assert.equal((await middleware(middlewareRequest('GET', '/api/img/a.png', null, currentKey))).status, 401);
+
+    // the opt-out restores bare reads, and still nothing else
+    process.env.AI_TOOLKIT_DISABLE_READ_PROTECTION = '1';
+    for (const [method, url] of reads) {
+      assert.equal((await middleware(middlewareRequest(method, url))).next, true, `${method} ${url} opt-out`);
+    }
+    for (const [method, url] of protectedRoutes) {
+      assert.equal((await middleware(middlewareRequest(method, url))).status, 401, `${method} ${url} opt-out`);
+    }
+
     delete process.env.AI_TOOLKIT_AUTH;
-    assert.equal(middleware(middlewareRequest('POST', '/api/img/delete')).next, true, 'local no-auth mode stays open');
+    delete process.env.AI_TOOLKIT_DISABLE_READ_PROTECTION;
+    assert.equal((await middleware(middlewareRequest('POST', '/api/img/delete'))).next, true, 'local no-auth mode stays open');
   } finally {
-    if (oldNoAuth !== undefined) process.env.AI_TOOLKIT_AUTH = oldNoAuth;
+    for (const name of names) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name];
+    }
   }
 });
 
