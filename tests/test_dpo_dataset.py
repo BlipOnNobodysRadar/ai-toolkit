@@ -224,8 +224,9 @@ def test_load_never_substitutes_a_corrupt_pair(tmp_path, monkeypatch):
         raise AssertionError("DPO load must not substitute another item")
 
     monkeypatch.setattr(ds, "_get_replacement_index", forbidden_replacement)
+    bad_index = next(i for i, item in enumerate(ds.file_list) if item.rejected_path == str(rejected / "a.png"))
     with pytest.raises(RuntimeError, match=r"DPO pair failed to load: chosen=.*a\.png, rejected=.*a\.png"):
-        ds._get_single_item(0)
+        ds._get_single_item(bad_index)
 
 
 @pytest.mark.parametrize("mode", ["memory", "disk"])

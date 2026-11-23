@@ -1,6 +1,8 @@
 # State machines: catalog, invariants, transitions, defects
 
-**CURRENT STATUS — 2026-11-07.** Section 20 supersedes the relevant older behaviour/status. Commits: UI `bb21cae1`; core and shared CLI/UI leases `964d79a1`; data/cache/inference `cb692933`. Final combined CPU suite: **863 passed, 53 skipped**, with unchanged Python source hashes. Full UI: **101 passed**; both TypeScript projects: **zero diagnostics**. All fixes are committed on `codex/opus-state-machines-20261106`, unmerged and unpushed; main remains `f6c137b4`. The separate detached `db8dafb5` GPU comparison is unchanged and does not validate these new commits. No GPU throughput/full-model validation was run here.
+**Queue update.** The GUI now uses the upstream AI Toolkit worker and job actions. The run ownership, deletion reservations and UI writer leases described in the historical audit below have been removed. The training process still protects its checkpoints against concurrent trainers. For a finished job shown as running, open the job menu and choose **Mark as Stopped**. **Delete** removes the job and its output folder.
+
+**Audit snapshot — 2026-11-07.** Section 20 supersedes the relevant older behaviour/status. Commits: UI `bb21cae1`; core and shared CLI/UI leases `964d79a1`; data/cache/inference `cb692933`. Final combined CPU suite: **863 passed, 53 skipped**, with unchanged Python source hashes. Full UI: **101 passed**; both TypeScript projects: **zero diagnostics**. All fixes are committed on `codex/opus-state-machines-20261106`, unmerged and unpushed; main remains `f6c137b4`. The separate detached `db8dafb5` GPU comparison is unchanged and does not validate these new commits. No GPU throughput/full-model validation was run here.
 
 **Historical status (sections 1-19; preserved verbatim; superseded where section 20 applies):**
 

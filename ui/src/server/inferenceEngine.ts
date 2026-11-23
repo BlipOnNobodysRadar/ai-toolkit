@@ -58,17 +58,15 @@ export async function listEngines(forceFresh = false): Promise<EngineHandle[]> {
   const trainingFolder = await getTrainingFolder();
   const handles: EngineHandle[] = [];
   for (const job of jobs) {
-    const active = ['starting', 'running', 'queued', 'stopping'].includes(job.status);
-    // a run that reported an ending but whose process exit is not verified yet still owns its GPU
-    const exiting = !active && job.run_id != null && job.launch_phase != null && job.launch_phase !== 'exited';
+    const active = ['running', 'queued', 'stopping'].includes(job.status);
     const endpoint = readEndpoint(path.join(trainingFolder, job.name));
-    if (!active && !endpoint && !exiting) continue;
+    if (!active && !endpoint) continue;
     handles.push({
       jobId: job.id,
       jobName: job.name,
       gpuIds: job.gpu_ids,
       // process still alive after the row was stopped: report it as stopping
-      status: !active && (endpoint || exiting) ? 'stopping' : job.status,
+      status: !active && endpoint ? 'stopping' : job.status,
       endpoint,
     });
   }

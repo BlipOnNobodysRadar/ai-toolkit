@@ -1,9 +1,4 @@
-// Cross-process operation lock (docs/STATE_MACHINES.md M19 uploads, M35 job deletion): an EXCLUSIVE transaction on a
-// small sidecar SQLite file, held for the whole operation (job deletion, one upload's chunk/finish/cancel). SQLite
-// takes an OS file lock,
-// so the lock is released when the holder's process dies; there is no owner file to judge stale and no unlink, so
-// a replacement owner can never be removed by a waiter (the ABA problem of create-exclusive lock files). Nothing
-// durable lives in this transaction: operations keep their state in their own files, written before/after I/O.
+// Serialize changes to an upload across requests. SQLite releases the file lock if the holder exits.
 import fs from 'fs';
 import path from 'path';
 import sqlite3 from 'sqlite3';

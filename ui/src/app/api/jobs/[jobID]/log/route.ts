@@ -99,11 +99,11 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
             log = log.slice(newlineIdx + 1);
           }
         }
-        return NextResponse.json({ log, offset: read.offset, reset: true, generation, run_id: job.run_id });
+        return NextResponse.json({ log, offset: read.offset, reset: true, generation, run_id: generation });
       }
       // Incremental: return only the bytes appended since the last offset.
       const read = await readRange(fh, offset, size);
-      return NextResponse.json({ ...read, reset: false, generation, run_id: job.run_id });
+      return NextResponse.json({ ...read, reset: false, generation, run_id: generation });
     } finally {
       await fh.close();
     }

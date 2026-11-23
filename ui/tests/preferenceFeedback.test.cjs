@@ -61,9 +61,9 @@ const callVote = (jobID, preferenceID, body) =>
   voteRoute.POST({ json: async () => body }, { params: Promise.resolve({ jobID, preferenceID }) });
 const bodyOf = async res => res.json();
 
-const makeFeedbackJob = async (name, { enabled = true, runDir = null, configOverride = null } = {}) => {
+const makeFeedbackJob = async (name, { enabled = true, configOverride = null } = {}) => {
   const id = randomUUID();
-  const folder = runDir || path.join(F.trainingRoot, name);
+  const folder = path.join(F.trainingRoot, name);
   const config = configOverride || {
     job: 'extension',
     config: {
@@ -83,11 +83,10 @@ const makeFeedbackJob = async (name, { enabled = true, runDir = null, configOver
   const job = await makeJob(F.db, {
     id,
     name,
-    run_dir: folder,
     job_config: JSON.stringify(config),
   });
   fs.mkdirSync(folder, { recursive: true });
-  return job;
+  return { id: job.id, folder };
 };
 
 const voteRecord = (pairID, choice, votedAt = '2026-11-18T13:00:00.000Z') => ({
@@ -175,7 +174,7 @@ const writeLossMetrics = async (jobFolder, rows) => {
 test('positive contract: enabled feedback lists one exact pair, serves its exact images, and accepts an immutable idempotent vote', async () => {
   const job = await makeFeedbackJob('positive-pairs');
   const pairID = randomUUID().replaceAll('-', '');
-  const pairDir = writePair(job.run_dir, pairID);
+  const pairDir = writePair(job.folder, pairID);
   const bytesA = fs.readFileSync(path.join(pairDir, 'a.png'));
 
   const listed = await callList(job.id);
@@ -225,7 +224,7 @@ test('positive contract: enabled feedback lists one exact pair, serves its exact
 test('skip is an immutable decision and disabled feedback with a published pair still opens the gallery', async () => {
   const job = await makeFeedbackJob('disabled-with-pair', { enabled: false });
   const pairID = randomUUID().replaceAll('-', '');
-  writePair(job.run_dir, pairID, { created_at: '2026-11-18T12:34:56+00:00' });
+  writePair(job.folder, pairID, { created_at: '2026-11-18T12:34:56+00:00' });
 
   let listed = await bodyOf(await callList(job.id));
   assert.equal(listed.enabled, false);
@@ -257,16 +256,16 @@ test('ordinary jobs stay empty and invalid ids/arms/choices are rejected without
 test('malformed metadata and non-UUID directories are omitted; a malformed vote is surfaced as invalid and never overwritten', async () => {
   const job = await makeFeedbackJob('defensive-metadata');
   const goodID = randomUUID().replaceAll('-', '');
-  writePair(job.run_dir, goodID);
+  writePair(job.folder, goodID);
   const badID = randomUUID().replaceAll('-', '');
-  writePair(job.run_dir, badID, { version: 999 });
+  writePair(job.folder, badID, { version: 999 });
   const strayID = '../escape';
-  fs.mkdirSync(path.join(job.run_dir, 'preferences', strayID), { recursive: true });
+  fs.mkdirSync(path.join(job.folder, 'preferences', strayID), { recursive: true });
 
   let list = await bodyOf(await callList(job.id));
   assert.deepEqual(list.pairs.map(p => p.id), [goodID]);
 
-  const votePath = path.join(job.run_dir, 'preferences', goodID, 'vote.json');
+  const votePath = path.join(job.folder, 'preferences', goodID, 'vote.json');
   fs.writeFileSync(votePath, '{not json');
   const beforeBytes = fs.readFileSync(votePath);
   list = await bodyOf(await callList(job.id));
@@ -282,7 +281,7 @@ test('malformed metadata and non-UUID directories are omitted; a malformed vote 
 test('concurrent different votes: exactly one immutable winner and one conflict', async () => {
   const job = await makeFeedbackJob('vote-race');
   const pairID = randomUUID().replaceAll('-', '');
-  const pairDir = writePair(job.run_dir, pairID);
+  const pairDir = writePair(job.folder, pairID);
 
   const [ra, rb] = await Promise.all([
     callVote(job.id, pairID, { choice: 'a' }),
@@ -301,26 +300,25 @@ test('concurrent different votes: exactly one immutable winner and one conflict'
   assert.deepEqual(noTempFiles, [], 'temporary vote files are cleaned up');
 });
 
-test('path defenses: outside run bindings, linked preference roots, and linked pair files are refused', async () => {
+test('path defenses: outside job names, linked preference roots, and linked pair files are refused', async () => {
   const outside = fs.mkdtempSync(path.join(SCRATCH, 'preference-outside-'));
   roots.push(outside);
-  const outsideJobFolder = path.join(outside, 'escape');
-  fs.mkdirSync(outsideJobFolder, { recursive: true });
-
-  const escaped = await makeFeedbackJob('escaped-root', { runDir: outsideJobFolder });
+  const escaped = await makeJob(F.db, { id: randomUUID(), name: outside });
   const escapedList = await callList(escaped.id);
-  assert.equal(escapedList.status, 409);
-  assert.match((await bodyOf(escapedList)).error, /claimed job folder/i);
+  assert.equal(escapedList.status, 400);
+  const error = await bodyOf(escapedList);
+  assert.equal(error.code, 'INVALID_JOB_FOLDER');
+  assert.equal(error.error.includes(outside), false);
 
   const linkedJob = await makeFeedbackJob('linked-prefs');
-  fs.symlinkSync(outside, path.join(linkedJob.run_dir, 'preferences'), 'junction');
+  fs.symlinkSync(outside, path.join(linkedJob.folder, 'preferences'), 'junction');
   const linkedList = await callList(linkedJob.id);
   assert.equal(linkedList.status, 403);
   assert.equal(JSON.stringify(await bodyOf(linkedList)).includes(outside), false, 'error does not reveal the outside path');
 
   const linkedPairJob = await makeFeedbackJob('linked-pair-file');
   const pairID = randomUUID().replaceAll('-', '');
-  const pairDir = writePair(linkedPairJob.run_dir, pairID);
+  const pairDir = writePair(linkedPairJob.folder, pairID);
   const outsideImage = path.join(outside, 'secret.png');
   fs.writeFileSync(outsideImage, 'secret image bytes');
   let linked = false;
@@ -340,7 +338,7 @@ test('path defenses: outside run bindings, linked preference roots, and linked p
   }
 });
 
-test('existing bearer middleware protects preference reads and votes', () => {
+test('existing bearer middleware protects preference reads and votes', async () => {
   const middleware = require(ts.uiPath('src/middleware.ts')).middleware;
   const request = (method, jobID, token) => ({
     method,
@@ -351,10 +349,10 @@ test('existing bearer middleware protects preference reads and votes', () => {
   try {
     process.env.AI_TOOLKIT_AUTH = 'fixture-only-token';
     const id = randomUUID().replaceAll('-', '');
-    assert.equal(middleware(request('GET', id)).status, 401);
-    assert.equal(middleware(request('POST', id)).status, 401);
-    assert.equal(middleware(request('GET', id, 'fixture-only-token')).next, true);
-    assert.equal(middleware(request('POST', id, 'fixture-only-token')).next, true);
+    assert.equal((await middleware(request('GET', id))).status, 401);
+    assert.equal((await middleware(request('POST', id))).status, 401);
+    assert.equal((await middleware(request('GET', id, 'fixture-only-token'))).next, true);
+    assert.equal((await middleware(request('POST', id, 'fixture-only-token'))).next, true);
   } finally {
     if (old === undefined) delete process.env.AI_TOOLKIT_AUTH;
     else process.env.AI_TOOLKIT_AUTH = old;
@@ -366,8 +364,8 @@ test('portable decisions work without hard links and persist genuine A and B cho
   const job = await makeFeedbackJob('portable-ab');
   const pairA = randomUUID().replaceAll('-', '');
   const pairB = randomUUID().replaceAll('-', '');
-  const dirA = writePair(job.run_dir, pairA);
-  const dirB = writePair(job.run_dir, pairB);
+  const dirA = writePair(job.folder, pairA);
+  const dirB = writePair(job.folder, pairB);
 
   const originalLink = fs.promises.link;
   fs.promises.link = async () => {
@@ -415,7 +413,7 @@ test('portable decisions work without hard links and persist genuine A and B cho
 test('legacy top-level vote.json is authoritative before any portable decision exists', async () => {
   const job = await makeFeedbackJob('legacy-top-level');
   const pairID = randomUUID().replaceAll('-', '');
-  const pairDir = writePair(job.run_dir, pairID);
+  const pairDir = writePair(job.folder, pairID);
   const legacy = voteRecord(pairID, 'a', '2026-11-18T12:00:00.000Z');
   writeVote(pairDir, legacy);
   const legacyText = fs.readFileSync(path.join(pairDir, 'vote.json'), 'utf8');
@@ -437,7 +435,7 @@ test('legacy top-level vote.json is authoritative before any portable decision e
 test('concurrent same-choice votes are idempotent with one complete winner', async () => {
   const job = await makeFeedbackJob('vote-race-same');
   const pairID = randomUUID().replaceAll('-', '');
-  const pairDir = writePair(job.run_dir, pairID);
+  const pairDir = writePair(job.folder, pairID);
 
   const responses = await Promise.all(
     Array.from({ length: 6 }, () => callVote(job.id, pairID, { choice: 'a' })),
@@ -459,7 +457,7 @@ test('concurrent same-choice votes are idempotent with one complete winner', asy
 test('interrupted projection heals from .decision and retries recover the committed winner', async () => {
   const job = await makeFeedbackJob('interrupted-projection');
   const pairID = randomUUID().replaceAll('-', '');
-  const pairDir = writePair(job.run_dir, pairID);
+  const pairDir = writePair(job.folder, pairID);
   const committed = voteRecord(pairID, 'b', '2026-11-18T14:00:00.000Z');
   writeDecision(pairDir, committed);
   const decisionText = fs.readFileSync(path.join(pairDir, '.decision', 'vote.json'), 'utf8');
@@ -492,7 +490,7 @@ test('linked .decision directories are rejected without reading outside or writi
   roots.push(outside);
   const job = await makeFeedbackJob('linked-decision');
   const pairID = randomUUID().replaceAll('-', '');
-  const pairDir = writePair(job.run_dir, pairID);
+  const pairDir = writePair(job.folder, pairID);
   const outsideDecision = path.join(outside, 'decision');
   fs.mkdirSync(outsideDecision, { recursive: true });
   fs.writeFileSync(path.join(outsideDecision, 'vote.json'), JSON.stringify(voteRecord(pairID, 'a'), null, 2) + '\n');
@@ -519,8 +517,8 @@ test('linked .decision directories are rejected without reading outside or writi
 test('training summary uses latest real feedback metrics, keeps exact own steps, and preserves actual zeros', async () => {
   const job = await makeFeedbackJob('training-metrics-latest');
   const pairID = randomUUID().replaceAll('-', '');
-  writePair(job.run_dir, pairID);
-  await writeLossMetrics(job.run_dir, [
+  writePair(job.folder, pairID);
+  await writeLossMetrics(job.folder, [
     { step: 3, key: 'feedback/updates', value: 0 },
     { step: 9, key: 'feedback/updates', value: 0 },
     { step: 4, key: 'feedback/optimizer_updates', value: 12 },
@@ -549,8 +547,8 @@ test('training summary uses latest real feedback metrics, keeps exact own steps,
 
 test('missing feedback metrics stay absent while a present zero is not treated as missing', async () => {
   const partial = await makeFeedbackJob('training-metrics-partial');
-  writePair(partial.run_dir, randomUUID().replaceAll('-', ''));
-  await writeLossMetrics(partial.run_dir, [{ step: 7, key: 'feedback/updates', value: 0 }]);
+  writePair(partial.folder, randomUUID().replaceAll('-', ''));
+  await writeLossMetrics(partial.folder, [{ step: 7, key: 'feedback/updates', value: 0 }]);
   const partialList = await bodyOf(await callList(partial.id));
   assert.deepEqual(partialList.training, {
     preference_updates: { value: 0, step: 7 },
@@ -559,8 +557,8 @@ test('missing feedback metrics stay absent while a present zero is not treated a
   });
 
   const ordinaryLog = await makeFeedbackJob('training-metrics-unrelated');
-  writePair(ordinaryLog.run_dir, randomUUID().replaceAll('-', ''));
-  await writeLossMetrics(ordinaryLog.run_dir, [{ step: 5, key: 'loss/total', value: 1 }]);
+  writePair(ordinaryLog.folder, randomUUID().replaceAll('-', ''));
+  await writeLossMetrics(ordinaryLog.folder, [{ step: 5, key: 'loss/total', value: 1 }]);
   const ordinaryList = await bodyOf(await callList(ordinaryLog.id));
   assert.equal(Object.hasOwn(ordinaryList, 'training'), false, 'no fabricated summary without feedback metrics');
 });
@@ -568,8 +566,8 @@ test('missing feedback metrics stay absent while a present zero is not treated a
 test('corrupt training log fails soft: list and voting still work', async () => {
   const job = await makeFeedbackJob('training-metrics-corrupt');
   const pairID = randomUUID().replaceAll('-', '');
-  writePair(job.run_dir, pairID);
-  fs.writeFileSync(path.join(job.run_dir, 'loss_log.db'), 'not a sqlite database');
+  writePair(job.folder, pairID);
+  fs.writeFileSync(path.join(job.folder, 'loss_log.db'), 'not a sqlite database');
 
   const listed = await callList(job.id);
   assert.equal(listed.status, 200);
@@ -589,10 +587,10 @@ test('linked loss logs and unsafe sidecars are not followed', async () => {
   const outsideDb = path.join(outside, 'loss_log.db');
 
   const linkedJob = await makeFeedbackJob('training-metrics-linked');
-  writePair(linkedJob.run_dir, randomUUID().replaceAll('-', ''));
+  writePair(linkedJob.folder, randomUUID().replaceAll('-', ''));
   let linked = false;
   try {
-    fs.symlinkSync(outsideDb, path.join(linkedJob.run_dir, 'loss_log.db'), 'file');
+    fs.symlinkSync(outsideDb, path.join(linkedJob.folder, 'loss_log.db'), 'file');
     linked = true;
   } catch (error) {
     if (error?.code !== 'EPERM' && error?.code !== 'EACCES') throw error;
@@ -603,10 +601,10 @@ test('linked loss logs and unsafe sidecars are not followed', async () => {
   assert.equal(Object.hasOwn(linkedList, 'training'), false, 'linked DB is refused without hiding the gallery');
 
   const sidecarJob = await makeFeedbackJob('training-metrics-sidecar');
-  writePair(sidecarJob.run_dir, randomUUID().replaceAll('-', ''));
-  await writeLossMetrics(sidecarJob.run_dir, [{ step: 4, key: 'feedback/updates', value: 3 }]);
+  writePair(sidecarJob.folder, randomUUID().replaceAll('-', ''));
+  await writeLossMetrics(sidecarJob.folder, [{ step: 4, key: 'feedback/updates', value: 3 }]);
   try {
-    fs.symlinkSync(outsideDb, path.join(sidecarJob.run_dir, 'loss_log.db-wal'), 'file');
+    fs.symlinkSync(outsideDb, path.join(sidecarJob.folder, 'loss_log.db-wal'), 'file');
   } catch (error) {
     if (error?.code !== 'EPERM' && error?.code !== 'EACCES') throw error;
     return;
@@ -618,8 +616,8 @@ test('linked loss logs and unsafe sidecars are not followed', async () => {
 
 test('a locked training log does not break the preference gallery', async () => {
   const job = await makeFeedbackJob('training-metrics-locked');
-  writePair(job.run_dir, randomUUID().replaceAll('-', ''));
-  const dbFile = await writeLossMetrics(job.run_dir, [{ step: 3, key: 'feedback/updates', value: 1 }]);
+  writePair(job.folder, randomUUID().replaceAll('-', ''));
+  const dbFile = await writeLossMetrics(job.folder, [{ step: 3, key: 'feedback/updates', value: 1 }]);
   const lock = await sqliteOpen(dbFile);
   try {
     await sqliteRun(lock, 'BEGIN EXCLUSIVE;');

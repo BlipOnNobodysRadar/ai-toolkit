@@ -81,7 +81,6 @@ export type JobReports = {
 export type ReportJob = {
   id: string;
   name: string;
-  run_dir?: string | null;
 };
 
 const METRIC_KEYS = [
@@ -391,7 +390,7 @@ const readReport = async (
   }
 };
 
-/** Resolve the persisted job binding, then read only the two fixed report names from that verified folder. */
+/** Read the two fixed report names from the verified job folder. */
 export const readJobReports = async (job: ReportJob, trainingRoot: string): Promise<JobReports> => {
   const bound = await resolveBoundJobRoot(job, trainingRoot);
   const validationFile = await readReport(bound, VALIDATION_FILE, true);

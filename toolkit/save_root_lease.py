@@ -1,17 +1,11 @@
 """One writer per training save root (docs/STATE_MACHINES.md, OPUS-ONEWRITER-01).
 
 Resume selection, pruning, the non-atomic checkpoint writes and the RAWR pair slots all assume that a single trainer
-writes a save root, and job deletion assumes nobody is writing the folder it removes. A lease is the UI's operation
-lock protocol (ui/cron/ownership/opLock.ts): an open BEGIN EXCLUSIVE transaction, with no wait, on a small SQLite file
-outside the root, `<canonical parent>/.aitk_locks/writer.<sha256(canonical root)>.lock` (the path
-ui/cron/ownership/writerLease.ts computes). Outside, so deleting the folder cannot remove the lock and let another
-writer take a replacement; the file is never unlinked. SQLite's OS lock drops when its owner dies.
+writes a save root. An open SQLite transaction in the parent directory holds the lock independently of the
+checkpoint files. SQLite releases it when the trainer exits.
 
-A training process holds its root for its lifetime, on behalf of its job: the processes of one job may share a root
-(a job's process list runs them in turn), anyone else is refused, whether another OS process, the UI deleting the
-folder, or another job in this process (a separate SQLite connection is busy too). Spellings of one folder (relative,
-case, trailing dots, junctions, symlinks) canonicalize like resources.ts canonicalFolder, so they meet at one lock.
-This covers cooperating writers of that exact root, not nested roots or other programs. Stdlib only.
+Training processes within one job may share the root. A second training job targeting the same canonical
+directory cannot acquire the lease.
 """
 import hashlib
 import os

@@ -2,7 +2,7 @@
 //
 // One directory per upload under <loras>/.uploads/<id>/: state.json (the durable record: immutable name/size/
 // overwrite, every received chunk with its length and SHA-256, publication intent and result), data.part (the
-// bytes) and op.lock (the crash-released operation lock, ui/cron/ownership/opLock.ts). Every chunk, finish and
+// bytes) and op.lock (the crash-released operation lock, uploadLock.ts). Every chunk, finish and
 // cancel runs entirely under that lock, so no operation can overlap another one's file I/O, in any process.
 //
 //   receiving --chunk--> receiving (only after the bytes are written and fsynced is the chunk recorded)
@@ -16,7 +16,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { OpLockBusy, withOpLock } from '../../cron/ownership/opLock';
+import { OpLockBusy, withOpLock } from './uploadLock';
 
 export type UploadState = {
   version: 1;

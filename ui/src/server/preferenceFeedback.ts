@@ -4,12 +4,12 @@ import { randomUUID } from 'crypto';
 import { once } from 'events';
 import archiver from 'archiver';
 import sqlite3 from 'sqlite3';
-import { jobFolderError } from '../../cron/ownership/resources';
+import { jobFolderError } from '../../cron/jobFolder';
 
 // Job-scoped reader/writer for MOSS preference-feedback pairs.
 //
 // The browser supplies only a job id, a pair id and a fixed arm/choice. Every filesystem path is derived from the
-// persisted job binding; pair metadata and vote files are treated as untrusted input. The image route is never a
+// configured training folder and job name; pair metadata and vote files are treated as untrusted input. The image route is never a
 // generic file server: the only filenames it can serve are a.png and b.png inside a validated pair directory.
 
 export type PreferenceChoice = 'a' | 'b' | 'skip';
@@ -63,7 +63,6 @@ export interface PreferenceFeedbackList {
 type BoundJob = {
   id: string;
   name: string;
-  run_dir?: string | null;
   job_config?: string | null;
 };
 
@@ -104,9 +103,6 @@ const isContained = (root: string, candidate: string): boolean => {
   const rel = path.relative(root, candidate);
   return rel === '' || (!path.isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${path.sep}`));
 };
-
-const sameName = (a: string, b: string): boolean =>
-  process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
 
 const lstatOptional = async (file: string): Promise<fs.Stats | null> => {
   try {
@@ -226,14 +222,14 @@ export const isDpoFeedbackEnabled = (rawJobConfig: string | null | undefined): b
 
 type BoundRoot = { lexical: string; real: string; preferencesLexical: string; preferencesReal: string | null };
 
-// Bind to the exact folder the invariant launch code admitted. `run_dir` is the durable claim; old rows without one
-// fall back to the same direct-child rule used by admission. A nested symlink/junction is refused rather than followed.
+// The UI stores each job under its name in the configured training folder.
 export const resolveBoundJobRoot = async (job: BoundJob, trainingRoot: string): Promise<BoundRoot> => {
   if (!job || !isUuidV4(job.id)) {
     throw new PreferenceFeedbackError('Invalid job id.', 400, 'INVALID_JOB_ID');
   }
-  const nameError = jobFolderError(trainingRoot, job.name);
-  if (nameError) throw new PreferenceFeedbackError(nameError, 400, 'INVALID_JOB_FOLDER');
+  if (jobFolderError(trainingRoot, job.name)) {
+    throw new PreferenceFeedbackError('Invalid job folder name.', 400, 'INVALID_JOB_FOLDER');
+  }
 
   const configuredRoot = path.resolve(trainingRoot);
   const configuredStat = await fs.promises.stat(configuredRoot).catch(() => null);
@@ -244,19 +240,7 @@ export const resolveBoundJobRoot = async (job: BoundJob, trainingRoot: string): 
     throw new PreferenceFeedbackError('The configured training folder cannot be resolved safely.', 500, 'TRAINING_FOLDER_UNAVAILABLE');
   });
 
-  const expected = path.resolve(configuredRoot, job.name);
-  let lexical = expected;
-  if (job.run_dir !== undefined && job.run_dir !== null && job.run_dir !== '') {
-    if (typeof job.run_dir !== 'string') {
-      throw new PreferenceFeedbackError('The job has an invalid run folder binding.', 409, 'INVALID_RUN_BINDING');
-    }
-    const bound = path.resolve(job.run_dir);
-    if (!sameName(path.dirname(bound), configuredRoot) || !sameName(path.basename(bound), job.name)) {
-      throw new PreferenceFeedbackError('The job run folder is not the claimed job folder.', 409, 'INVALID_RUN_BINDING');
-    }
-    lexical = bound;
-  }
-
+  const lexical = path.join(configuredRoot, job.name);
   const folderStat = await lstatOptional(lexical);
   if (!folderStat) {
     return { lexical, real: lexical, preferencesLexical: path.join(lexical, 'preferences'), preferencesReal: null };
@@ -660,7 +644,7 @@ type PreferenceExportPair = {
   prompt: string;
 };
 
-// Export eligibility deliberately reuses the same trusted job binding, strict pair-id rule, metadata parser, image
+// Export eligibility deliberately reuses the same verified job folder, strict pair-id rule, metadata parser, image
 // checks and vote resolver as the gallery. The read-only resolver is important: exporting must never heal or create a
 // vote receipt as a side effect.
 const listPreferenceExportPairs = async (bound: BoundRoot): Promise<PreferenceExportPair[]> => {

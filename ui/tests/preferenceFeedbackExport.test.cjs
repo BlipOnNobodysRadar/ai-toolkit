@@ -68,11 +68,10 @@ const makeFeedbackJob = async name => {
   const job = await makeJob(F.db, {
     id,
     name,
-    run_dir: folder,
     job_config: JSON.stringify(config),
   });
   fs.mkdirSync(folder, { recursive: true });
-  return job;
+  return { id: job.id, folder };
 };
 
 const writePair = (jobFolder, preferenceID, overrides = {}, bytes = null) => {
@@ -164,8 +163,8 @@ test('winner inversion maps A/B choices to chosen/rejected and preserves Unicode
   const bytesB = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0xbb, 0x02]);
   const promptA = 'first line\nsecond line — 日本語 🌸\r\nliteral trailing spaces  ';
   const promptB = 'α beta\r\nZażółć gęślą jaźń';
-  const pairA = writePair(job.run_dir, idA, { prompt: promptA, step: 20 }, { a: bytesA, b: bytesB });
-  const pairB = writePair(job.run_dir, idB, { prompt: promptB, step: 10 }, { a: bytesB, b: bytesA });
+  const pairA = writePair(job.folder, idA, { prompt: promptA, step: 20 }, { a: bytesA, b: bytesB });
+  const pairB = writePair(job.folder, idB, { prompt: promptB, step: 10 }, { a: bytesB, b: bytesA });
   writeVote(pairA, voteRecord(idA, 'a'));
   writeVote(pairB, voteRecord(idB, 'b'));
 
@@ -205,23 +204,23 @@ test('pending, skipped, invalid and malformed pairs are omitted; a committed dec
   const malformedMetadataID = randomUUID().replaceAll('-', '');
   const decisionID = randomUUID().replaceAll('-', '');
 
-  const ratedDir = writePair(job.run_dir, ratedID, { prompt: 'rated prompt' });
+  const ratedDir = writePair(job.folder, ratedID, { prompt: 'rated prompt' });
   writeVote(ratedDir, voteRecord(ratedID, 'b'));
 
-  writePair(job.run_dir, pendingID, { prompt: 'pending prompt' });
+  writePair(job.folder, pendingID, { prompt: 'pending prompt' });
 
-  const skippedDir = writePair(job.run_dir, skippedID, { prompt: 'skipped prompt' });
+  const skippedDir = writePair(job.folder, skippedID, { prompt: 'skipped prompt' });
   writeVote(skippedDir, voteRecord(skippedID, 'skip'));
 
-  const invalidVoteDir = writePair(job.run_dir, invalidVoteID, { prompt: 'invalid prompt' });
+  const invalidVoteDir = writePair(job.folder, invalidVoteID, { prompt: 'invalid prompt' });
   fs.writeFileSync(path.join(invalidVoteDir, 'vote.json'), '{not valid json');
 
-  const malformedDir = writePair(job.run_dir, malformedMetadataID, { prompt: 'bad metadata', version: 999 });
+  const malformedDir = writePair(job.folder, malformedMetadataID, { prompt: 'bad metadata', version: 999 });
   writeVote(malformedDir, voteRecord(malformedMetadataID, 'a'));
 
-  const decisionDir = writePair(job.run_dir, decisionID, { prompt: 'decision-only prompt' });
+  const decisionDir = writePair(job.folder, decisionID, { prompt: 'decision-only prompt' });
   writeDecision(decisionDir, voteRecord(decisionID, 'a'));
-  fs.mkdirSync(path.join(job.run_dir, 'preferences', 'not-a-pair'), { recursive: true });
+  fs.mkdirSync(path.join(job.folder, 'preferences', 'not-a-pair'), { recursive: true });
 
   const response = await callExport(job.id);
   assert.equal(response.status, 200);
@@ -246,8 +245,8 @@ test('zero eligible pairs returns a clear JSON empty-state response instead of a
   const job = await makeFeedbackJob('export-empty');
   const pendingID = randomUUID().replaceAll('-', '');
   const skippedID = randomUUID().replaceAll('-', '');
-  writePair(job.run_dir, pendingID);
-  const skippedDir = writePair(job.run_dir, skippedID);
+  writePair(job.folder, pendingID);
+  const skippedDir = writePair(job.folder, skippedID);
   writeVote(skippedDir, voteRecord(skippedID, 'skip'));
 
   const response = await callExport(job.id);
@@ -261,7 +260,7 @@ test('zero eligible pairs returns a clear JSON empty-state response instead of a
 test('export source read failures reject the response stream rather than finishing a partial ZIP', async () => {
   const job = await makeFeedbackJob('export-read-error');
   const pairID = randomUUID().replaceAll('-', '');
-  const pairDir = writePair(job.run_dir, pairID);
+  const pairDir = writePair(job.folder, pairID);
   writeVote(pairDir, voteRecord(pairID, 'a'));
 
   const originalCreateReadStream = fs.createReadStream;
@@ -289,7 +288,7 @@ test('disconnecting during the first image closes it without opening the remaini
   const job = await makeFeedbackJob('export-cancel');
   for (let index = 0; index < 4; ++index) {
     const id = randomUUID().replaceAll('-', '');
-    writeVote(writePair(job.run_dir, id), voteRecord(id, 'a'));
+    writeVote(writePair(job.folder, id), voteRecord(id, 'a'));
   }
   const controller = new AbortController();
   const { PassThrough } = require('node:stream');
@@ -317,7 +316,7 @@ test('disconnecting during the first image closes it without opening the remaini
   }
 });
 
-test('existing bearer middleware protects the export route', () => {
+test('existing bearer middleware protects the export route', async () => {
   const middleware = require(ts.uiPath('src/middleware.ts')).middleware;
   const request = (token) => ({
     method: 'GET',
@@ -327,8 +326,8 @@ test('existing bearer middleware protects the export route', () => {
   const old = process.env.AI_TOOLKIT_AUTH;
   try {
     process.env.AI_TOOLKIT_AUTH = 'fixture-only-token';
-    assert.equal(middleware(request()).status, 401);
-    assert.equal(middleware(request('fixture-only-token')).next, true);
+    assert.equal((await middleware(request())).status, 401);
+    assert.equal((await middleware(request('fixture-only-token'))).next, true);
   } finally {
     if (old === undefined) delete process.env.AI_TOOLKIT_AUTH;
     else process.env.AI_TOOLKIT_AUTH = old;

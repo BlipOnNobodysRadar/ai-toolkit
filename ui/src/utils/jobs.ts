@@ -102,52 +102,20 @@ export const getJobConfig = (job: Job) => {
   return JSON.parse(job.job_config) as JobConfig;
 };
 
-// Run ownership as the row shows it (docs/STATE_MACHINES.md M10). The server enforces ownership from its claims;
-// this is the display view: a run still holds its GPUs/folder from admission until its process exit is verified,
-// even when Python already reported completed/error/stopped; a pre-update ("legacy") row holds them while it has a
-// pid or an active status.
-export const ownershipOf = (job: Job): { held: boolean; legacy: boolean } => {
-  const legacy = job.run_id == null && (['starting', 'running', 'stopping'].includes(job.status) || job.pid != null);
-  const run = job.run_id != null && job.launch_phase != null && job.launch_phase !== 'exited';
-  return { held: run || legacy, legacy };
-};
-
-// Status label shown to the user: the reported status, plus "exiting" while a finished run's process is still owned.
-export const displayStatus = (job: Job): string => {
-  const { held } = ownershipOf(job);
-  if (job.status === 'delete_failed') return 'delete failed';
-  if (held && ['completed', 'error', 'stopped', 'queued'].includes(job.status)) return `${job.status} (exiting)`;
-  return job.status;
-};
-
 export const getAvaliableJobActions = (job: Job) => {
   const jobConfig = getJobConfig(job);
-  const { held, legacy } = ownershipOf(job);
-  const isStopping = job.status === 'stopping' || (job.stop && ['starting', 'running'].includes(job.status));
-  // 'deleting' with no run ownership is a deletion that did not finish (e.g. the server stopped mid-way): Delete
-  // resumes it. A deletion still running elsewhere holds the server's deletion lock and the retry is refused (409),
-  // so the browser does not need to guess whether the earlier deleter is alive.
-  const canDelete = !held && ['queued', 'completed', 'stopped', 'error', 'delete_failed', 'deleting'].includes(job.status);
-  const isRetryDelete = canDelete && ['deleting', 'delete_failed'].includes(job.status);
-  let canEdit = !held && ['queued', 'completed', 'stopped', 'error'].includes(job.status);
+  const isStopping = job.stop && job.status === 'running';
+  const canDelete = ['queued', 'completed', 'stopped', 'error'].includes(job.status) && !isStopping;
+  let canEdit = ['queued', 'completed', 'stopped', 'error'].includes(job.status) && !isStopping;
   const canRemoveFromQueue = job.status === 'queued';
-  const canStop = ['starting', 'running'].includes(job.status) && !isStopping;
-  let canStart = !held && ['stopped', 'error'].includes(job.status);
+  const canStop = job.status === 'running' && !isStopping;
+  let canStart = ['stopped', 'error'].includes(job.status) && !isStopping;
   // can resume if more steps were added
-  if (!held && job.status === 'completed' && (jobConfig.config.process[0].train?.steps || 0) > job.step) {
+  if (job.status === 'completed' && (jobConfig.config.process[0].train?.steps || 0) > job.step && !isStopping) {
     canStart = true;
   }
-  // force stop needs an identified process boundary; pre-update runs cannot be force stopped from the UI
-  const canForceStop = held && !legacy && job.launch_phase === 'attached';
-  // display reset only for a row that owns nothing (the server refuses otherwise)
-  const canMarkStopped = !held && !['stopped', 'deleting', 'delete_failed'].includes(job.status);
-  return { canDelete, isRetryDelete, canEdit, canStop, canStart, canRemoveFromQueue, canForceStop, canMarkStopped, isStopping };
+  return { canDelete, canEdit, canStop, canStart, canRemoveFromQueue };
 };
-
-// The server's refusal text for an action (409 ownership conflicts etc.), for showing to the user.
-export const actionError = (e: any): string => e?.response?.data?.error || e?.message || 'Request failed';
-
-export const forceStopJob = (jobID: string) => apiClient.get(`/api/jobs/${jobID}/kill`).then(res => res.data);
 
 export const getNumberOfSamples = (job: Job) => {
   const jobConfig = getJobConfig(job);

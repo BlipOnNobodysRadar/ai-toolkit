@@ -151,9 +151,8 @@ test('EDM2 CSV parser validates documented columns, filters bad rows, and bounds
   assert.equal(edm.maxWeight, 1.999);
 });
 
-test('small reports use the bound job folder and expose no filesystem path', async () => {
+test('small reports use the configured job folder and expose no filesystem path', async () => {
   const jobFolder = setupJob();
-  jobRow = { id: JOB_ID, name: 'job', run_dir: jobFolder };
   fs.writeFileSync(
     path.join(jobFolder, 'validation.jsonl'),
     JSON.stringify({ step: 5, phase: 'final', raw_metrics: [{ sigma: 0.5, video_mse: 0.123 }] }) + '\n',
@@ -239,21 +238,21 @@ test('raw download rejects any name other than the two fixed report files', asyn
   }
 });
 
-test('foreign run bindings are refused without leaking configured paths', async () => {
+test('a job name outside the training folder is refused without leaking configured paths', async () => {
   setupJob();
   const otherRoot = makeRoot();
-  jobRow = { id: JOB_ID, name: 'job', run_dir: path.join(otherRoot, 'job') };
+  jobRow = { id: JOB_ID, name: path.join(otherRoot, 'job') };
   const response = await route.GET({}, { params: { jobID: JOB_ID } });
-  assert.equal(response.status, 409);
-  assert.equal(response.body.code, 'INVALID_RUN_BINDING');
+  assert.equal(response.status, 400);
+  assert.equal(response.body.code, 'INVALID_JOB_FOLDER');
   const serialized = JSON.stringify(response.body);
   assert.equal(serialized.includes(otherRoot), false);
   assert.equal(serialized.includes(trainingRoot), false);
 });
 
-test('a missing claimed run folder is an ordinary empty report response', async () => {
+test('a missing job folder is an ordinary empty report response', async () => {
   trainingRoot = makeRoot();
-  jobRow = { id: JOB_ID, name: 'job', run_dir: path.join(trainingRoot, 'job') };
+  jobRow = { id: JOB_ID, name: 'job' };
   const response = await route.GET({}, { params: { jobID: JOB_ID } });
   assert.equal(response.status, 200);
   assert.equal(response.body.validation.exists, false);

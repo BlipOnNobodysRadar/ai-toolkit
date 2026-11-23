@@ -1,9 +1,9 @@
 import { NextResponse } from 'next/server';
 import prisma from '@/server/prisma';
 import { isMac } from '@/helpers/basic';
-import { cached } from '@/server/apiCache';
+import { jobFolderError } from '../../../../cron/jobFolder';
 import { getTrainingFolder } from '@/server/settings';
-import { saveJob } from '../../../../cron/ownership/store';
+import { cached } from '@/server/apiCache';
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -32,7 +32,7 @@ export async function GET(request: Request) {
       where.job_type = job_type;
     }
     if (only_active === 'true') {
-      where.status = { in: ['starting', 'running', 'queued', 'stopping'] };
+      where.status = { in: ['running', 'queued', 'stopping'] };
       const jobs = await cached(
         'jobs-active',
         () =>
@@ -57,14 +57,60 @@ export async function GET(request: Request) {
   }
 }
 
-// Create (no id) or edit. Names are unique by the folder they map to (case-insensitive on Windows/macOS), a
-// folder still being deleted cannot be reused, and an edit is refused while the job owns a process: an editable
-// status alone is not enough, since Python can report completed/error while its process is still exiting.
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const out = await saveJob(prisma, body, await getTrainingFolder(), isMac() ? 'mps' : undefined);
-    return NextResponse.json(out.body, { status: out.status });
+    const { id, name, job_config } = body;
+    const error = jobFolderError(await getTrainingFolder(), name);
+    if (error) return NextResponse.json({ error }, { status: 400 });
+    let gpu_ids: string = body.gpu_ids;
+
+    if (isMac()) {
+      gpu_ids = 'mps';
+    }
+
+    const extra: any = {};
+    if ('job_ref' in body) {
+      extra['job_ref'] = body.job_ref;
+    }
+
+    if ('job_type' in body) {
+      extra['job_type'] = body.job_type;
+    }
+
+    if (id) {
+      // Update existing training
+      const training = await prisma.job.update({
+        where: { id },
+        data: {
+          name,
+          gpu_ids,
+          job_config: JSON.stringify(job_config),
+          ...extra,
+        },
+      });
+      return NextResponse.json(training);
+    } else {
+      // find the highest queue position and add 1000
+      const highestQueuePosition = await prisma.job.aggregate({
+        _max: {
+          queue_position: true,
+        },
+      });
+      const newQueuePosition = (highestQueuePosition._max.queue_position || 0) + 1000;
+
+      // Create new training
+      const training = await prisma.job.create({
+        data: {
+          name,
+          gpu_ids,
+          job_config: JSON.stringify(job_config),
+          queue_position: newQueuePosition,
+          ...extra,
+        },
+      });
+      return NextResponse.json(training);
+    }
   } catch (error: any) {
     if (error.code === 'P2002') {
       // Handle unique constraint violation, 409=Conflict

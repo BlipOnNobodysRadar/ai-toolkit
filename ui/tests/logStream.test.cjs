@@ -14,7 +14,7 @@ function fixture(open) {
   const wrapped = { ...fs, promises: { ...fs.promises, open: (...args) => open(log, ...args) } };
   const mocks = {
     'next/server': { NextResponse: { json: body => ({ body }) } },
-    '@/server/prisma': { default: { job: { findUnique: async () => ({ id: 'job', name: 'job', run_id: 'run' }) } } },
+    '@/server/prisma': { default: { job: { findUnique: async () => ({ id: 'job', name: 'job' }) } } },
     '@/server/settings': { getTrainingFolder: async () => root },
     fs: { default: wrapped }, path: { default: path },
   };

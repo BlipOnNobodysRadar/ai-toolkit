@@ -70,13 +70,16 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   try {
     await fs.promises.access(logPath);
   } catch {
-    return NextResponse.json({ keys: [], since_step: 0, run_id: job.run_id ?? null, series: {} });
+    return NextResponse.json({ keys: [], since_step: 0, run_id: null, series: {} });
   }
 
   const url = new URL(request.url);
   const sinceStepParam = Number(url.searchParams.get('since_step') ?? 0);
   const sinceStep = Number.isFinite(sinceStepParam) ? sinceStepParam : 0;
 
+  // The worker rotates log.txt at launch. Its file identity lets an open chart reload steps rewritten on resume.
+  const logStat = await fs.promises.stat(path.join(jobFolder, 'log.txt'), { bigint: true }).catch(() => null);
+  const runId = logStat ? `${logStat.ino}-${logStat.birthtimeNs}` : null;
   const db = openDb(logPath);
 
   let body: string;
@@ -93,7 +96,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     }
     // run_id: the client's since_step cursor belongs to one run; a new run may rewrite steps it already has, so the
     // client reloads everything (history is kept, it lives in this file) when the run changes
-    body = `{"keys":${JSON.stringify(keys)},"since_step":${sinceStep},"run_id":${JSON.stringify(job.run_id ?? null)},"series":{${parts.join(',')}}}`;
+    body = `{"keys":${JSON.stringify(keys)},"since_step":${sinceStep},"run_id":${JSON.stringify(runId)},"series":{${parts.join(',')}}}`;
   } finally {
     await closeDb(db);
   }

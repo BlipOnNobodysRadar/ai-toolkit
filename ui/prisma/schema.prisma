@@ -42,44 +42,9 @@ model Job {
   save_now        Boolean  @default(false) // if true, the job will be saved on the next step
   sample_now      Boolean  @default(false) // if true, the job will be sampled on the next step
 
-  // Run ownership (docs/STATE_MACHINES.md M10). All nullable so `prisma db push` adds them to an existing
-  // database; a row whose run_id is null was last launched before this schema ("legacy").
-  run_id             String? // generation of the current/last launch; Python fences every Job write on it
-  launch_phase       String? // claimed | spawn_requested | attached | exited
-  launcher_pid       Int? // worker that admitted the run and alone may spawn its relay
-  launcher_identity  String? // that worker's pid@creation
-  run_dir            String? // job folder at admission (per-run config and launch receipt live here)
-  spawn_requested_at DateTime?
-  relay_pid          Int?
-  relay_exited_at    DateTime? // the relay's exit was observed: it can no longer start a child
-  supervisor_identity String? // pid@creation of the run's supervisor (owns the run's process boundary)
-  run_boundary       String? // 'win-job' | 'linux-subreaper' (from the spawn receipt)
-  boot_id            String? // boot identity the run (or, for a legacy row, its first observation) belongs to
-  pid_identity       String? // root process pid@creation, from the launch receipt or a token scan
-  run_members        String? // JSON list of pid@creation of the run's processes seen so far
-  stop_requested_at  DateTime?
-  after_exit         String? // 'stopped' | 'queued': what the user asked for once the process has exited
-  exit_verified_at   DateTime?
-  ownership_note     String? // why ownership is still held (shown in the UI)
-
   @@index([status])
   @@index([gpu_ids])
   @@index([job_type])
   @@index([job_ref])
-  @@index([run_id])
-}
 
-// One row per owned resource ('gpu:<n>', 'gpu:mps', 'gpu:*' for an exclusive/opaque GPU set,
-// 'folder:<canonical training folder>'). kind 'run' is held from admission to verified process exit;
-// kind 'delete' reserves a job's folder while it is being deleted. Admission and these reservations are made in
-// SQLite transactions, so two workers can never both own one resource.
-model RunClaim {
-  resource   String   @id
-  job_id     String
-  run_id     String
-  kind       String   @default("run")
-  created_at DateTime @default(now())
-
-  @@index([job_id])
-  @@index([run_id])
 }

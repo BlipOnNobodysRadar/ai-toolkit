@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import { CgSpinner } from 'react-icons/cg';
 import useJobsList from '@/hooks/useJobsList';
-import { getTotalSteps, ownershipOf } from '@/utils/jobs';
+import { getTotalSteps } from '@/utils/jobs';
 
 export default function ActiveJobWidget() {
   const { jobs } = useJobsList({ onlyActive: true, reloadInterval: 5000 });
@@ -22,7 +22,7 @@ export default function ActiveJobWidget() {
               totalSteps = undefined;
             }
             const pct = totalSteps ? Math.min(100, (job.step / totalSteps) * 100) : 0;
-            const isRunning = ['starting', 'running', 'stopping'].includes(job.status) || ownershipOf(job).held;
+            const isRunning = job.status === 'running' || job.status === 'stopping';
 
             let label = job.name;
             let href = `/jobs/${job.id}`;
@@ -38,7 +38,7 @@ export default function ActiveJobWidget() {
 
             let statusColor = 'text-gray-400';
             if (job.status === 'running') statusColor = 'text-blue-400';
-            if (job.status === 'queued' || job.status === 'starting') statusColor = 'text-yellow-400';
+            if (job.status === 'queued') statusColor = 'text-yellow-400';
             if (job.status === 'stopping') statusColor = 'text-orange-400';
 
             return (

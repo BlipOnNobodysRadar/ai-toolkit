@@ -2,7 +2,6 @@ import asyncio
 from collections import OrderedDict
 
 import sqlite3
-from toolkit.ui_run_fence import RunFence
 import os
 import re
 import tempfile
@@ -73,9 +72,6 @@ class BaseCaptioner(BaseExtensionProcess):
         self.sqlite_db_path = self.config.get("sqlite_db_path", "./aitk_db.db")
         self.job_id = os.environ.get("AITK_JOB_ID", None)
         self.job_id = self.job_id.strip() if self.job_id is not None else None
-        # a UI run id fences every Job read/write to this launch; a fenced run must own its row to start
-        self.fence = RunFence(self.job_id)
-        self.fence.require_owned(self.sqlite_db_path)
         self.is_ui_captioner = True
         if not os.path.exists(self.sqlite_db_path):
             self.is_ui_captioner = False
@@ -430,15 +426,13 @@ class BaseCaptioner(BaseExtensionProcess):
     def should_stop(self):
         if not self.is_ui_captioner:
             return False
-        if self.fence.superseded:  # a fenced write matched no row: this run no longer owns the job
-            return True
 
         def _check_stop():
             with self._db_connect() as conn:
                 cursor = conn.cursor()
-                cursor.execute(f"SELECT stop FROM Job WHERE {self.fence.job_clause}", self.fence.params())
+                cursor.execute("SELECT stop FROM Job WHERE id = ?", (self.job_id,))
                 stop = cursor.fetchone()
-                return self.fence.flag(stop, stop=True)
+                return False if stop is None else stop[0] == 1
 
         return self._retry_db_operation(_check_stop)
 
@@ -450,10 +444,10 @@ class BaseCaptioner(BaseExtensionProcess):
             with self._db_connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    f"SELECT return_to_queue FROM Job WHERE {self.fence.job_clause}", self.fence.params()
+                    "SELECT return_to_queue FROM Job WHERE id = ?", (self.job_id,)
                 )
                 return_to_queue = cursor.fetchone()
-                return self.fence.flag(return_to_queue, stop=False)
+                return False if return_to_queue is None else return_to_queue[0] == 1
 
         return self._retry_db_operation(_check_return_to_queue)
 
@@ -483,9 +477,8 @@ class BaseCaptioner(BaseExtensionProcess):
                         value_to_insert = str(value)
 
                     # Use parameterized query for both the column name and value
-                    update_query = f"UPDATE Job SET {key} = ? WHERE {self.fence.job_clause}"
-                    cursor.execute(update_query, self.fence.params(value_to_insert))
-                    self.fence.wrote(cursor)
+                    update_query = f"UPDATE Job SET {key} = ? WHERE id = ?"
+                    cursor.execute(update_query, (value_to_insert, self.job_id))
                 finally:
                     cursor.execute("COMMIT")
 
@@ -512,15 +505,14 @@ class BaseCaptioner(BaseExtensionProcess):
                 try:
                     if info is not None:
                         cursor.execute(
-                            f"UPDATE Job SET status = ?, info = ? WHERE {self.fence.job_clause}",
-                            self.fence.params(status, info),
+                            "UPDATE Job SET status = ?, info = ? WHERE id = ?",
+                            (status, info, self.job_id),
                         )
                     else:
                         cursor.execute(
-                            f"UPDATE Job SET status = ? WHERE {self.fence.job_clause}",
-                            self.fence.params(status),
+                            "UPDATE Job SET status = ? WHERE id = ?",
+                            (status, self.job_id),
                         )
-                    self.fence.wrote(cursor)
                 finally:
                     cursor.execute("COMMIT")
 
