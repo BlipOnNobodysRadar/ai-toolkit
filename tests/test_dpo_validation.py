@@ -110,6 +110,7 @@ def test_paired_validation_reports_vectorized_per_pair_metrics(tmp_path):
         "paired": True,
         "native_batches": [_paired_cache(tmp_path)],
     }
+    trainer._validation_cache["native_batches"][0]["preference_probabilities"] = [1.0, 0.75]
 
     tv.validate(trainer, phase="periodic")
 
@@ -129,14 +130,16 @@ def test_paired_validation_reports_vectorized_per_pair_metrics(tmp_path):
         assert row["reference_chosen_error"] == pytest.approx(1.0)
         assert row["reference_rejected_error"] == pytest.approx(1.0)
         assert row["margin"] == pytest.approx(1.0)
-        assert row["dpo_loss"] == pytest.approx(torch.nn.functional.softplus(torch.tensor(-1.0)).item())
+        probability = [1.0, 0.75][row["item"]]
+        assert row["preference_probability"] == probability
+        assert row["dpo_loss"] == pytest.approx(torch.nn.functional.softplus(torch.tensor(-1.0)).item() + 1 - probability)
         assert row["strict_preference_correct"] is True
     assert by_pair == {0: {0.25, 0.75}, 1: {0.25, 0.75}}
     assert {r["chosen_image_id"] for r in rows[0]["raw_metrics"]} == {"a.png", "sub/b.png"}
     assert trainer.additional_logs["val/dpo/margin"] == pytest.approx(1.0)
     assert trainer.additional_logs["val/dpo/accuracy"] == pytest.approx(1.0)
     assert trainer.additional_logs["val/dpo/loss"] == pytest.approx(
-        torch.nn.functional.softplus(torch.tensor(-1.0)).item()
+        torch.nn.functional.softplus(torch.tensor(-1.0)).item() + 0.125
     )
     assert trainer.additional_logs["val/dpo/accuracy/sigma_0.25"] == pytest.approx(1.0)
     # Per-pass state must be restored even though validation used eval mode.
@@ -262,6 +265,7 @@ def test_setup_caches_paired_validation_without_touching_plain_path(tmp_path, mo
             ),
             SimpleNamespace(
                 path=str(val_chosen / "sub" / "b.png"),
+                preference_probability=0.8,
                 dataset_root=str(val_chosen),
                 caption="another chosen caption",
                 rejected_item=SimpleNamespace(),
@@ -289,6 +293,7 @@ def test_setup_caches_paired_validation_without_touching_plain_path(tmp_path, mo
     assert item["latents"].shape[0] == pair_count * 2
     assert item["noise"].shape[0] == pair_count
     assert item["chosen_image_ids"] == ["a.png", "sub/b.png"]
+    assert item["preference_probabilities"] == [1.0, 0.8]
     assert len(item["embeds"].text_embeds) == pair_count
 
 

@@ -554,6 +554,28 @@ def test_dpo_swap_flips_margin_and_batch_ordering():
     torch.testing.assert_close(swapped_logits, -logits, rtol=0.0, atol=1e-4)
 
 
+def test_score_gap_changes_policy_gradient_on_same_moss_pair():
+    model, transformer = _make_model()
+    network, network_config = _make_network(model, transformer)
+    trainer = _make_trainer(model, transformer, network, network_config)
+    batch = _make_latent_batch()
+    # At initial margin zero, the derivative for a soft target is 0.5 - p.
+    # Isolate one pair in a mixed batch using the existing dataset weights.
+    batch.loss_multiplier_list = [0.0, 1.5]
+
+    def policy_gradient(probability):
+        network.zero_grad(set_to_none=True)
+        batch.file_items[1].preference_probability = probability
+        torch.manual_seed(30)
+        SDTrainer.train_single_accumulation(trainer, batch, accum_scale=1.0)
+        return torch.cat([p.grad.flatten() for p in network.parameters() if p.grad is not None])
+
+    hard = policy_gradient(1.0)
+    assert hard.abs().max() > 0
+    torch.testing.assert_close(policy_gradient(0.75), 0.5 * hard)
+    torch.testing.assert_close(policy_gradient(0.5), torch.zeros_like(hard))
+
+
 def test_dpo_failure_restores_grad_mode_gradients_and_network_scope(monkeypatch):
     model, transformer = _make_model()
     network, network_config = _make_network(model, transformer)

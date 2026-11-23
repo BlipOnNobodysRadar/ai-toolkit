@@ -162,14 +162,18 @@ test('leaving offline DPO clears rejected paths but keeps beta while online feed
   const process = job.config.process[0];
   process.train.dpo_feedback = { every: 10, start_after: 0 };
   process.train.dpo_beta = 100;
+  process.train.dpo_reference_lora_path = 'C:/models/original.safetensors';
+  process.train.dpo_reference_lora_strength = 0.8;
   process.datasets[0].rejected_path = 'C:/rejected';
 
   const h = stateHarness(job);
   clearDpoConfig(h.state, h.setJobConfig);
   assert.equal(h.state.config.process[0].train.dpo_beta, 100);
   assert.equal('rejected_path' in h.state.config.process[0].datasets[0], false);
+  assert.equal('dpo_reference_lora_path' in h.state.config.process[0].train, false);
+  assert.equal('dpo_reference_lora_strength' in h.state.config.process[0].train, false);
 
-  process.train.dpo_feedback = null;
+  h.setJobConfig(null, 'config.process[0].train.dpo_feedback');
   clearDpoConfig(h.state, h.setJobConfig);
   assert.equal('dpo_beta' in h.state.config.process[0].train, false);
 });

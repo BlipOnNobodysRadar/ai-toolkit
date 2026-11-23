@@ -200,6 +200,8 @@ export interface TrainConfig {
   switch_boundary_every: number;
   loss_type: 'mse' | 'mae' | 'wavelet' | 'stepped' | 'dpo';
   dpo_beta?: number;
+  dpo_reference_lora_path?: string;
+  dpo_reference_lora_strength?: number;
   /** Inline MOSS preference feedback from ranked gallery samples. This is
    * independent of offline DPO, which uses loss_type='dpo' and rejected
    * dataset folders. */

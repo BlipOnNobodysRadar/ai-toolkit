@@ -10,7 +10,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from .optim import evaluation_optimizer
 from toolkit.noise_augmentation import disable_noise_augmentation
@@ -520,7 +519,7 @@ def setup(trainer):
                 # Validation uses explicit fixed sigmas below, never advances curriculum.
                 batch._clean_share_validation = True
                 if paired_validation:
-                    from toolkit.diffusion_dpo import paired_batch
+                    from toolkit.diffusion_dpo import batch_preference_probabilities, paired_batch
 
                     paired = paired_batch(batch)
                     _, noise, timesteps, prompts, _ = trainer.process_general_training_batch(
@@ -537,6 +536,7 @@ def setup(trainer):
                         'latents': paired.latents.detach().to('cpu', dtype=torch.float32),
                         'noise': noise[:pair_count].detach().to('cpu', dtype=torch.float32),
                         'embeds': embeds,
+                        'preference_probabilities': batch_preference_probabilities(batch),
                         'chosen_image_ids': [
                             _relative_chosen_image_id(item) for item in batch.file_items
                         ],
@@ -563,6 +563,7 @@ def _validate_paired(trainer, cfg, phase, device, dtype):
     from toolkit.diffusion_dpo import (
         prediction_errors,
         preference_logits,
+        preference_losses,
         reference_errors,
     )
     from toolkit.prompt_utils import concat_prompt_embeds
@@ -595,6 +596,7 @@ def _validate_paired(trainer, cfg, phase, device, dtype):
                 embeds_cpu = cached['embeds']
                 chosen_ids = cached['chosen_image_ids']
                 pair_count = len(chosen_ids)
+                probabilities = cached.get('preference_probabilities', [1.0] * pair_count)
                 if pair_latents_cpu.shape[0] != pair_count * 2:
                     raise ValueError('Cached DPO validation latents are not 2 x pair count')
                 if noise_cpu.shape[0] == pair_count * 2:
@@ -631,7 +633,7 @@ def _validate_paired(trainer, cfg, phase, device, dtype):
                         margins = preference_logits(
                             policy, reference, trainer.train_config.dpo_beta
                         )
-                        losses = -F.logsigmoid(margins)
+                        losses = preference_losses(margins, probabilities)
 
                         for pair_index in range(pair_count):
                             rejected_index = pair_count + pair_index
@@ -645,6 +647,7 @@ def _validate_paired(trainer, cfg, phase, device, dtype):
                                 'chosen_image_id': chosen_ids[pair_index],
                                 'relative_chosen_image_id': chosen_ids[pair_index],
                                 'sigma': float(sigma),
+                                'preference_probability': probabilities[pair_index],
                                 'loss': float(losses[pair_index].item()),
                                 'dpo_loss': float(losses[pair_index].item()),
                                 'margin': float(margins[pair_index].item()),

@@ -25,6 +25,10 @@ config:
           cache_text_embeddings: true
       train:
         loss_type: dpo
+        # For images generated with an existing transformer LoRA, uncomment both lines.
+        # The new output is a second adapter to stack on the original at inference.
+        # dpo_reference_lora_path: /path/to/original.safetensors
+        # dpo_reference_lora_strength: 1.0  # use the strength from generation
         dpo_beta: 100
         noise_scheduler: flowmatch
         timestep_type: logit_normal

@@ -81,6 +81,20 @@ def preference_logits(policy_errors, reference_errors, beta):
     return (0.5 * beta) * (rejected_delta - chosen_delta)
 
 
+def batch_preference_probabilities(batch):
+    # Offline labels follow the chosen items through bucketing and flipping.
+    # Interactive A/B votes are still hard preferences.
+    return [getattr(item, 'preference_probability', 1.0) for item in batch.file_items]
+
+
+def preference_losses(logits, probabilities):
+    """Cross-entropy against each pair's target chance of preferring chosen."""
+    targets = logits.new_tensor(probabilities)
+    if targets.shape != logits.shape:
+        raise ValueError('DPO needs one preference target per logit')
+    return -targets * F.logsigmoid(logits) - (1 - targets) * F.logsigmoid(-logits)
+
+
 def paired_batch(batch):
     # The loader batch stays reusable. General preprocessing writes its encoded
     # latents onto this shallow view; captions and item weights remain B-wide.
@@ -143,7 +157,8 @@ def train_dpo_accumulation(trainer, batch, accum_scale):
                 policy_errors = prediction_errors(trainer.predict_noise(noisy, timesteps, conditioning), target)
                 logits = preference_logits(policy_errors, frozen_errors, trainer.train_config.dpo_beta)
                 weights = logits.new_tensor(batch.loss_multiplier_list)
-                loss = (-F.logsigmoid(logits) * weights).mean()
+                losses = preference_losses(logits, batch_preference_probabilities(batch))
+                loss = (losses * weights).mean()
                 if not torch.isfinite(loss):
                     raise FloatingPointError('Non-finite DPO loss')
             with trainer.timer('backward'):

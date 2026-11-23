@@ -530,6 +530,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         feedback = getattr(self, '_feedback_schedule', None)
         if feedback is not None:
             info['dpo_feedback'] = feedback.state_dict()
+        reference = getattr(self, '_dpo_reference_identity', None)
+        if reference is not None:
+            info['dpo_reference_lora'] = reference
         return info
 
     def clean_up_saves(self):
@@ -1563,6 +1566,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if meta is not None and meta.get('aitk_rawr_generation') is not None:
             if meta['aitk_rawr_generation'] != getattr(self, '_rawr_pair_generation', None):
                 raise ValueError('RAWR model requires its committed-pair manifest; refusing an unpaired export')
+        training_info = (meta or {}).get('training_info')
+        saved_reference = training_info.get('dpo_reference_lora') if isinstance(training_info, dict) else None
+        if saved_reference != getattr(self, '_dpo_reference_identity', None):
+            raise ValueError('Frozen DPO LoRA or strength differs from this checkpoint. '
+                             'Restore the original reference to resume, or use a new job name.')
         BaseSDTrainProcess._note_resumed(self, path, meta)
         for sibling in (getattr(self, '_latest_save_files', None) or {}).get(path, []):
             if sibling != path:

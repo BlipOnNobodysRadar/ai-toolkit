@@ -118,6 +118,22 @@ def test_matching_requires_same_extension_not_just_stem(tmp_path):
         AiToolkitDataset(config_for(chosen, rejected), batch_size=1, sd=None)
 
 
+@pytest.mark.parametrize("contents", [
+    "{", "[]", '{"version":2,"preference_probability":0.8}',
+    '{"version":true,"preference_probability":1}', '{"version":1}',
+    '{"version":1,"preference_probability":true}',
+    '{"version":1,"preference_probability":"0.7"}',
+    '{"version":1,"preference_probability":NaN}',
+    '{"version":1,"preference_probability":0.49}',
+    '{"version":1,"preference_probability":1.01}',
+])
+def test_invalid_preference_sidecar_names_the_bad_file(tmp_path, contents):
+    chosen, rejected = make_tree(tmp_path, ["sub/a.png"])
+    (chosen / "sub/a.dpo.json").write_text(contents)
+    with pytest.raises(ValueError, match=r"a\.dpo\.json"):
+        AiToolkitDataset(config_for(chosen, rejected), batch_size=1, sd=None)
+
+
 def test_exif_oriented_dimensions_are_compared_and_mismatch_is_rejected(tmp_path):
     chosen = tmp_path / "chosen"
     rejected = tmp_path / "rejected"
@@ -160,6 +176,7 @@ def test_corrupt_pair_scan_fails_with_useful_path(tmp_path):
 
 def test_bucket_geometry_is_symmetric_and_caption_is_chosen_only(tmp_path):
     chosen, rejected = make_tree(tmp_path, ["a.png", "sub/b.png"])
+    (chosen / "sub/b.dpo.json").write_text('{"version":1,"preference_probability":0.75}')
     ds = AiToolkitDataset(
         config_for(chosen, rejected, resolution=64, buckets=True, random_crop=True, flip_x=True),
         batch_size=2,
@@ -173,6 +190,7 @@ def test_bucket_geometry_is_symmetric_and_caption_is_chosen_only(tmp_path):
         "crop_height", "flip_x", "flip_y",
     )
     for item in ds.file_list:
+        assert item.preference_probability == (0.75 if item.path.endswith("b.png") else 1.0)
         mate = item.rejected_item
         assert mate is not None
         assert mate.path != item.path
@@ -224,8 +242,9 @@ def test_load_never_substitutes_a_corrupt_pair(tmp_path, monkeypatch):
         raise AssertionError("DPO load must not substitute another item")
 
     monkeypatch.setattr(ds, "_get_replacement_index", forbidden_replacement)
+    bad_index = next(i for i, item in enumerate(ds.file_list) if item.rejected_path == str(rejected / "a.png"))
     with pytest.raises(RuntimeError, match=r"DPO pair failed to load: chosen=.*a\.png, rejected=.*a\.png"):
-        ds._get_single_item(0)
+        ds._get_single_item(bad_index)
 
 
 @pytest.mark.parametrize("mode", ["memory", "disk"])

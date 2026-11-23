@@ -170,6 +170,38 @@ pairs to measure whether images improve.
 
 ## Offline dataset DPO
 
+### From a batch of generations to a second LoRA
+
+1. Generate PNGs for one positive prompt with your current LoRA. In
+   [Blind LoRA Ranker](https://github.com/BlipOnNobodysRadar/blind-lora-ranker), open **Rate for DPO**,
+   paste the prompt, and drop the PNGs or choose their folder. Give each image a score from 1 to 10.
+2. Choose **Export DPO dataset**. In the Toolkit job editor, select offline DPO. Point the target dataset
+   at the export's `chosen` folder and the rejected dataset at its `rejected` folder. For multiple
+   prompts, export each batch and add one dataset entry per export.
+3. Select the MOSS-Image or Krea 2 Raw text-to-image checkpoint used for generation. In **Frozen reference LoRA
+   (optional)**, enter the path to the existing transformer LoRA on the training machine. Set **Reference LoRA
+   strength** to the strength you generated with. Give the job a fresh name and leave
+   `network.pretrained_lora_path` unset for a fresh preference adapter.
+4. Load the original LoRA at that strength together with the newly saved LoRA in ComfyUI. The original sits
+   on both sides of the DPO comparison during training. Only the new LoRA receives gradients and gets saved.
+   The reference option accepts local safetensors with ordinary linear transformer LoRA weights.
+
+The YAML equivalents are `train.dpo_reference_lora_path` and `train.dpo_reference_lora_strength` (default
+`1.0`). The [offline example](../config/examples/train_dpo_moss_image.yaml) includes both settings. A resumed
+job checks the original adapter's file digest and strength against the saved training state.
+
+### How numerical ratings reach the loss
+
+The ranker writes an optional `chosen/<stem>.dpo.json` for each pair. For example, a 9 versus a 3 produces
+`{"version":1,"preference_probability":0.8333333333333333}`. The 1–10 scale maps to a soft training target
+`p = 0.5 + (chosen_score - rejected_score) / 18`. This mapping expresses how strongly to favor the winner.
+
+For a margin `m`, the per-pair loss is `p * softplus(-m) + (1-p) * softplus(m)`. At a fresh adapter's
+zero margin, a 9 versus an 8 produces one ninth of the preference gradient of a 10 versus a 1. A soft
+target also limits how far the objective pushes a near-tie once the model already favors the winner.
+The loader accepts finite targets from 0.5 through 1. Missing sidecars use 1, preserving the binary
+objective for existing folders and exports from the Toolkit gallery.
+
 To reuse your gallery ratings, open **Job → Samples → Preference feedback** and select **Export DPO ZIP**. Extract the ZIP and point `folder_path` at `chosen/` and `rejected_path` at `rejected/`. Each A or B rating contributes the two original PNGs and their shared prompt. The download excludes skipped and pending pairs. You can use the dataset with another compatible text-to-image LoRA.
 
 Put the image you want MOSS to favor in the chosen folder and its alternative in the rejected folder. Save the shared
