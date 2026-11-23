@@ -10,7 +10,7 @@ export type ScanResult = {
   denied?: number;
   error?: string;
 };
-export type Describe = { state: 'alive' | 'gone' | 'denied' | 'unknown'; identity?: string; cmdline?: string | null; why?: string };
+export type Describe = { state: 'alive' | 'gone' | 'denied' | 'unknown'; identity?: string; started_ms?: number; cmdline?: string | null; why?: string };
 // The run's ownership container (Windows job object) as seen now. 'absent' = the object no longer exists.
 export type RunState = {
   supervisor: 'alive' | 'exited' | 'unknown';
@@ -23,7 +23,7 @@ export type RunState = {
 export type ProbeRequest = {
   describe?: number[];
   runs?: Record<string, { run_id: string; supervisor: string | null; members?: string[] }>;
-  scans?: Record<string, { needle: string; since_ms: number }>;
+  scans?: Record<string, { needle: string; since_ms: number; legacy_launchers_only?: boolean }>;
 };
 export type ProbeResult = {
   ok: boolean;

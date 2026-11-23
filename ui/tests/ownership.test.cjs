@@ -193,12 +193,12 @@ test('boundary evidence (decision rev2): only an open+empty job object with its 
   // supervisor gone, boundary unqueryable: fail closed
   await reconcile(fakeProcCtl({ runs: { 'desc-sup@1': { supervisor: 'exited', boundary: 'unknown', live: [], members: {}, error: 'access denied' } } }));
   assert.equal((await claimsOf(j.id)).length, 2);
-  assert.match((await job(j.id)).ownership_note, /restart of this computer/);
+  assert.match((await job(j.id)).ownership_note, /Mark as Stopped/);
   // supervisor gone, job name absent, EVERY recorded member exited: still not proof (Q4: the name disappears before
   // unrecorded members finish terminating)
   await reconcile(fakeProcCtl({ runs: { 'desc-sup@1': goneAbsent(rootOf('desc'), '3@3') } }));
   assert.equal((await claimsOf(j.id)).length, 2);
-  assert.match((await job(j.id)).ownership_note, /restart of this computer/);
+  assert.match((await job(j.id)).ownership_note, /Mark as Stopped/);
   // supervisor alive with an empty job: it will write the exit receipt itself; nothing released yet
   await reconcile(fakeProcCtl({ runs: { 'desc-sup@1': { supervisor: 'alive', boundary: 'open', active: 0, live: [], members: {} } } }));
   assert.equal((await claimsOf(j.id)).length, 2);
@@ -310,7 +310,7 @@ test('U-R5 restart in each launch phase (scripted process layer)', async () => {
   assert.equal((await claimsOf(n.id)).length, 2, 'supervisor alive');
   await reconcile(fakeProcCtl({ runs: { '9200@1': { supervisor: 'exited', boundary: 'absent', live: [], members: {} } } }));
   assert.equal((await claimsOf(n.id)).length, 2, 'supervisor died before its receipt, job name gone: NOT proof (Q4)');
-  assert.match((await job(n.id)).ownership_note, /restart of this computer/);
+  assert.match((await job(n.id)).ownership_note, /Mark as Stopped/);
   await reconcile(fakeProcCtl({ runs: { '9200@1': { supervisor: 'exited', boundary: 'open', active: 1, live: [], members: {} } } }));
   assert.equal((await claimsOf(n.id)).length, 2, 'members still running');
   assert.match((await reconcile(fakeProcCtl({ runs: { '9200@1': { supervisor: 'exited', boundary: 'open', active: 0, live: [], members: {} } } })))[n.run_id], /released: supervisor gone, job object empty/);
@@ -389,50 +389,76 @@ test('stop backstop: a run alive long after the stop request gets ONE force stop
   assert.equal((await claimsOf(j.id)).length, 2, 'termination is not exit proof');
 });
 
-test('U-R7 legacy migration fixture: pre-update rows block admission; dead-looking pids and empty scans are NOT proof; only a boot change after first observation clears; never signalled', async () => {
-  const running = await makeJob(F.db, { name: 'L-run', gpu_ids: '0', status: 'running', pid: 111 });
-  const done = await makeJob(F.db, { name: 'L-done', gpu_ids: '1', status: 'completed', pid: 222 });
-  const debris = await makeJob(F.db, { name: 'L-debris', gpu_ids: '2', status: 'running', pid: null });
-  const empty = await makeJob(F.db, { name: 'L-empty', gpu_ids: '', status: 'running', pid: 333 });
-  for (const g of ['0', '1', '2', '3']) await makeJob(F.db, { name: `new${g}`, gpu_ids: g, status: 'queued' });
-  const newJobs = await F.db.job.findMany({ where: { name: { startsWith: 'new' } }, orderBy: { name: 'asc' } });
-  for (const n of newJobs) assert.equal((await admit(n)).admitted, null, `${n.gpu_ids} blocked`);
-  assert.match((await job(newJobs[3].id)).ownership_note, /all GPUs in use by job "L-empty"/);
-  assert.equal((await routeCall(markRoute, 'GET', done.id)).status, 409);
-  assert.equal((await routeCall(deleteRoute, 'GET', done.id)).status, 409);
-  const stamps = Object.fromEntries((await F.db.job.findMany({ where: { name: { startsWith: 'L-' } } })).map(r => [r.id, r.updated_at.getTime()]));
-  // whatever the process layer would say (pids gone, scans empty), legacy rows have no run boundary: kept
-  const pc = fakeProcCtl({ describe: { 111: { state: 'gone' }, 222: { state: 'gone' }, 333: { state: 'gone' } } });
+test('an update releases stale legacy jobs on the first worker tick, preserves outputs and starts the queued job', async () => {
+  const old = new Date(Date.now() - 86_400_000);
+  const done = await makeJob(F.db, { name: 'done', status: 'completed', pid: 101, step: 100, updated_at: old });
+  const stale = await makeJob(F.db, { name: 'stale', status: 'running', pid: 102, updated_at: old });
+  const noPid = await makeJob(F.db, { name: 'no-pid', status: 'running', pid: null, updated_at: old });
+  const next = await makeJob(F.db, { name: 'next', status: 'queued' });
+  const output = path.join(F.trainingRoot, done.name, 'checkpoint.safetensors');
+  fs.mkdirSync(path.dirname(output), { recursive: true });
+  fs.writeFileSync(output, 'checkpoint');
+  await F.db.queue.create({ data: { gpu_ids: '0', is_running: true } });
+  const pc = fakeProcCtl({
+    describe: { 101: { state: 'gone' }, 102: { state: 'alive', started_ms: Date.now(), cmdline: 'unrelated' } },
+    scans: { '.job_config.json': { complete: true, matches: [] } },
+  });
   await reconcile(pc);
-  await reconcile(pc);
-  for (const r of [running, done, debris, empty]) {
-    const row = await job(r.id);
-    assert.equal(row.run_id, null);
-    assert.equal(row.boot_id, 'boot-test-1', `${row.name}: boot id recorded at first observation`);
-    assert.equal(row.status, r.status);
-    assert.match(row.ownership_note, /until this computer restarts/);
-    assert.equal(row.updated_at.getTime(), stamps[r.id], `${row.name} updated_at preserved by note writes`);
-  }
-  assert.equal(pc.calls.probe.length, 0, 'no process probing is used as legacy evidence');
-  // a worker that cannot read the boot identity records nothing and clears nothing
-  const late = await makeJob(F.db, { name: 'L-late', gpu_ids: '5', status: 'running', pid: 444 });
-  await reconcile(pc, { self: { ...self, boot_id: null } });
-  assert.equal((await job(late.id)).boot_id, null);
-  assert.match((await job(late.id)).ownership_note, /cannot be cleared automatically/);
-  // force stop is refused for a legacy run; Stop still works through the flag the legacy process polls
-  assert.equal((await forceStop(F.db, pc, running.id)).status, 409);
-  assert.equal((await routeCall(stopRoute, 'GET', running.id)).status, 200);
-  assert.equal((await job(running.id)).stop, true);
-  assert.equal((await job(running.id)).updated_at.getTime(), stamps[running.id], 'stop on a legacy row keeps its original time');
-  // a restart (new boot id) clears every row first observed under the old boot
-  await reconcile(pc, { self: { ...self, boot_id: 'boot-test-2' } });
-  assert.equal((await job(running.id)).pid, null);
-  assert.equal((await job(running.id)).status, 'stopped', 'stop had been requested');
   assert.equal((await job(done.id)).status, 'completed');
-  assert.equal((await job(debris.id)).status, 'error');
-  assert.match((await job(debris.id)).ownership_note, /Legacy process exit verified: the computer restarted/);
-  assert.equal(pc.calls.terminate.length, 0, 'legacy pids are never signalled');
-  for (const n of newJobs.slice(0, 4)) assert.ok((await admit(n)).admitted, `${n.gpu_ids} free after the restart proof`);
+  assert.equal((await job(done.id)).step, 100);
+  assert.equal((await job(done.id)).pid, null);
+  assert.equal((await job(stale.id)).status, 'stopped');
+  assert.equal((await job(noPid.id)).status, 'stopped');
+  assert.equal(fs.readFileSync(output, 'utf8'), 'checkpoint');
+  const launched = [];
+  await queue.processQueueWith({ db: F.db, trainingRoot: F.trainingRoot, launcher: self, launch: j => launched.push(j.id) });
+  assert.deepEqual(launched, [next.id]);
+  assert.equal((await routeCall(deleteRoute, 'GET', done.id)).status, 200);
+  assert.equal(fs.existsSync(output), false);
+  assert.equal(pc.calls.terminate.length, 0);
+});
+
+test('live legacy trainers stay reserved with or without a PID; failed observations have a manual recovery', async () => {
+  const { checkStopped } = require(ts.uiPath('cron/ownership/recoverStopped.ts'));
+  const old = new Date(Date.now() - 86_400_000);
+  const a = await makeJob(F.db, { name: 'live', status: 'running', pid: 444, updated_at: old });
+  const b = await makeJob(F.db, { name: 'legacy orphan', status: 'running', pid: null, updated_at: old });
+  const c = await makeJob(F.db, { name: 'unknown', status: 'stopping', pid: 445, updated_at: old });
+  const cmd = j => 'python run.py "' + path.join(F.trainingRoot, j.name, '.job_config.json') + '"';
+  const pc = fakeProcCtl({
+    describe: { 444: { state: 'alive', cmdline: cmd(a) }, 445: { state: 'denied' } },
+    scans: { '.job_config.json': { complete: false, matches: [{ identity: '71@1', cmdline: cmd(b) }] } },
+  });
+  await reconcile(pc);
+  for (const j of [a, b]) {
+    assert.equal((await job(j.id)).status, 'running');
+    assert.equal((await checkStopped(F.db, pc, j.id, j)).status, 409);
+  }
+  assert.match((await job(c.id)).ownership_note, /Mark as Stopped/);
+  assert.equal((await checkStopped(F.db, pc, c.id, c)).status, 200);
+  assert.equal((await store.markStopped(F.db, c.id, c)).status, 200);
+  assert.equal((await job(c.id)).pid, null);
+  assert.equal((await routeCall(deleteRoute, 'GET', c.id)).status, 200);
+  assert.equal(pc.calls.terminate.length, 0);
+});
+
+test('manual recovery preserves live runs and rejects a stale confirmation after a relaunch', async () => {
+  const { checkStopped } = require(ts.uiPath('cron/ownership/recoverStopped.ts'));
+  const j = await runningJob('manual');
+  const pc = fakeProcCtl({ runs: { 'manual-sup@1': alive(rootOf('manual')) } });
+  assert.equal((await checkStopped(F.db, pc, j.id, j)).status, 409);
+  pc.script.runs['manual-sup@1'] = { supervisor: 'exited', boundary: 'absent', live: [], members: { [rootOf('manual')]: 'exited' } };
+  assert.equal((await checkStopped(F.db, pc, j.id, j)).status, 200);
+  assert.equal((await store.markStopped(F.db, j.id, j)).status, 200);
+  assert.equal((await claimsOf(j.id)).length, 0);
+  assert.equal((await job(j.id)).run_id, null);
+  await store.requestStart(F.db, j.id, F.trainingRoot);
+  const newer = (await admit(j)).admitted;
+  assert.ok(newer);
+  assert.equal((await store.markStopped(F.db, j.id, j)).status, 409);
+  assert.equal((await store.deleteJob(F.db, j.id, F.trainingRoot, { seen: j })).status, 409);
+  assert.equal((await job(j.id)).run_id, newer.run_id);
+  assert.equal((await claimsOf(j.id)).length, 2);
 });
 
 test('U-R7 migration compatibility: the ORIGINAL schema pushed to a database with rows, then this schema pushed without data loss', async () => {
@@ -465,6 +491,11 @@ test('U-R8 delete: claim-free -> deleting reserves the canonical folder; case al
   fs.mkdirSync(folder, { recursive: true });
   assert.equal((await store.beginDelete(F.db, d.id, F.trainingRoot)).status, 200);
   assert.equal((await job(d.id)).status, 'deleting');
+  // Make these alternate spellings real aliases on filesystems that distinguish them.
+  for (const spelling of ['myjob', 'MYJOB. ']) {
+    const aliasPath = path.join(F.trainingRoot, spelling);
+    if (!fs.existsSync(aliasPath)) fs.symlinkSync(folder, aliasPath, 'dir');
+  }
   for (const name of ['MyJob', 'myjob', 'MYJOB. ']) {
     assert.equal((await jobsRoute.POST({ json: async () => ({ name, gpu_ids: '0', job_config: {} }) })).status, 409, name);
   }
@@ -482,6 +513,10 @@ test('U-R8 delete: claim-free -> deleting reserves the canonical folder; case al
   assert.equal(await job(d.id), null);
   assert.equal(fs.existsSync(folder), false);
   assert.equal(await F.db.runClaim.count(), 0);
+  for (const spelling of ['myjob', 'MYJOB. ']) {
+    const aliasPath = path.join(F.trainingRoot, spelling);
+    if (fs.lstatSync(aliasPath, { throwIfNoEntry: false })?.isSymbolicLink()) fs.unlinkSync(aliasPath);
+  }
   assert.equal((await jobsRoute.POST({ json: async () => ({ name: 'myjob', gpu_ids: '0', job_config: {} }) })).status, 200);
 });
 
@@ -524,6 +559,10 @@ test('U-R9 Edit while starting/running/stopping/deleting -> 409; edit and rename
   assert.equal(ok.status, 200);
   assert.equal((await job(j.id)).name, 'e-renamed');
   const other = await makeJob(F.db, { name: 'Other', status: 'stopped' });
+  const renamed = path.join(F.trainingRoot, 'e-renamed');
+  fs.mkdirSync(renamed, { recursive: true });
+  const aliasPath = path.join(F.trainingRoot, 'E-RENAMED');
+  if (!fs.existsSync(aliasPath)) fs.symlinkSync(renamed, aliasPath, 'dir');
   assert.equal((await jobsRoute.POST({ json: async () => ({ id: other.id, name: 'E-RENAMED', gpu_ids: '1', job_config: {} }) })).status, 409);
   assert.equal((await jobsRoute.POST({ json: async () => ({ name: '../escape', gpu_ids: '1', job_config: {} }) })).status, 400);
 });

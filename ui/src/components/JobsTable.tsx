@@ -54,14 +54,16 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
   const onMassDelete = () => {
     const jobsToDelete = jobs.filter(job => selectedIds.has(job.id));
     if (jobsToDelete.length === 0) return;
-    // same rule as the single Delete button: a job that still owns a process (running, or finished but not yet
-    // verified as exited) is skipped; an unfinished earlier deletion is retried
+    // Use the same confirmation and server-side process check as the single-job Delete action.
     const deletable = jobsToDelete.filter(job => getAvaliableJobActions(job).canDelete);
     const owned = jobsToDelete.filter(job => !deletable.includes(job));
     const retries = deletable.filter(job => getAvaliableJobActions(job).isRetryDelete).length;
     let message = `Are you sure you want to delete ${deletable.length} job${
       deletable.length === 1 ? '' : 's'
     }? This will also permanently remove them from your disk.`;
+    if (deletable.some(job => ownershipOf(job).held)) {
+      message += ' Confirm that the selected runs have finished. Jobs with a known live process will be kept.';
+    }
     if (retries > 0) {
       message += ` ${retries} of them ${retries === 1 ? 'is a deletion' : 'are deletions'} that did not finish and will be retried.`;
     }
@@ -79,7 +81,7 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
         for (let i = 0; i < deletable.length; i++) {
           const job = deletable[i];
           try {
-            await deleteJob(job.id);
+            await deleteJob(job.id, job);
             setSelectedIds(prev => {
               const next = new Set(prev);
               next.delete(job.id);

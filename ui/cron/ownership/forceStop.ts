@@ -15,7 +15,7 @@ export const forceStop = async (db: Db, procctl: ProcCtl, jobId: string, waitFor
         status: 409,
         body: {
           error:
-            'This job was started before the run-ownership update, so its processes cannot be identified and it is not force-stopped from here. Use Stop, or end the process yourself; its GPUs stay reserved until it is proven gone.',
+            'This job was started before the run-ownership update. Choose Stop if it is still training, or Mark as Stopped if it has finished.',
           ownership: 'legacy',
         },
       };

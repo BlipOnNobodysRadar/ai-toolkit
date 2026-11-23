@@ -10,11 +10,12 @@ import {
   stopJob,
   deleteJob,
   getAvaliableJobActions,
-  markJobAsStopped,
+  confirmJobStopped,
   saveJobNow,
   sampleJobNow,
   forceStopJob,
   actionError,
+  ownershipOf,
 } from '@/utils/jobs';
 import { startQueue } from '@/utils/queue';
 import { Menu, MenuButton, MenuItem, MenuItems } from '@headlessui/react';
@@ -132,10 +133,21 @@ export default function JobActionBar({
           disabled={isBusy}
           onClick={() => {
             if (!canRemoveFromQueue) return;
-            runAction('remove', async () => {
-              await markJobAsStopped(job.id);
-              if (onRefresh) onRefresh();
+            const remove = () => runAction('remove', async () => {
+              await confirmJobStopped(job);
+              onRefresh?.();
             });
+            if (ownershipOf(job).held) {
+              openConfirm({
+                title: 'Remove from Queue',
+                message: `Confirm that "${job.name}" has finished. This removes it from the queue and keeps its checkpoints.`,
+                type: 'warning',
+                confirmText: 'Remove from Queue',
+                onConfirm: remove,
+              });
+            } else {
+              remove();
+            }
           }}
           className={actionButtonClass}
         >
@@ -207,12 +219,12 @@ export default function JobActionBar({
             : `Are you sure you want to delete the job "${job.name}"? This will also permanently remove it from your disk.`;
           openConfirm({
             title: isRetryDelete ? 'Retry Delete' : 'Delete Job',
-            message: message,
+            message: ownershipOf(job).held ? `Confirm that ${job.name} has finished. Deleting removes the job and its output folder, including checkpoints.` : message,
             type: 'warning',
             confirmText: isRetryDelete ? 'Retry Delete' : 'Delete',
             onConfirm: () =>
               runAction('delete', async () => {
-                await deleteJob(job.id);
+                await deleteJob(job.id, job);
                 if (afterDelete) afterDelete();
               }),
           });
@@ -312,7 +324,7 @@ export default function JobActionBar({
               className={isBusy || !canMarkStopped ? menuItemDisabledClass : menuItemEnabledClass}
               onClick={() => {
                 if (isBusy || !canMarkStopped) return;
-                let message = `Are you sure you want to mark this job as stopped? This only resets the displayed status of a job whose process is already gone; it will NOT stop anything.`;
+                const message = `Confirm that "${job.name}" has finished. This releases its queue reservation and keeps its checkpoints. If it is still training, use Stop instead.`;
                 openConfirm({
                   title: 'Mark Job as Stopped',
                   message: message,
@@ -320,7 +332,7 @@ export default function JobActionBar({
                   confirmText: 'Mark as Stopped',
                   onConfirm: () =>
                     runAction('markStopped', async () => {
-                      await markJobAsStopped(job.id);
+                      await confirmJobStopped(job);
                       onRefresh && onRefresh();
                     }),
                 });

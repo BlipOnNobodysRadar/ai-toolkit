@@ -1,5 +1,7 @@
 # State machines: catalog, invariants, transitions, defects
 
+**Queue recovery update.** During an upgrade, the worker checks jobs from the older launcher on its first pass. An exited trainer or a reused PID releases the GPU automatically. For an old row without a PID, the worker looks for a process using that job’s config. If the process state is inconclusive and you know training has ended, choose **Mark as Stopped** to keep the checkpoints, or **Delete** to remove the job and its output folder. Both actions check for live processes. This supersedes the reboot requirement in the historical audit below.
+
 **CURRENT STATUS — 2026-11-07.** Section 20 supersedes the relevant older behaviour/status. Commits: UI `bb21cae1`; core and shared CLI/UI leases `964d79a1`; data/cache/inference `cb692933`. Final combined CPU suite: **863 passed, 53 skipped**, with unchanged Python source hashes. Full UI: **101 passed**; both TypeScript projects: **zero diagnostics**. All fixes are committed on `codex/opus-state-machines-20261106`, unmerged and unpushed; main remains `f6c137b4`. The separate detached `db8dafb5` GPU comparison is unchanged and does not validate these new commits. No GPU throughput/full-model validation was run here.
 
 **Historical status (sections 1-19; preserved verbatim; superseded where section 20 applies):**

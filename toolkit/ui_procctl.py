@@ -29,6 +29,7 @@ legacy row recorded under another boot id cannot have a live process.
 Process identity is "<pid>@<creation>" (Windows: exact 64-bit FILETIME as decimal; Linux: boot id and start ticks).
 A pid that now shows another creation time is a different process: the recorded one exited. Unknown is never exited.
 """
+from functools import lru_cache
 import json
 import os
 import subprocess
@@ -288,7 +289,7 @@ if IS_WINDOWS:
         return None, f"error {err}"
 
     def _snapshot():
-        """[(pid, ppid)] from one Toolhelp snapshot; raises unless enumeration reached its normal end."""
+        """[(pid, ppid, executable name)] from one Toolhelp snapshot; raises unless enumeration reached its normal end."""
         snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
         if not snap or snap == INVALID_HANDLE_VALUE:
             raise OSError(f"CreateToolhelp32Snapshot failed ({ctypes.get_last_error()})")
@@ -298,7 +299,7 @@ if IS_WINDOWS:
             out = []
             ok = Process32FirstW(snap, ctypes.byref(entry))
             while ok:
-                out.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID)))
+                out.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID), entry.szExeFile))
                 ok = Process32NextW(snap, ctypes.byref(entry))
             err = ctypes.get_last_error()
             if err != ERROR_NO_MORE_FILES:
@@ -368,6 +369,7 @@ if IS_LINUX:
         except (FileNotFoundError, ProcessLookupError, PermissionError):
             return None
 
+    @lru_cache(maxsize=1)
     def _btime():
         with open("/proc/stat") as f:
             for line in f:
@@ -428,14 +430,16 @@ def describe(pid):
                 return {"state": "unknown", "why": "wait failed"}
             if not alive:
                 return {"state": "gone", "why": "exited", "identity": _identity(pid, creation)}
-            return {"state": "alive", "identity": _identity(pid, creation), "cmdline": _cmdline(h)}
+            return {"state": "alive", "identity": _identity(pid, creation),
+                    "started_ms": int(creation) // 10000 - 11644473600000, "cmdline": _cmdline(h)}
         finally:
             CloseHandle(h)
     if IS_LINUX:
         st = _stat(pid)
         if st is None or st[0] == "Z":
             return {"state": "gone", "why": "no process" if st is None else "zombie"}
-        return {"state": "alive", "identity": _identity(pid, f"{_BOOT}:{st[2]}"), "cmdline": _cmdline_linux(pid)}
+        return {"state": "alive", "identity": _identity(pid, f"{_BOOT}:{st[2]}"),
+                "started_ms": int((_btime() + int(st[2]) / _CLK) * 1000), "cmdline": _cmdline_linux(pid)}
     try:
         out = subprocess.run(["ps", "-o", "lstart=", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
                              timeout=10)
@@ -463,15 +467,17 @@ def check(identity):
     return "unknown"
 
 
-def scan(needle, since_ms):
+def scan(needle, since_ms, legacy_launchers_only=False):
     """Live processes created at/after since_ms whose command line contains needle.
     complete=False if any such process could be opened but its creation time or command line could not be read.
-    A process that cannot be queried at all ('denied') may be anything, so it also makes the scan incomplete. Scans are
-    diagnostics; no release decision uses a negative scan."""
+    A process that cannot be queried at all ('denied') also makes the scan incomplete.
+    Legacy launch scans on Windows consider Python and its Node relay."""
     matches, unreadable, denied = [], 0, 0
     if IS_WINDOWS:
         since_ft = (int(since_ms) + 11644473600000) * 10000
-        for pid, ppid in _snapshot():
+        for pid, ppid, executable in _snapshot():
+            if legacy_launchers_only and not (executable.lower().startswith("python") or executable.lower() == "node.exe"):
+                continue
             if pid in (0, 4):
                 continue
             h, why = _open(pid)
@@ -914,7 +920,10 @@ def main(argv):
     if cmd == "probe":
         res = {"platform": platform_name(), "boot_id": boot_id(), "describe": {}, "runs": {}, "scans": {}}
         for p in req.get("describe", []):
-            res["describe"][str(p)] = describe(p)
+            try:
+                res["describe"][str(p)] = describe(p)
+            except OSError as e:
+                res["describe"][str(p)] = {"state": "unknown", "why": str(e)}
         for key, r in (req.get("runs") or {}).items():
             try:
                 res["runs"][key] = run_state(r["run_id"], r.get("supervisor"), r.get("members") or [])
@@ -923,7 +932,7 @@ def main(argv):
                                     "error": str(e)}
         for key, s in (req.get("scans") or {}).items():
             try:
-                res["scans"][key] = scan(s["needle"], s["since_ms"])
+                res["scans"][key] = scan(s["needle"], s["since_ms"], s.get("legacy_launchers_only", False))
             except Exception as e:  # noqa: BLE001
                 res["scans"][key] = {"complete": False, "matches": [], "error": str(e)}
     elif cmd == "fence":

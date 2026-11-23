@@ -265,18 +265,30 @@ export const requestQueueReturn = async (db: Db, job: Job) => {
   );
 };
 
-// Pure display reset for a row that owns nothing. Never an ownership bypass.
-export const markStopped = (db: Db, jobId: string): Promise<Outcome> =>
+export type RunSnapshot = Pick<Job, 'run_id' | 'launch_phase' | 'pid' | 'status'>;
+export const sameRun = (job: Job, seen: RunSnapshot) =>
+  job.run_id === seen.run_id && job.launch_phase === seen.launch_phase && job.pid === seen.pid && job.status === seen.status;
+
+// The ordinary action only changes the status. A confirmed recovery has already checked the observed
+// processes; recheck the run in the transaction so an old tab cannot release a subsequent launch.
+export const markStopped = (db: Db, jobId: string, seen?: RunSnapshot): Promise<Outcome> =>
   routeTx(db, async tx => {
     const job = await tx.job.findUnique({ where: { id: jobId } });
     if (!job) return { status: 404, body: { error: 'Job not found' } };
     if (DELETING.includes(job.status)) return conflict('This job is being deleted.');
     const own = await ownershipOf(tx, job);
-    if (own.held) return conflict(`Not marked as stopped: ${own.message}`, { ownership: own.kind });
-    await tx.job.updateMany({
+    if (seen && !sameRun(job, seen)) return conflict('The job changed. Refresh and try again.');
+    if (own.held && !seen) return conflict(`Not marked as stopped: ${own.message}`, { ownership: own.kind });
+    if (seen) await tx.runClaim.deleteMany({ where: { job_id: jobId, kind: 'run' } });
+    const updated = await tx.job.updateMany({
       where: { id: jobId, run_id: job.run_id, status: job.status },
-      data: { stop: true, status: 'stopped', info: 'Job stopped', pid: null },
+      data: {
+        stop: true, status: 'stopped', info: 'Job stopped', pid: null,
+        ...(seen ? { run_id: null, launch_phase: null, pid_identity: null, supervisor_identity: null,
+          run_members: null, after_exit: null, stop_requested_at: null, return_to_queue: false, ownership_note: null } : {}),
+      },
     });
+    if (updated.count !== 1) throw new LostRace();
     return { status: 200, body: job };
   });
 
@@ -338,14 +350,15 @@ export const saveJob = (db: Db, body: any, trainingRoot: string, forcedGpuIds?: 
 // admitted to it until removal finishes. The row (and its name) stay until the folder is gone.
 // resume=true is only for a caller holding the job's deletion lock (deleteJob): a row left 'deleting' by a deleter
 // that crashed, or whose final DB write failed, is then safely continued.
-export const beginDelete = (db: Db, jobId: string, trainingRoot: string, opts: { resume?: boolean; expectedFolder?: string } = {}): Promise<Outcome> =>
+export const beginDelete = (db: Db, jobId: string, trainingRoot: string, opts: { resume?: boolean; expectedFolder?: string; seen?: RunSnapshot } = {}): Promise<Outcome> =>
   routeTx(db, async tx => {
     const job = await tx.job.findUnique({ where: { id: jobId } });
     if (!job) return { status: 404, body: { error: 'Job not found' } };
     if (job.status === 'deleting' && !opts.resume) return conflict('This job is already being deleted.');
-    if (job.status !== 'deleting' && !DELETABLE.includes(job.status)) return conflict(`A ${job.status} job cannot be deleted; stop it first.`);
+    if (opts.seen && !sameRun(job, opts.seen)) return conflict('The job changed. Refresh and try again.');
+    if (!opts.seen && job.status !== 'deleting' && !DELETABLE.includes(job.status)) return conflict(`A ${job.status} job cannot be deleted; stop it first.`);
     const own = await ownershipOf(tx, job);
-    if (own.held) return conflict(`Not deleted: ${own.message}`, { ownership: own.kind });
+    if (own.held && !opts.seen) return conflict(`Not deleted: ${own.message}`, { ownership: own.kind });
     const nameError = jobFolderError(trainingRoot, job.name);
     if (nameError) return { status: 400, body: { error: `${nameError}; its folder is not removed from here.` } };
     const folder = canonicalFolder(trainingRoot, job.name);
@@ -357,12 +370,13 @@ export const beginDelete = (db: Db, jobId: string, trainingRoot: string, opts: {
     // any other owner of this folder, of a folder inside it, or of one containing it (recursive removal would hit it)
     const other = (await occupants(tx, trainingRoot)).find(o => o.job_id !== jobId && foldersOverlap(o.set.folder, folder));
     if (other) return conflict(`Another job ("${other.job_name}") is using this folder or a folder inside it.`);
-    if (!holder) {
+    if (opts.seen) await tx.runClaim.deleteMany({ where: { job_id: jobId, kind: 'run' } });
+    if (!holder || (opts.seen && holder.kind === 'run' && holder.job_id === jobId)) {
       await tx.runClaim.create({ data: { resource, job_id: jobId, run_id: deleteRunId(jobId), kind: 'delete' } });
     }
     const r = await tx.job.updateMany({
       where: { id: jobId, status: job.status, run_id: job.run_id },
-      data: { status: 'deleting', info: 'Deleting job...' },
+      data: { status: 'deleting', info: 'Deleting job...', ...(opts.seen ? { run_id: null, pid: null, launch_phase: null, ownership_note: null } : {}) },
     });
     if (r.count !== 1) throw new LostRace();
     return { status: 200, body: job };
@@ -377,7 +391,7 @@ export const deleteJob = async (
   db: Db,
   jobId: string,
   trainingRoot: string,
-  deps: { rm?: (dir: string) => Promise<void>; afterBegin?: () => Promise<void>; waitMs?: number } = {},
+  deps: { rm?: (dir: string) => Promise<void>; afterBegin?: () => Promise<void>; waitMs?: number; seen?: RunSnapshot } = {},
 ): Promise<Outcome> => {
   const lockFile = path.join(trainingRoot, LOCK_DIR, `delete.${jobId.replace(/[^\w-]/g, '_')}.lock`);
   try {
@@ -391,7 +405,7 @@ export const deleteJob = async (
         const expectedFolder = canonicalFolder(trainingRoot, candidate.name);
         try {
           return await withOpLock(writerLeasePath(expectedFolder), async () => {
-            const begun = await beginDelete(db, jobId, trainingRoot, { resume: true, expectedFolder });
+            const begun = await beginDelete(db, jobId, trainingRoot, { resume: true, expectedFolder, seen: deps.seen });
             if (begun.status !== 200) return begun;
             if (deps.afterBegin) await deps.afterBegin();
             const folder = path.join(trainingRoot, begun.body.name);
@@ -600,7 +614,7 @@ export const keepLegacyTime = (job: Pick<Job, 'run_id' | 'updated_at'>) => (job.
 export const noteOwnership = async (db: Db, job: Job, note: string | null) => {
   if (job.ownership_note === note) return;
   await withRetry(() =>
-    db.job.updateMany({ where: { id: job.id, run_id: job.run_id }, data: { ownership_note: note, ...keepLegacyTime(job) } }),
+    db.job.updateMany({ where: { id: job.id, run_id: job.run_id, pid: job.pid, status: job.status, ...keepLegacyTime(job) }, data: { ownership_note: note, ...keepLegacyTime(job) } }),
   );
 };
 
@@ -661,18 +675,19 @@ export const releaseRun = async (
     }),
   );
 
-// Claims left by a run id that no job row carries any more (not produced by this code; kept for manual repair).
 // Legacy rows: cleared only on proof of exit (never signalled).
 export const clearLegacy = (db: Db, job: Job, evidence: string) =>
   withRetry(() =>
     db.job.updateMany({
-      where: { id: job.id, run_id: null, pid: job.pid, status: job.status, updated_at: job.updated_at },
+      where: { id: job.id, run_id: null, pid: job.pid, status: job.status, updated_at: job.updated_at, stop: job.stop, return_to_queue: job.return_to_queue },
       data: {
         pid: null,
         ...(ACTIVE.includes(job.status)
-          ? { status: job.stop ? 'stopped' : 'error', info: job.stop ? 'Job stopped' : `Job process exited (${evidence}).` }
+          ? { status: job.return_to_queue && !job.stop ? 'queued' : 'stopped', info: `Previous run ended (${evidence}).` }
           : {}),
-        ownership_note: `Legacy process exit verified: ${evidence}`,
+        stop: false,
+        return_to_queue: false,
+        ownership_note: null,
       },
     }),
   );

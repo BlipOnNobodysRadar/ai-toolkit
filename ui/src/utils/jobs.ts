@@ -34,7 +34,10 @@ export const stopJob = (jobID: string) => {
   });
 };
 
-export const deleteJob = (jobID: string) => {
+const snapshot = ({ status, pid, run_id, launch_phase }: Job) => ({ status, pid, run_id, launch_phase });
+
+export const deleteJob = (jobID: string, job?: Job) => {
+  if (job && ownershipOf(job).held) return apiClient.post(`/api/jobs/${jobID}/delete`, snapshot(job)).then(() => {});
   return new Promise<void>((resolve, reject) => {
     apiClient
       .get(`/api/jobs/${jobID}/delete`)
@@ -98,6 +101,9 @@ export const markJobAsStopped = (jobID: string) => {
   });
 };
 
+export const confirmJobStopped = (job: Job) =>
+  ownershipOf(job).held ? apiClient.post(`/api/jobs/${job.id}/mark_stopped`, snapshot(job)) : markJobAsStopped(job.id);
+
 export const getJobConfig = (job: Job) => {
   return JSON.parse(job.job_config) as JobConfig;
 };
@@ -127,7 +133,7 @@ export const getAvaliableJobActions = (job: Job) => {
   // 'deleting' with no run ownership is a deletion that did not finish (e.g. the server stopped mid-way): Delete
   // resumes it. A deletion still running elsewhere holds the server's deletion lock and the retry is refused (409),
   // so the browser does not need to guess whether the earlier deleter is alive.
-  const canDelete = !held && ['queued', 'completed', 'stopped', 'error', 'delete_failed', 'deleting'].includes(job.status);
+  const canDelete = held || ['queued', 'completed', 'stopped', 'error', 'delete_failed', 'deleting'].includes(job.status);
   const isRetryDelete = canDelete && ['deleting', 'delete_failed'].includes(job.status);
   let canEdit = !held && ['queued', 'completed', 'stopped', 'error'].includes(job.status);
   const canRemoveFromQueue = job.status === 'queued';
@@ -139,8 +145,8 @@ export const getAvaliableJobActions = (job: Job) => {
   }
   // force stop needs an identified process boundary; pre-update runs cannot be force stopped from the UI
   const canForceStop = held && !legacy && job.launch_phase === 'attached';
-  // display reset only for a row that owns nothing (the server refuses otherwise)
-  const canMarkStopped = !held && !['stopped', 'deleting', 'delete_failed'].includes(job.status);
+  // Owners can recover a stale reservation even when the worker could not identify the process.
+  const canMarkStopped = !['deleting', 'delete_failed'].includes(job.status) && (held || job.status !== 'stopped');
   return { canDelete, isRetryDelete, canEdit, canStop, canStart, canRemoveFromQueue, canForceStop, canMarkStopped, isStopping };
 };
 

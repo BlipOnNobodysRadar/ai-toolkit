@@ -101,6 +101,22 @@ export const readMembers = (membersPath: string, runId: string): string[] => {
   return r?.run_id === runId && Array.isArray(r.members) ? r.members.filter(validIdentity) : [];
 };
 
+export const savedMembers = (job: Pick<Job, 'run_members'>): string[] => {
+  try {
+    const m: unknown = JSON.parse(job.run_members || '[]');
+    return Array.isArray(m) ? m.filter(validIdentity) : [];
+  } catch {
+    return [];
+  }
+};
+
+export const knownMembers = (job: Job): string[] => {
+  const recorded = savedMembers(job);
+  if (job.pid_identity) recorded.push(job.pid_identity);
+  if (job.run_id && job.run_dir) recorded.push(...readMembers(runFiles(job.run_dir, job.run_id).members, job.run_id));
+  return [...new Set(recorded)];
+};
+
 const writeAtomic = (file: string, text: string) => {
   const tmp = `${file}.${process.pid}.tmp`;
   const fd = fs.openSync(tmp, 'w');

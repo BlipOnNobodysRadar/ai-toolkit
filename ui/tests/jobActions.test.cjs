@@ -17,7 +17,7 @@ ts.mock('react/jsx-runtime', {
   jsxs: (type, props) => ({ type, props }),
   Fragment: 'Fragment',
 });
-ts.mock('@/utils/api', { apiClient: { get: url => (requests.push(url), Promise.resolve({ data: { ok: true } })) } });
+ts.mock('@/utils/api', { apiClient: { post: (url, data) => (requests.push({ url, data }), Promise.resolve({ data: {} })), get: url => (requests.push(url), Promise.resolve({ data: { ok: true } })) } });
 ts.mock('@/components/ConfirmModal', { openConfirm: c => confirms.push(c) });
 ts.mock('@/components/CaptionDatasetModal', { openCaptionDatasetModal: () => {} });
 ts.mock('@/utils/queue', { startQueue: async () => {} });
@@ -58,7 +58,7 @@ const find = (node, pred) => {
   return find(node.props?.children, pred);
 };
 
-test('helper: an unfinished deletion (deleting/delete_failed, no run ownership) offers Retry Delete; owned or active rows do not', () => {
+test('unfinished deletions offer Retry Delete and a stale status cannot disable Delete', () => {
   for (const status of ['deleting', 'delete_failed']) {
     const a = getAvaliableJobActions(row({ status }));
     assert.equal(a.canDelete, true, status);
@@ -72,10 +72,9 @@ test('helper: an unfinished deletion (deleting/delete_failed, no run ownership) 
   for (const r of [
     row({ status: 'running', run_id: 'r', launch_phase: 'attached' }),
     row({ status: 'completed', run_id: 'r', launch_phase: 'attached' }), // reported done, process not yet verified gone
-    row({ status: 'deleting', run_id: 'r', launch_phase: 'attached' }), // never guessed: ownership wins
-    row({ status: 'completed', pid: 123 }), // pre-update row with a recorded pid
+    row({ status: 'stopping', run_id: 'r', launch_phase: 'attached' }),
   ]) {
-    assert.equal(getAvaliableJobActions(r).canDelete, false, JSON.stringify([r.status, r.launch_phase, r.pid]));
+    assert.equal(getAvaliableJobActions(r).canDelete, true, JSON.stringify([r.status, r.launch_phase, r.pid]));
   }
 });
 
@@ -96,13 +95,27 @@ test('JobActionBar: the Retry Delete button is enabled and labelled for a persis
   h.unmount();
 });
 
-test('JobActionBar: an ordinary stopped row shows a plain Delete; a running row has it disabled', () => {
+test('JobActionBar: stopped and apparently running jobs both offer Delete', () => {
   const plain = renderHook(props => JobActionBar(props), { job: row({ status: 'stopped' }) });
   const del = find(plain.result.current, p => p['aria-label'] === 'Delete');
   assert.equal(del.props.disabled, false);
   plain.unmount();
   const running = renderHook(props => JobActionBar(props), { job: row({ status: 'running', run_id: 'r', launch_phase: 'attached' }) });
   const off = find(running.result.current, p => p['aria-label'] === 'Delete');
-  assert.equal(off.props.disabled, true);
+  assert.equal(off.props.disabled, false);
   running.unmount();
+});
+
+test('a pre-update job can be deleted directly or marked stopped from the job menu', async () => {
+  const legacy = row({ status: 'running', pid: 123 });
+  const h = renderHook(props => JobActionBar(props), { job: legacy });
+  const del = find(h.result.current, p => p['aria-label'] === 'Delete');
+  assert.equal(del.props.disabled, false);
+  del.props.onClick();
+  const confirm = confirms.pop();
+  assert.match(confirm.message, /checkpoints/);
+  await confirm.onConfirm();
+  assert.deepEqual(requests.at(-1), { url: '/api/jobs/J1/delete', data: { status: 'running', run_id: null, launch_phase: null, pid: 123 } });
+  assert.equal(getAvaliableJobActions(legacy).canMarkStopped, true);
+  h.unmount();
 });

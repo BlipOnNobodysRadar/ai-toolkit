@@ -313,7 +313,7 @@ test('supervisor dies after creating the root, before any receipt, with a tokenl
   const rep = await reconcile();
   assert.match(rep[r0.run_id], /kept: supervisor exited/);
   assert.equal(await claims(j.id), 2);
-  assert.match((await row(j.id)).ownership_note, /restart of this computer/);
+  assert.match((await row(j.id)).ownership_note, /Mark as Stopped/);
   // the kernel did terminate the run (KILL_ON_JOB_CLOSE) — observed here for the record, never used as proof
   const scan = (await pc.probe({ scans: { s: { needle: r0.run_id, since_ms: 0 } } })).scans.s;
   fs.appendFileSync(identityLog, `${new Date().toISOString()} crash-before-receipt run=${r0.run_id} remaining-token-matches=${scan.matches.length}\n`);

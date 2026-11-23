@@ -49,7 +49,7 @@ test('a deleter process that dies after committing the reservation is resumed by
   assert.equal(await F.db.runClaim.count({ where: { kind: 'delete' } }), 1);
   assert.equal(fs.existsSync(dir), true);
   // meanwhile the name/folder stay reserved
-  assert.equal((await jobsRoute.POST({ json: async () => ({ name: 'CrashDel', gpu_ids: '0', job_config: {} }) })).status, 409);
+  assert.equal((await jobsRoute.POST({ json: async () => ({ name: process.platform === 'win32' ? 'CrashDel' : j.name, gpu_ids: '0', job_config: {} }) })).status, 409);
   const out = await routeCall(deleteRoute, 'GET', j.id);
   assert.equal(out.status, 200, JSON.stringify(out.body));
   assert.equal(await row(j.id), null);
