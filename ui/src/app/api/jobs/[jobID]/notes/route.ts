@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/server/prisma';
 import path from 'path';
 import fs from 'fs';
+import { jobArtifactPath } from '../../../../../../cron/ownership/jobArtifacts';
 import { getTrainingFolder } from '@/server/settings';
 
 const getNotesPath = async (jobID: string): Promise<string | null> => {
@@ -14,7 +15,7 @@ const getNotesPath = async (jobID: string): Promise<string | null> => {
   }
 
   const trainingFolder = await getTrainingFolder();
-  return path.join(trainingFolder, job.name, 'notes.md');
+  return await jobArtifactPath(trainingFolder, job, 'notes.md');
 };
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ jobID: string }> }) {

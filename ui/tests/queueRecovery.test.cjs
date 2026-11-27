@@ -104,3 +104,77 @@ test('recover pre-update jobs, delete a finished run, and complete the next laun
   assert.equal((await row(next.id)).status, 'completed');
   assert.equal(await F.db.runClaim.count({ where: { job_id: next.id } }), 0);
 });
+
+test('Force Stop ends only the pre-update trainer and its workers', { skip: !supported }, async t => {
+  const kill = require(ts.uiPath('src/app/api/jobs/[jobID]/kill/route.ts'));
+  const legacy = await makeJob(F.db, { name: 'old-stuck', status: 'running', step: 87 });
+  const config = path.join(F.trainingRoot, legacy.name, '.job_config.json');
+  const gate = path.join(F.trainingRoot, 'legacy-child.pid');
+  const script = [
+    'import pathlib,subprocess,sys,time',
+    'child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])',
+    'pathlib.Path(sys.argv[1]).write_text(str(child.pid))',
+    'child.wait()',
+  ].join('\n');
+  const trainer = spawn(PYTHON, ['-c', script, gate, config], {
+    stdio: 'ignore', windowsHide: true, env: { ...process.env, AITK_JOB_ID: legacy.id, AITK_RUN_ID: '' },
+  });
+  const other = spawn(PYTHON, ['-c', 'import time; time.sleep(30)', config], {
+    stdio: 'ignore', windowsHide: true, env: { ...process.env, AITK_JOB_ID: 'some-other-job' },
+  });
+  t.after(() => { trainer.kill(); other.kill(); });
+  const deadline = Date.now() + 5000;
+  while (!fs.existsSync(gate) && Date.now() < deadline) await delay(50);
+  const childPid = Number(fs.readFileSync(gate, 'utf8'));
+  const setPid = pid => F.db.job.update({ where: { id: legacy.id }, data: { pid } });
+  await setPid(other.pid);
+  assert.equal((await routeCall(kill, 'GET', legacy.id)).status, 409);
+  await setPid(trainer.pid);
+  const result = await routeCall(kill, 'GET', legacy.id);
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(result.body.killed, true);
+  const observed = await pc.probe({ describe: [other.pid, trainer.pid, childPid] });
+  assert.equal(observed.describe[other.pid].state, 'alive');
+  assert.equal(observed.describe[trainer.pid].state, 'gone');
+  assert.equal(observed.describe[childPid].state, 'gone');
+  const recovered = await row(legacy.id);
+  assert.equal(recovered.status, 'stopped');
+  assert.equal(recovered.step, 87);
+});
+
+test('Linux Force Stop and overdue graceful stop both release the run', { skip: process.platform !== 'linux' }, async t => {
+  const store = require(ts.uiPath('cron/ownership/store.ts'));
+  const kill = require(ts.uiPath('src/app/api/jobs/[jobID]/kill/route.ts'));
+  const stop = require(ts.uiPath('src/app/api/jobs/[jobID]/stop/route.ts'));
+  for (const action of ['force', 'graceful']) {
+    const name = 'linux-stop-' + action;
+    const gate = path.join(F.trainingRoot, name + '.gate');
+    t.after(() => fs.writeFileSync(gate, ''));
+    const config = jobConfig(name);
+    config.config.process[0].test_steps = ['wait:' + gate];
+    const j = await makeJob(F.db, { name, status: 'queued', job_config: JSON.stringify(config) });
+    const { admitted } = await store.admit(F.db, j.id, F.trainingRoot, worker);
+    assert.ok(admitted);
+    const launch = await launchRun({
+      db: F.db, toolkitRoot: TOOLKIT_ROOT, helperPath: pc.helperPath, helperPython: PYTHON, jobPython: PYTHON,
+      runPy: path.join(__dirname, 'fixtures', 'fake_run.py'), sqliteDbPath: F.file, inFlight: new Set(),
+    }, admitted);
+    assert.equal(launch.result, 'attached');
+    const job = await row(j.id);
+    if (action === 'force') {
+      const result = await routeCall(kill, 'GET', j.id);
+      assert.ok([200, 202].includes(result.status), JSON.stringify(result.body));
+    } else {
+      await routeCall(stop, 'GET', j.id);
+      await reconcile({ db: F.db, procctl: pc, self: worker, inFlight: new Set(), trainingRoot: F.trainingRoot, tick: 0,
+        now: () => Date.now() + 120_000 });
+    }
+    const exit = runFiles(job.run_dir, job.run_id).exit;
+    const deadline = Date.now() + 5000;
+    while (!fs.existsSync(exit) && Date.now() < deadline) await delay(50);
+    assert.ok(fs.existsSync(exit));
+    await poll();
+    assert.equal((await row(j.id)).status, 'stopped');
+    assert.equal(await F.db.runClaim.count({ where: { job_id: j.id } }), 0);
+  }
+});

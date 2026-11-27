@@ -29,6 +29,8 @@ ts.mock('@/server/settings', {
   getTrainingFolder: async () => settings.training,
 });
 
+ts.mock('@/server/prisma', { job: { findMany: async () => [] } });
+
 const middleware = require(ts.uiPath('src/middleware.ts')).middleware;
 const imgDelete = require(ts.uiPath('src/app/api/img/delete/route.ts'));
 const imgCaption = require(ts.uiPath('src/app/api/img/caption/route.ts'));

@@ -250,7 +250,7 @@ const uiProps = (jobConfig, setJobConfig = () => {}) => ({
   runId: null,
   gpuIDs: null,
   setGpuIDs: () => {},
-  gpuList: [],
+  gpuOptions: [],
   datasetOptions: [],
 });
 

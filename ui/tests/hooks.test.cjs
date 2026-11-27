@@ -260,3 +260,24 @@ test('useJobLossLog: a run-change retry queued for job A neither requests A nor 
     global.clearTimeout = realClear;
   }
 });
+
+test('loss graph replaces old points when the current launch prunes metrics after its first poll', async () => {
+  const h = mount(({ id }) => useJobLossLog(id, 1_000_000), { id: 'J' });
+  await flush();
+  const response = (steps, wall_time, reset) => ({
+    keys: ['loss'], run_id: 'resumed', reset, cursor: { step: steps.at(-1), wall_time },
+    series: { loss: { steps, values: steps } },
+  });
+  gets('/api/jobs/J/loss')[0].resolve(response([3, 8, 10], 120, false));
+  await flush();
+  h.result.current.refreshLoss();
+  await flush();
+  const poll = gets('/api/jobs/J/loss')[1];
+  assert.deepEqual(poll.config.params, { since_step: 10, since_time: 120 });
+  poll.resolve(response([3, 5], 125, true));
+  await flush();
+  assert.deepEqual(h.result.current.series.loss.steps, [3, 5]);
+  h.result.current.refreshLoss();
+  await flush();
+  assert.deepEqual(gets('/api/jobs/J/loss')[2].config.params, { since_step: 5, since_time: 125 });
+});

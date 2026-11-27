@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { jobArtifactPath, regularJobPath } from '../../../../../cron/ownership/jobArtifacts';
 import fs from 'fs';
 import path from 'path';
 import prisma from '@/server/prisma';
@@ -40,14 +41,14 @@ async function proxy(request: NextRequest, segments: string[]) {
     const body = await request.json().catch(() => ({}));
     const paths: string[] = Array.isArray(body?.paths) ? body.paths : [];
     const trainingFolder = path.resolve(await getTrainingFolder());
-    const jobs = await prisma.job.findMany({ where: { job_type: 'inference' }, select: { name: true } });
-    const roots = jobs.map(j => path.join(trainingFolder, j.name, 'outputs'));
+    const jobs = await prisma.job.findMany({ where: { job_type: 'inference' }, select: { name: true, run_dir: true, run_id: true, exit_verified_at: true } });
+    const roots = await Promise.all(jobs.map(j => jobArtifactPath(trainingFolder, j, 'outputs').catch(() => null)));
     const deleted: string[] = [];
     const refused: string[] = [];
     for (const p of paths) {
       const resolved = path.resolve(String(p));
-      const root = roots.find(r => resolved.startsWith(r + path.sep));
-      if (!root) {
+      const root = roots.find(r => r && resolved.startsWith(r + path.sep));
+      if (!root || !(await regularJobPath(root, resolved))) {
         refused.push(p);
         continue;
       }

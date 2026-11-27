@@ -92,6 +92,7 @@ export const canonicalFolder = (trainingRoot: string, name: string, platform: st
 // delete act outside it).
 export const jobFolderError = (trainingRoot: string, name: string | null | undefined): string | null => {
   if (typeof name !== 'string' || name.trim() === '') return 'Job name is required';
+  if (path.basename(name) !== name) return `Invalid job name "${name}"`;
   const root = path.resolve(trainingRoot);
   const folder = path.resolve(root, name);
   if (path.dirname(folder) !== root || folder === root) return `Invalid job name "${name}"`;
@@ -99,6 +100,44 @@ export const jobFolderError = (trainingRoot: string, name: string | null | undef
   if (name.trim().replace(/[. ]+$/, '').toLowerCase() === '.aitk_locks') return `"${name}" is reserved`;
   if (process.platform === 'win32' && name.replace(/[. ]+$/, '') === '') return `Invalid job name "${name}"`;
   return null;
+};
+
+// A launch records its absolute output directory. Renaming a job or changing
+// Training Folder does not move the existing files. Unlaunched/legacy rows
+// have only the configured root and name to go on.
+export const jobOutputFolder = (
+  trainingRoot: string,
+  job: { name: string; run_dir?: string | null; run_id?: string | null; exit_verified_at?: unknown },
+  pinHistoricalParent = false,
+): string => {
+  const nameError = jobFolderError(trainingRoot, job.name);
+  if (nameError) throw new FolderIdentityError(nameError);
+  const configured = path.resolve(trainingRoot, job.name);
+  if (!job.run_dir) return configured;
+  const bound = path.resolve(job.run_dir);
+  const historical = path.relative(configured, bound) !== '';
+  if (!path.isAbsolute(job.run_dir) || path.normalize(job.run_dir) !== bound ||
+      jobFolderError(path.dirname(bound), path.basename(bound)) ||
+      (historical && !job.run_id && !job.exit_verified_at)) {
+    throw new FolderIdentityError('The saved output directory is not the claimed job folder.');
+  }
+  if (historical) {
+    const pinned = path.join(physicalPath(path.dirname(bound)), path.basename(bound));
+    const resolved = physicalPath(pinned);
+    if (path.relative(resolved, bound) !== '') {
+      // A junction or symlink can be redirected after a launch. The generated
+      // per-run config identifies the original output on older installations.
+      const config = job.run_id && /^[\w-]+$/.test(job.run_id)
+        ? path.join(resolved, `.job_config.${job.run_id}.json`) : null;
+      if (!config || !fs.lstatSync(config, { throwIfNoEntry: false })?.isFile()) {
+        throw new FolderIdentityError('The historical output link no longer identifies this run.');
+      }
+      // Pin parent links to the verified target for this operation. Preserve a
+      // final directory link so removal unlinks it without following it.
+      if (pinHistoricalParent) return pinned;
+    }
+  }
+  return bound;
 };
 
 export const resourceSet = (gpu: { gpus: string[]; exclusive: boolean }, folder: string): ResourceSet => ({

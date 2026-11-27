@@ -38,7 +38,8 @@ export type TerminateResult = { supported: boolean; verified: boolean; boundary?
 export type FenceResult = { fenced: boolean; boundary?: any; error?: string };
 export type ProcCtl = {
   probe(req: ProbeRequest): Promise<ProbeResult>;
-  terminate(runId: string, supervisor: string | null): Promise<TerminateResult>;
+  terminate(runId: string, supervisor: string | null, runDir?: string | null): Promise<TerminateResult>;
+  terminateLegacy(jobId: string, jobName: string, identity: string): Promise<TerminateResult>;
   // claim an unattached run's boundary for good (see toolkit/ui_procctl.py "Boundary claim")
   fence(runId: string, runDir: string, by: string): Promise<FenceResult>;
   self(pid: number): Promise<{ identity: string; boot_id: string | null } | null>;
@@ -52,7 +53,7 @@ const call = (python: string, helper: string, cmd: string, payload: any): Promis
   new Promise(resolve => {
     const child = execFile(
       python,
-      ['-I', '-S', helper, cmd],
+      cmd === 'terminate-legacy' ? ['-I', helper, cmd] : ['-I', '-S', helper, cmd],
       { windowsHide: true, timeout: HELPER_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 },
       (error, stdout, stderr) => {
         if (error) {
@@ -79,10 +80,14 @@ export const makeProcCtl = (python: string, toolkitRoot: string): ProcCtl => {
       if (r.ok === false) return { ok: false, error: r.error, describe: {}, runs: {}, scans: {} };
       return { ok: true, boot_id: r.value.boot_id ?? null, describe: r.value.describe ?? {}, runs: r.value.runs ?? {}, scans: r.value.scans ?? {} };
     },
-    async terminate(runId, supervisor) {
-      const r = await call(python, helperPath, 'terminate', { run_id: runId, supervisor });
+    async terminate(runId, supervisor, runDir) {
+      const r = await call(python, helperPath, 'terminate', { run_id: runId, supervisor, run_dir: runDir });
       if (r.ok === false) return { supported: true, verified: false, error: r.error };
       return r.value;
+    },
+    async terminateLegacy(jobId, jobName, identity) {
+      const r = await call(python, helperPath, 'terminate-legacy', { job_id: jobId, job_name: jobName, identity });
+      return r.ok === false ? { supported: true, verified: false, error: r.error } : r.value;
     },
     async fence(runId, runDir, by) {
       const r = await call(python, helperPath, 'fence', { run_id: runId, run_dir: runDir, by });

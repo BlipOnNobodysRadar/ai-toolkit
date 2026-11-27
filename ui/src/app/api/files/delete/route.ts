@@ -1,5 +1,8 @@
 /* eslint-disable */
 import { NextRequest, NextResponse } from 'next/server';
+import { historicalArtifactFolder } from '../../../../../cron/ownership/jobArtifacts';
+import prisma from '@/server/prisma';
+import path from 'path';
 import fs from 'fs';
 import { getDatasetsRoot, getTrainingFolder } from '@/server/settings';
 import { resolveAllowedMutationPath } from '@/server/safePath';
@@ -16,7 +19,7 @@ export async function POST(request: NextRequest) {
     // Decode the path
     let decodedFilePath: string;
     try {
-      decodedFilePath = decodeURIComponent(filePath);
+      decodedFilePath = path.isAbsolute(filePath) ? filePath : decodeURIComponent(filePath);
     } catch {
       return new NextResponse('Invalid file path', { status: 400 });
     }
@@ -29,7 +32,13 @@ export async function POST(request: NextRequest) {
     // The unlink immediately below is the residual check-then-act boundary documented in server/safePath.ts.
     let target;
     try {
-      target = await resolveAllowedMutationPath([datasetRoot, trainingRoot], decodedFilePath);
+      const roots = [datasetRoot, trainingRoot];
+      const resolved = path.resolve(decodedFilePath);
+      if (!roots.some(root => resolved.startsWith(root + path.sep))) {
+        const historical = await historicalArtifactFolder(prisma, trainingRoot, resolved);
+        if (historical) roots.push(historical);
+      }
+      target = await resolveAllowedMutationPath(roots, decodedFilePath);
     } catch {
       console.warn(`Access denied: ${decodedFilePath} not in ${[datasetRoot, trainingRoot].join(', ')}`);
       return new NextResponse('Access denied', { status: 403 });

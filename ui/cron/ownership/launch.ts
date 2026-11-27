@@ -66,6 +66,7 @@ export type Receipt = {
   boundary?: string;
   members?: string[];
   evidence?: string;
+  exit_code?: number;
   boot_id?: string | null;
   error?: string;
 };
@@ -93,7 +94,7 @@ export const readReceipt = (receiptPath: string, runId: string): Receipt | null 
 export const readExitReceipt = (exitPath: string, runId: string, supervisor: string | null): Receipt | null => {
   const r = readJson(exitPath);
   if (r?.run_id !== runId || r.state !== 'exited' || !supervisor || r.supervisor !== supervisor) return null;
-  return r;
+  return { ...r, exit_code: Number.isSafeInteger(r.exit_code) ? r.exit_code : undefined };
 };
 
 export const readMembers = (membersPath: string, runId: string): string[] => {
@@ -153,8 +154,8 @@ const rotateLog = (folder: string, logPath: string) => {
 
 class PreSpawnError extends Error {}
 
-// Windows: job object (tested). Linux: child-subreaper supervisor (source only on the test host).
-export const SUPPORTED_PLATFORMS = ['win32', 'linux'];
+// The helper implements a Windows job object, Linux subreaper, and macOS process group.
+export const SUPPORTED_PLATFORMS = ['win32', 'linux', 'darwin'];
 
 export const launchRun = async (ctx: LaunchContext, job: Job): Promise<LaunchResult> => {
   const runId = job.run_id!;
@@ -169,16 +170,20 @@ export const launchRun = async (ctx: LaunchContext, job: Job): Promise<LaunchRes
     // Bind the saved config to the claimed folder BEFORE any run-folder/config write. In particular this rebinds a
     // stale Training Folder setting and process/config names, and refuses ambiguous multi-process layouts.
     const jobConfig = bindLaunchConfig(job.job_config, job.name, folder);
-    jobConfig.config.process[0].sqlite_db_path = ctx.sqliteDbPath;
+    for (const proc of jobConfig.config.process) proc.sqlite_db_path = ctx.sqliteDbPath;
     // CLI trainers have no UI claim. Respect their lease during launch preparation too, before rotating their log
     // or replacing a config. Release before spawning: the Python constructor acquires its lifetime lease itself.
     // If another trainer wins that handoff, Python refuses before training/config writes.
-    await withOpLock(writerLeasePath(folder), async () => {
+    const prepared = await withOpLock(writerLeasePath(folder), async () => {
+      // A delayed launch may acquire this lock after Delete or a later run. Check before touching either one's files.
+      if (!(await db.job.findFirst({ where: { id: job.id, run_id: runId, launch_phase: 'claimed' }, select: { id: true } }))) return false;
       fs.mkdirSync(folder, { recursive: true });
       rotateLog(folder, files.log);
       writeAtomic(files.config, JSON.stringify(jobConfig, null, 2));
       logFd = fs.openSync(files.log, 'a');
+      return true;
     });
+    if (!prepared) return { result: 'cancelled' };
     if (!fs.existsSync(ctx.runPy)) throw new PreSpawnError('run.py not found');
     const platform = ctx.platform ?? process.platform;
     if (!SUPPORTED_PLATFORMS.includes(platform)) {

@@ -13,6 +13,7 @@ function fixture(open) {
   const log = path.join(root, 'job', 'log.txt');
   const wrapped = { ...fs, promises: { ...fs.promises, open: (...args) => open(log, ...args) } };
   const mocks = {
+    '../../../../../../cron/ownership/jobArtifacts': require(require('./harness/tsrequire.cjs').uiPath('cron/ownership/jobArtifacts.ts')),
     'next/server': { NextResponse: { json: body => ({ body }) } },
     '@/server/prisma': { default: { job: { findUnique: async () => ({ id: 'job', name: 'job', run_id: 'run' }) } } },
     '@/server/settings': { getTrainingFolder: async () => root },

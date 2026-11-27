@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react';
 import useJobsList from '@/hooks/useJobsList';
 import Link from 'next/link';
 import UniversalTable, { TableColumn } from '@/components/UniversalTable';
-import { GpuInfo } from '@/types';
+import { isMac } from '@/helpers/basic';
 import JobActionBar from './JobActionBar';
 import { Job, Queue } from '@prisma/client';
 import useQueueList from '@/hooks/useQueueList';
@@ -22,8 +22,8 @@ interface JobsTableProps {
 
 export default function JobsTable({ onlyActive = false, job_type = null }: JobsTableProps) {
   const { jobs, status, refreshJobs } = useJobsList({ onlyActive, reloadInterval: 5000, job_type });
-  const { queues, status: queueStatus, refreshQueues } = useQueueList();
-  const { gpuList, isGPUInfoLoaded } = useGPUInfo();
+  const { queues, refreshQueues } = useQueueList(5000);
+  const { gpuList } = useGPUInfo();
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [deleteProgress, setDeleteProgress] = useState<{ done: number; total: number } | null>(null);
 
@@ -78,10 +78,12 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
       onConfirm: async () => {
         setDeleteProgress({ done: 0, total: deletable.length });
         const refused: string[] = [];
+        const keptFiles: string[] = [];
         for (let i = 0; i < deletable.length; i++) {
           const job = deletable[i];
           try {
-            await deleteJob(job.id, job);
+            const result = await deleteJob(job.id, job);
+            if (result.keptOutput) keptFiles.push(`${job.name}: ${result.keptOutput}`);
             setSelectedIds(prev => {
               const next = new Set(prev);
               next.delete(job.id);
@@ -94,7 +96,8 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
           setDeleteProgress({ done: i + 1, total: deletable.length });
           refreshJobs();
         }
-        if (refused.length) alert(`Not deleted:\n${refused.join('\n')}`);
+        const notes = [...(refused.length ? [`Not deleted:\n${refused.join('\n')}`] : []), ...keptFiles];
+        if (notes.length) alert(notes.join('\n'));
         setDeleteProgress(null);
         refresh();
       },
@@ -140,12 +143,11 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
           );
         }
         if (row.job_type === 'caption') {
-          let splits = row.job_ref.split(/[/\\]/);
-          const datasetPath = `${splits[splits.length - 1]}`;
-          href = `/datasets/${datasetPath}`;
+          const datasetPath = row.job_ref?.split(/[/\\]/).filter(Boolean).pop();
+          if (datasetPath) href = `/datasets/${encodeURIComponent(datasetPath)}`;
           title = (
             <>
-              <small className="opacity-50">CAPTION: </small> {datasetPath}
+              <small className="opacity-50">CAPTION: </small> {datasetPath || row.name}
             </>
           );
         }
@@ -176,7 +178,7 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
             <div className="bg-gray-700 rounded-full h-1.5">
               <div
                 className="bg-blue-500 h-1.5 rounded-full"
-                style={{ width: `${(row.step / totalSteps) * 100}%` }}
+                style={{ width: `${Math.min(100, (row.step / totalSteps) * 100)}%` }}
               ></div>
             </div>
           </div>
@@ -221,45 +223,44 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
     },
   ];
 
-  const jobsDict = useMemo(() => {
-    if (!isGPUInfoLoaded) return {};
-    if (jobs.length === 0) return {};
-    let jd: { [key: string]: { name: string; jobs: Job[] } } = {};
+  // The worker addresses a queue by its complete gpu_ids string (including e.g. "1,0", "-1" and "mps").
+  // Hardware monitoring only supplies display names. It may be unavailable while the jobs API is healthy.
+  const { queueGroups, idleJobs } = useMemo(() => {
+    const groups = new Map<string, { name: string; jobs: Job[] }>();
+    const ensureQueue = (id: string) => {
+      if (!groups.has(id)) {
+        const name = id === '-1' ? 'CPU' : id === 'mps' ? 'Apple GPU' : `GPU ${id}`;
+        groups.set(id, { name, jobs: [] });
+      }
+      return groups.get(id)!;
+    };
     gpuList.forEach(gpu => {
-      jd[`${gpu.index}`] = { name: `${gpu.name}`, jobs: [] };
+      ensureQueue(isMac() ? 'mps' : String(gpu.index)).name = gpu.name;
     });
-    jd['Idle'] = { name: 'Idle', jobs: [] };
+    queues.forEach(queue => ensureQueue(queue.gpu_ids));
+    const idleJobs: Job[] = [];
     jobs.forEach(job => {
-      const gpu = gpuList.find(gpu => job.gpu_ids?.split(',').includes(gpu.index.toString())) as GpuInfo;
-      const key = `${gpu?.index || '0'}`;
-      if ((['queued', 'starting', 'running', 'stopping'].includes(job.status) || ownershipOf(job).held) && key in jd) {
-        jd[key].jobs.push(job);
+      if (['queued', 'starting', 'running', 'stopping'].includes(job.status) || ownershipOf(job).held) {
+        ensureQueue(job.gpu_ids).jobs.push(job);
       } else {
-        jd['Idle'].jobs.push(job);
+        idleJobs.push(job);
       }
     });
-    // sort the queued/running jobs by queue position
-    Object.keys(jd).forEach(key => {
-      if (key === 'Idle') {
-        jd[key].jobs.sort((a, b) => {
-          // sort by updated_at, newest first
-          return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
-        });
-      } else {
-        jd[key].jobs.sort((a, b) => {
-          if (a.queue_position === null) return 1;
-          if (b.queue_position === null) return -1;
-          return a.queue_position - b.queue_position;
-        });
-      }
-    });
-    return jd;
-  }, [jobs, queues, isGPUInfoLoaded]);
+    groups.forEach(group => group.jobs.sort((a, b) => a.queue_position - b.queue_position));
+    idleJobs.sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
+    const queueGroups = [...groups.entries()].sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }));
+    return { queueGroups, idleJobs };
+  }, [jobs, queues, gpuList]);
 
-  let isLoading = status === 'loading' || queueStatus === 'loading' || !isGPUInfoLoaded;
-
-  // if job dict is populated, we are always loaded
-  if (Object.keys(jobsDict).length > 0) isLoading = false;
+  const isLoading = jobs.length === 0 && (status === 'idle' || status === 'loading');
+  const changeQueue = async (id: string, running: boolean) => {
+    try {
+      await (running ? stopQueue(id) : startQueue(id));
+    } catch (error) {
+      alert(actionError(error));
+    }
+    refresh();
+  };
 
   return (
     <div>
@@ -294,78 +295,70 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
           )}
         </div>
       )}
-      {Object.keys(jobsDict)
-        .sort()
-        .filter(key => key !== 'Idle')
-        .map(gpuKey => {
-          const queue = queues.find(q => `${q.gpu_ids}` === gpuKey) as Queue;
-          return (
-            <div key={gpuKey} className="mb-6">
-              <div
-                className={classNames(
-                  'text-md flex flex-wrap gap-y-1 px-2 sm:px-4 py-1 rounded-t-lg',
-                  { 'bg-green-600 dark:bg-green-900': queue?.is_running },
-                  { 'bg-red-600 dark:bg-red-900': !queue?.is_running },
-                )}
-              >
-                <div className="flex items-center space-x-2 flex-1 min-w-0 py-2">
-                  <h2 className="font-semibold text-white truncate">{jobsDict[gpuKey].name}</h2>
-                  <span className="px-2 py-0.5 bg-gray-700 rounded-full text-xs text-gray-300 flex-shrink-0">
-                    # {queue?.gpu_ids}
-                  </span>
-                </div>
-                <div className="text-sm text-gray-300 italic flex items-center flex-shrink-0">
-                  {queue?.is_running ? (
-                    <>
-                      <span className="text-green-100 dark:text-green-400 mr-2">Queue Running</span>
-                      <button
-                        onClick={async () => {
-                          await stopQueue(queue.gpu_ids as string);
-                          refresh();
-                        }}
-                        className="ml-2 sm:ml-4 text-xs text-white bg-red-600 hover:bg-red-700 px-2 py-1 rounded"
-                      >
-                        STOP
-                      </button>
-                    </>
-                  ) : (
-                    <>
-                      <span className="text-red-100 dark:text-red-400 mr-2">Queue Stopped</span>
-                      <button
-                        onClick={async () => {
-                          await startQueue(gpuKey);
-                          refresh();
-                        }}
-                        className="ml-2 sm:ml-4 text-xs text-white bg-green-600 hover:bg-green-700 px-2 py-1 rounded"
-                      >
-                        START
-                      </button>
-                    </>
-                  )}
-                </div>
+      {status === 'error' && <p role="alert">Could not load jobs. <button onClick={refresh}>Retry</button></p>}
+      {queueGroups.map(([gpuKey, group]) => {
+        const queue = queues.find(q => `${q.gpu_ids}` === gpuKey) as Queue;
+        return (
+          <div key={gpuKey} className="mb-6">
+            <div
+              className={classNames(
+                'text-md flex flex-wrap gap-y-1 px-2 sm:px-4 py-1 rounded-t-lg',
+                { 'bg-green-600 dark:bg-green-900': queue?.is_running },
+                { 'bg-red-600 dark:bg-red-900': !queue?.is_running },
+              )}
+            >
+              <div className="flex items-center space-x-2 flex-1 min-w-0 py-2">
+                <h2 className="font-semibold text-white truncate">{group.name}</h2>
+                <span className="px-2 py-0.5 bg-gray-700 rounded-full text-xs text-gray-300 flex-shrink-0">
+                  # {gpuKey}
+                </span>
               </div>
-              <UniversalTable
-                columns={columns}
-                rows={jobsDict[gpuKey].jobs}
-                isLoading={isLoading}
-                onRefresh={refresh}
-                theadClassName={
-                  queue?.is_running
-                    ? 'bg-green-700 dark:bg-green-950 text-white dark:text-gray-400'
-                    : 'bg-red-700 dark:bg-red-950 text-white dark:text-gray-400'
-                }
-              />
+              <div className="text-sm text-gray-300 italic flex items-center flex-shrink-0">
+                {queue?.is_running ? (
+                  <>
+                    <span className="text-green-100 dark:text-green-400 mr-2">Queue Running</span>
+                    <button
+                      onClick={() => changeQueue(gpuKey, true)}
+                      className="ml-2 sm:ml-4 text-xs text-white bg-red-600 hover:bg-red-700 px-2 py-1 rounded"
+                    >
+                      STOP
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <span className="text-red-100 dark:text-red-400 mr-2">Queue Stopped</span>
+                    <button
+                      onClick={() => changeQueue(gpuKey, false)}
+                      className="ml-2 sm:ml-4 text-xs text-white bg-green-600 hover:bg-green-700 px-2 py-1 rounded"
+                    >
+                      START
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
-          );
-        })}
-      {!onlyActive && Object.keys(jobsDict).includes('Idle') && (
+            <UniversalTable
+              columns={columns}
+              rows={group.jobs}
+              isLoading={isLoading}
+              onRefresh={refresh}
+              theadClassName={
+                queue?.is_running
+                  ? 'bg-green-700 dark:bg-green-950 text-white dark:text-gray-400'
+                  : 'bg-red-700 dark:bg-red-950 text-white dark:text-gray-400'
+              }
+            />
+          </div>
+        );
+      })}
+      {!onlyActive && (
         <div className="mb-6 opacity-50">
           <div className="text-md flex px-4 py-1 rounded-t-lg bg-slate-600">
             <div className="flex items-center space-x-2 flex-1 py-2">
               <h2 className="font-semibold text-gray-100">Idle</h2>
             </div>
           </div>
-          <UniversalTable columns={columns} rows={jobsDict['Idle'].jobs} isLoading={isLoading} onRefresh={refresh} />
+          <UniversalTable columns={columns} rows={idleJobs} isLoading={isLoading} onRefresh={refresh} />
         </div>
       )}
     </div>

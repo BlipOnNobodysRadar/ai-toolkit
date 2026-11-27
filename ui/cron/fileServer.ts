@@ -34,6 +34,7 @@ import { randomBytes } from 'crypto';
 import { loadEnvConfig, resetEnv } from '@next/env';
 import prisma from './prisma';
 import { defaultDatasetsFolder, defaultTrainFolder, defaultDataRoot, TOOLKIT_ROOT } from './paths';
+import { historicalArtifactFolder, regularJobPath } from './ownership/jobArtifacts';
 import { isReadAuthorized } from './readKey';
 
 const isDev = process.argv.includes('dev');
@@ -319,7 +320,8 @@ async function serveFile(req: http.IncomingMessage, res: http.ServerResponse, pr
       // any moment. Re-fetch before denying so a just-updated path never 403s.
       ({ dirs: allowedDirs, allowed: isAllowed } = checkAllowed(await getRoots(true)));
     }
-    if (!isAllowed) {
+    const historicalFolder = isAllowed ? null : await historicalArtifactFolder(prisma, (await getRoots()).training, resolvedFilePath);
+    if (!isAllowed && !historicalFolder) {
       console.warn(`Access denied: ${resolvedFilePath} not in ${allowedDirs.join(', ')}`);
       res.writeHead(403);
       res.end('Access denied');
@@ -333,9 +335,11 @@ async function serveFile(req: http.IncomingMessage, res: http.ServerResponse, pr
     // ffmpeg, corrupt file). Album art is always the thumb.
     if (isArt || (isImg && new URL(req.url || '', 'http://localhost').searchParams.has('thumb'))) {
       const thumbBase = path.join(path.dirname(resolvedFilePath), '.thumbs', path.basename(resolvedFilePath));
+      const thumbTargets = [`${thumbBase}.png`, `${thumbBase}.jpg`];
+      const thumbsAllowed = !historicalFolder || (await Promise.all(thumbTargets.map(file => regularJobPath(historicalFolder, file)))).every(Boolean);
       let thumbPath: string | null = null;
       let thumbStat: fs.Stats | null = null;
-      for (const candidate of [`${thumbBase}.png`, `${thumbBase}.jpg`]) {
+      for (const candidate of thumbsAllowed ? thumbTargets : []) {
         const stat = await fs.promises.stat(candidate).catch(() => null);
         if (stat && stat.isFile()) {
           thumbPath = candidate;
@@ -343,7 +347,7 @@ async function serveFile(req: http.IncomingMessage, res: http.ServerResponse, pr
           break;
         }
       }
-      if (!thumbStat) {
+      if (thumbsAllowed && !thumbStat) {
         const srcStat = await fs.promises.stat(resolvedFilePath).catch(() => null);
         if (srcStat && srcStat.isFile()) {
           const written = await ensureThumb(resolvedFilePath, thumbBase, srcStat.mtimeMs);

@@ -2,13 +2,11 @@ from collections import OrderedDict
 import os
 import sqlite3
 from toolkit.ui_run_fence import RunFence
+from toolkit.ui_job_status import watch_training_stop
 import asyncio
 import concurrent.futures
 from extensions_built_in.sd_trainer.SDTrainer import SDTrainer
 from typing import Literal, Optional
-import threading
-import time
-import signal
 
 AITK_Status = Literal["running", "stopped", "error", "completed"]
 
@@ -35,50 +33,12 @@ class UITrainer(SDTrainer):
         # Track all async tasks
         self._async_tasks = []
         # Initialize the status
-        self._run_async_operation(self._update_status("running", "Starting"))
-        self._stop_watcher_started = False
-        if os.name == "nt":
-            # On Windows the stop route cannot send us SIGINT from outside
-            # (no console to deliver a Ctrl+C to), so watch the stop flag
-            # and raise the interrupt from inside. On Linux the route
-            # sends a real SIGINT to the pid and this is unnecessary.
-            self.start_stop_watcher(interval_sec=2.0)
-    
-    def start_stop_watcher(self, interval_sec: float = 5.0):
-        """
-        Start a daemon thread that periodically checks should_stop()
-        and terminates the process immediately when triggered.
-        """
-        if getattr(self, "_stop_watcher_started", False):
-            return
-        self._stop_watcher_started = True
-        t = threading.Thread(
-            target=self._stop_watcher_thread, args=(interval_sec,), daemon=True
-        )
-        t.start()
+        if process_id == 0:
+            self._run_async_operation(self._update_status("running", "Starting"))
 
-    def _stop_watcher_thread(self, interval_sec: float):
-        while True:
-            try:
-                if self.should_stop():
-                    if self.is_stopping:
-                        # maybe_stop() already started the graceful shutdown;
-                        # a second interrupt would only break its cleanup.
-                        return
-                    print("")
-                    print("****************************************************")
-                    print("    Stop signal received; terminating process.      ")
-                    print("****************************************************")
-                    # Deliver a real KeyboardInterrupt to the main thread so
-                    # on_error runs the normal shutdown (final DB write, last
-                    # log). os.kill(pid, SIGINT) must not be used here: on
-                    # Windows it is TerminateProcess and kills us instantly.
-                    # Leave the thread pool alone -- on_error still needs it.
-                    signal.raise_signal(signal.SIGINT)
-                    return
-                time.sleep(interval_sec)
-            except Exception:
-                time.sleep(interval_sec)
+    def run(self):
+        with watch_training_stop(self):
+            return super().run()
 
     def _run_async_operation(self, coro):
         """Helper method to run an async coroutine and track the task."""
@@ -182,6 +142,7 @@ class UITrainer(SDTrainer):
             self._run_async_operation(self._update_key(key, value))
 
     async def _update_status(self, status: AITK_Status, info: Optional[str] = None):
+        status, info = self.ui_process_status(status, info)
         if not self.accelerator.is_main_process:
             return
 
@@ -234,7 +195,11 @@ class UITrainer(SDTrainer):
                 self.update_status("stopped", "Job stopped")
         elif self.accelerator.is_main_process and not self.is_stopping:
             self.update_status("error", str(e))
-        self.update_db_key("step", self.last_save_step)
+        # A stop during setup has no new progress. During training, an update can finish
+        # before validation, saving or the end-of-step hook is interrupted.
+        completed = getattr(self, "_checkpoint_completed_step", None)
+        if completed is not None:
+            self.update_db_key("step", completed)
         asyncio.run(self.wait_for_all_async())
         self.thread_pool.shutdown(wait=True)
 
@@ -276,6 +241,7 @@ class UITrainer(SDTrainer):
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
         self.maybe_stop()
+        self.update_db_key("total_steps", self.train_config.steps)
         self.update_step()
         self.update_status("running", "Training")
         self.timer.add_after_print_hook(self.handle_timing_print_hook)

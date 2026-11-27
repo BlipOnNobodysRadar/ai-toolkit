@@ -34,23 +34,12 @@ export const stopJob = (jobID: string) => {
   });
 };
 
-const snapshot = ({ status, pid, run_id, launch_phase }: Job) => ({ status, pid, run_id, launch_phase });
+const snapshot = ({ status, pid, run_id, launch_phase, name, run_dir }: Job) => ({ status, pid, run_id, launch_phase, name, run_dir });
 
-export const deleteJob = (jobID: string, job?: Job) => {
-  if (job && ownershipOf(job).held) return apiClient.post(`/api/jobs/${jobID}/delete`, snapshot(job)).then(() => {});
-  return new Promise<void>((resolve, reject) => {
-    apiClient
-      .get(`/api/jobs/${jobID}/delete`)
-      .then(res => res.data)
-      .then(data => {
-        console.log('Job deleted:', data);
-        resolve();
-      })
-      .catch(error => {
-        console.error('Error deleting job:', error);
-        reject(error);
-      });
-  });
+export const deleteJob = async (jobID: string, job?: Job): Promise<{ keptOutput?: string }> => {
+  const url = `/api/jobs/${jobID}/delete`;
+  const response = job ? await apiClient.post(url, snapshot(job)) : await apiClient.get(url);
+  return response.data;
 };
 
 export const saveJobNow = (jobID: string) => {
@@ -104,8 +93,12 @@ export const markJobAsStopped = (jobID: string) => {
 export const confirmJobStopped = (job: Job) =>
   ownershipOf(job).held ? apiClient.post(`/api/jobs/${job.id}/mark_stopped`, snapshot(job)) : markJobAsStopped(job.id);
 
-export const getJobConfig = (job: Job) => {
-  return JSON.parse(job.job_config) as JobConfig;
+export const getJobConfig = (job: Job): JobConfig | null => {
+  try {
+    return JSON.parse(job.job_config) as JobConfig | null;
+  } catch {
+    return null;
+  }
 };
 
 // Run ownership as the row shows it (docs/STATE_MACHINES.md M10). The server enforces ownership from its claims;
@@ -140,11 +133,11 @@ export const getAvaliableJobActions = (job: Job) => {
   const canStop = ['starting', 'running'].includes(job.status) && !isStopping;
   let canStart = !held && ['stopped', 'error'].includes(job.status);
   // can resume if more steps were added
-  if (!held && job.status === 'completed' && (jobConfig.config.process[0].train?.steps || 0) > job.step) {
+  const processes = jobConfig?.config?.process;
+  if (!held && job.status === 'completed' && Array.isArray(processes) && processes.some(proc => (proc?.train?.steps || 0) > job.step)) {
     canStart = true;
   }
-  // force stop needs an identified process boundary; pre-update runs cannot be force stopped from the UI
-  const canForceStop = held && !legacy && job.launch_phase === 'attached';
+  const canForceStop = held && (legacy || job.launch_phase === 'attached');
   // Owners can recover a stale reservation even when the worker could not identify the process.
   const canMarkStopped = !['deleting', 'delete_failed'].includes(job.status) && (held || job.status !== 'stopped');
   return { canDelete, isRetryDelete, canEdit, canStop, canStart, canRemoveFromQueue, canForceStop, canMarkStopped, isStopping };
@@ -156,14 +149,15 @@ export const actionError = (e: any): string => e?.response?.data?.error || e?.me
 export const forceStopJob = (jobID: string) => apiClient.get(`/api/jobs/${jobID}/kill`).then(res => res.data);
 
 export const getNumberOfSamples = (job: Job) => {
-  const jobConfig = getJobConfig(job);
-  return jobConfig.config.process[0].sample?.prompts?.length || 0;
+  const sample = getJobConfig(job)?.config?.process?.[0]?.sample;
+  return Math.max(sample?.prompts?.length || 0, sample?.samples?.length || 0);
 };
 
 export const getTotalSteps = (job: Job) => {
-  if (job.total_steps != null) {
-    return job.total_steps;
-  }
-  const jobConfig = getJobConfig(job);
-  return jobConfig.config.process[0].train?.steps || 0;
+  const processes = getJobConfig(job)?.config?.process;
+  const configured = Number(processes?.[0]?.train?.steps);
+  const firstTarget = Number.isSafeInteger(configured) && configured > 0 ? configured : 0;
+  // Show edits to a single trainer's target immediately, even before the next launch.
+  if (job.job_type === 'train' && processes?.length === 1 && firstTarget > 0) return firstTarget;
+  return job.total_steps ?? firstTarget;
 };

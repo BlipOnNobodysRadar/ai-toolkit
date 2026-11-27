@@ -70,7 +70,7 @@ const readLogTail = (logPath: string): string | null => {
   }
 };
 
-type Plan = { job: Job; kind: string };
+type Plan = { job: Job; kind: string; exitCode?: number; evidence?: string };
 
 export const reconcile = async (ctx: ReconcileContext): Promise<ReconcileReport> => {
   const { db, procctl } = ctx;
@@ -97,16 +97,17 @@ export const reconcile = async (ctx: ReconcileContext): Promise<ReconcileReport>
       report[runId] = 'launch in flight';
       continue;
     }
+    const files = job.run_dir ? runFiles(job.run_dir, runId) : null;
+    const receipt = job.launch_phase === 'attached' && files ? readExitReceipt(files.exit, runId, job.supervisor_identity) : null;
+    if (receipt) {
+      plan.push({ job, kind: 'exit-receipt', exitCode: receipt.exit_code, evidence: receipt.evidence });
+      continue;
+    }
     if (bootChanged(job.boot_id) && job.launch_phase && ['claimed', 'spawn_requested', 'attached'].includes(job.launch_phase)) {
       plan.push({ job, kind: 'rebooted' });
       continue;
     }
-    const files = job.run_dir ? runFiles(job.run_dir, runId) : null;
     if (job.launch_phase === 'attached' && job.pid_identity) {
-      if (files && readExitReceipt(files.exit, runId, job.supervisor_identity)) {
-        plan.push({ job, kind: 'exit-receipt' });
-        continue;
-      }
       const cheap =
         ['starting', 'running'].includes(job.status) && !job.stop && ctx.tick % (ctx.identityEveryTicks ?? 15) !== 0 && job.pid != null && pidExists(job.pid);
       if (cheap) {
@@ -154,11 +155,11 @@ export const reconcile = async (ctx: ReconcileContext): Promise<ReconcileReport>
 
   const release = async (job: Job, phase: 'claimed' | 'spawn_requested' | 'attached', outcome: ReleaseOutcome, label: string) => {
     const r = await releaseRun(db, job.id, job.run_id!, phase === 'attached' ? { phase, identity: job.pid_identity } : { phase }, outcome);
-    if (r.released && r.unexpected) appendUnexpected(job);
+    if (r.released && r.unexpected && outcome.kind === 'exited') appendUnexpected(job, outcome.unexpectedInfo);
     report[job.run_id!] = r.released ? `released: ${label}${r.status ? ` -> ${r.status}` : ''}` : `kept: ${r.reason}`;
   };
 
-  for (const { job, kind } of plan) {
+  for (const { job, kind, exitCode, evidence } of plan) {
     const runId = job.run_id ?? `legacy:${job.id}`;
     try {
       if (kind === 'rebooted') {
@@ -176,9 +177,8 @@ export const reconcile = async (ctx: ReconcileContext): Promise<ReconcileReport>
         continue;
       }
       if (kind === 'exit-receipt') {
-        const files = runFiles(job.run_dir!, job.run_id!);
-        const evidence = readExitReceipt(files.exit, job.run_id!, job.supervisor_identity)!.evidence ?? 'supervisor exit receipt';
-        await release(job, 'attached', { kind: 'exited', evidence, unexpectedInfo: unexpected(job) }, 'exit receipt');
+        await release(job, 'attached', { kind: 'exited', evidence: evidence ?? 'supervisor exit receipt',
+          exitCode, unexpectedInfo: unexpected(job, exitCode) }, 'exit receipt');
         continue;
       }
       if (kind === 'receipt-spawned') {
@@ -276,21 +276,24 @@ export const reconcile = async (ctx: ReconcileContext): Promise<ReconcileReport>
           await release(job, 'attached', { kind: 'exited', evidence: 'job object open with no active process, supervisor gone', unexpectedInfo: unexpected(job) }, 'empty job object');
           continue;
         }
+        const supervisedPosix = ['linux-subreaper', 'darwin-process-group'].includes(job.run_boundary ?? '') && st?.supervisor === 'alive';
         let note: string | null;
         if (st?.supervisor === 'exited') note = SUPERVISOR_LOST_NOTE;
+        else if (supervisedPosix) note = null;
         else if (!st || st.boundary !== 'open' || st.supervisor !== 'alive') note = `Cannot verify the run's processes (${st?.error ?? `supervisor ${st?.supervisor ?? 'unknown'}, boundary ${st?.boundary ?? 'unknown'}`}); ownership kept.`;
         else note = st.members[job.pid_identity!] === 'alive' ? null : `Waiting for ${st.active} remaining process(es) of this run to exit.`;
         // the former Windows stop backstop: a stop request this old gets a force stop through the run boundary
         const requested = job.stop_requested_at?.getTime();
-        if (requested != null && now() - requested > (ctx.graceMs ?? 60_000) && st?.boundary === 'open' && (st.active ?? 0) > 0) {
+        const canTerminate = supervisedPosix || (st?.boundary === 'open' && (st.active ?? 0) > 0);
+        if (requested != null && now() - requested > (ctx.graceMs ?? 60_000) && canTerminate) {
           const attempts = ctx.backstopAttempts ?? new Map<string, number>();
           if (now() - (attempts.get(job.run_id!) ?? 0) > BACKSTOP_RETRY_MS) {
             attempts.set(job.run_id!, now());
             log(`Job ${job.id} still running ${(ctx.graceMs ?? 60_000) / 1000}s after the stop request; force stopping it`);
-            const t = await procctl.terminate(job.run_id!, job.supervisor_identity);
+            const t = await procctl.terminate(job.run_id!, job.supervisor_identity, job.run_dir);
             note = t.supported
-              ? t.verified
-                ? 'Force stopped after the stop request timed out; confirming exit.'
+              ? t.verified || t.requested
+                ? 'Force stop requested after the graceful stop timed out; confirming exit.'
                 : `Force stop after the stop request timed out did not finish (${t.error ?? `${t.remaining} remaining`}).`
               : `Stop pending: ${t.error}`;
           }
@@ -305,13 +308,14 @@ export const reconcile = async (ctx: ReconcileContext): Promise<ReconcileReport>
   }
   return report;
 
-  function unexpected(job: Job) {
+  function unexpected(job: Job, exitCode?: number) {
     const tail = job.run_dir ? readLogTail(runFiles(job.run_dir, job.run_id!).log) : null;
-    return tail ? `Job process exited unexpectedly. Last log line: ${tail}` : 'Job process exited unexpectedly.';
+    const reason = exitCode === undefined ? 'Job process exited unexpectedly.' : `Job process exited with code ${exitCode}.`;
+    return tail ? `${reason} Last log line: ${tail}` : reason;
   }
-  function appendUnexpected(job: Job) {
+  function appendUnexpected(job: Job, message?: string) {
     try {
-      if (job.run_dir) fs.appendFileSync(runFiles(job.run_dir, job.run_id!).log, `\n${unexpected(job)}\n`);
+      if (job.run_dir) fs.appendFileSync(runFiles(job.run_dir, job.run_id!).log, `\n${message ?? unexpected(job)}\n`);
     } catch {
       // the log is a convenience
     }

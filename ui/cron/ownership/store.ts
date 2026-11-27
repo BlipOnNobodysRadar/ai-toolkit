@@ -19,6 +19,7 @@ import {
   canonicalFolder,
   claimKeys,
   jobFolderError,
+  jobOutputFolder,
   overlap,
   parseGpuIds,
   resourceSet,
@@ -265,9 +266,10 @@ export const requestQueueReturn = async (db: Db, job: Job) => {
   );
 };
 
-export type RunSnapshot = Pick<Job, 'run_id' | 'launch_phase' | 'pid' | 'status'>;
+export type RunSnapshot = Pick<Job, 'run_id' | 'launch_phase' | 'pid' | 'status'> & Partial<Pick<Job, 'name' | 'run_dir'>>;
 export const sameRun = (job: Job, seen: RunSnapshot) =>
-  job.run_id === seen.run_id && job.launch_phase === seen.launch_phase && job.pid === seen.pid && job.status === seen.status;
+  job.run_id === seen.run_id && job.launch_phase === seen.launch_phase && job.pid === seen.pid && job.status === seen.status &&
+  (seen.name === undefined || job.name === seen.name) && (seen.run_dir === undefined || job.run_dir === seen.run_dir);
 
 // The ordinary action only changes the status. A confirmed recovery has already checked the observed
 // processes; recheck the run in the transaction so an old tab cannot release a subsequent launch.
@@ -284,13 +286,28 @@ export const markStopped = (db: Db, jobId: string, seen?: RunSnapshot): Promise<
       where: { id: jobId, run_id: job.run_id, status: job.status },
       data: {
         stop: true, status: 'stopped', info: 'Job stopped', pid: null,
-        ...(seen ? { run_id: null, launch_phase: null, pid_identity: null, supervisor_identity: null,
+        ...(seen ? { run_id: null, launch_phase: null, pid_identity: null, supervisor_identity: null, exit_verified_at: new Date(),
           run_members: null, after_exit: null, stop_requested_at: null, return_to_queue: false, ownership_note: null } : {}),
       },
     });
     if (updated.count !== 1) throw new LostRace();
     return { status: 200, body: job };
   });
+
+// Check saved output directories as well as names: a renamed job can still
+// resume in the folder from its last launch.
+export const findOutputConflict = async (tx: Tx, trainingRoot: string, folder: string, exceptJobId?: string) => {
+  const others = await tx.job.findMany({
+    where: exceptJobId ? { id: { not: exceptJobId } } : {},
+    select: { name: true, run_dir: true },
+  });
+  return others.find(other => {
+    if (!jobFolderError(trainingRoot, other.name) && foldersOverlap(canonicalFolder(trainingRoot, other.name), folder)) return true;
+    if (!other.run_dir || !path.isAbsolute(other.run_dir)) return false;
+    if (jobFolderError(path.dirname(other.run_dir), path.basename(other.run_dir))) return false;
+    return foldersOverlap(canonicalFolder(path.dirname(other.run_dir), path.basename(other.run_dir)), folder);
+  });
+};
 
 // Create (no id) or edit. Names are compared by canonical folder, so 'Foo' and 'foo' collide where the file system
 // would put them in one directory, and a folder reserved by a deletion cannot be reused until it is gone.
@@ -315,8 +332,7 @@ export const saveJob = (db: Db, body: any, trainingRoot: string, forcedGpuIds?: 
       const own = await ownershipOf(tx, existing);
       if (own.held) return conflict(`Not saved: ${own.message}`, { ownership: own.kind });
     }
-    const others = await tx.job.findMany({ select: { id: true, name: true } });
-    const alias = others.find(o => o.id !== id && canonicalFolder(trainingRoot, o.name) === folder);
+    const alias = await findOutputConflict(tx, trainingRoot, folder, id);
     if (alias) {
       return conflict(alias.name === name ? 'Job name already exists' : `Job name conflicts with existing job "${alias.name}" (same folder)`);
     }
@@ -346,11 +362,26 @@ export const saveJob = (db: Db, body: any, trainingRoot: string, forcedGpuIds?: 
     return { status: 200, body: created };
   });
 
+const deletionTarget = (trainingRoot: string, job: Job): string | null => {
+  try {
+    return jobOutputFolder(trainingRoot, job, true);
+  } catch (error) {
+    if (error instanceof FolderIdentityError) return null;
+    throw error;
+  }
+};
+
+const removeRowKeepingOutput = async (tx: Tx, job: Job, reason: string): Promise<Outcome> => {
+  await tx.runClaim.deleteMany({ where: { job_id: job.id } });
+  await tx.job.delete({ where: { id: job.id } });
+  return { status: 200, body: { ...job, keptOutput: reason } };
+};
+
 // Delete, step 1: claim-free -> deleting, and reserve the canonical folder so nothing can be created in it or
 // admitted to it until removal finishes. The row (and its name) stay until the folder is gone.
 // resume=true is only for a caller holding the job's deletion lock (deleteJob): a row left 'deleting' by a deleter
 // that crashed, or whose final DB write failed, is then safely continued.
-export const beginDelete = (db: Db, jobId: string, trainingRoot: string, opts: { resume?: boolean; expectedFolder?: string; seen?: RunSnapshot } = {}): Promise<Outcome> =>
+export const beginDelete = (db: Db, jobId: string, trainingRoot: string, opts: { resume?: boolean; expectedFolder?: string | null; seen?: RunSnapshot } = {}): Promise<Outcome> =>
   routeTx(db, async tx => {
     const job = await tx.job.findUnique({ where: { id: jobId } });
     if (!job) return { status: 404, body: { error: 'Job not found' } };
@@ -359,9 +390,12 @@ export const beginDelete = (db: Db, jobId: string, trainingRoot: string, opts: {
     if (!opts.seen && job.status !== 'deleting' && !DELETABLE.includes(job.status)) return conflict(`A ${job.status} job cannot be deleted; stop it first.`);
     const own = await ownershipOf(tx, job);
     if (own.held && !opts.seen) return conflict(`Not deleted: ${own.message}`, { ownership: own.kind });
-    const nameError = jobFolderError(trainingRoot, job.name);
-    if (nameError) return { status: 400, body: { error: `${nameError}; its folder is not removed from here.` } };
-    const folder = canonicalFolder(trainingRoot, job.name);
+    const target = deletionTarget(trainingRoot, job);
+    if (target === null) {
+      if (opts.expectedFolder != null) return conflict('The job folder changed. Refresh and retry Delete.');
+      return removeRowKeepingOutput(tx, job, 'Files kept because the old job has no valid output folder.');
+    }
+    const folder = canonicalFolder(path.dirname(target), path.basename(target));
     if (opts.expectedFolder !== undefined && folder !== opts.expectedFolder) {
       return conflict('The job folder changed before deletion was reserved; retry Delete.');
     }
@@ -370,13 +404,23 @@ export const beginDelete = (db: Db, jobId: string, trainingRoot: string, opts: {
     // any other owner of this folder, of a folder inside it, or of one containing it (recursive removal would hit it)
     const other = (await occupants(tx, trainingRoot)).find(o => o.job_id !== jobId && foldersOverlap(o.set.folder, folder));
     if (other) return conflict(`Another job ("${other.job_name}") is using this folder or a folder inside it.`);
+    const reservation = await tx.runClaim.findFirst({ where: { job_id: jobId, kind: 'delete' } });
+    const shared = await findOutputConflict(tx, trainingRoot, folder, jobId);
+    if (shared || (reservation && reservation.resource !== resource)) {
+      // Older rows can share one output directory. Remove only the selected
+      // row when the folder is shared or no longer matches a failed deletion.
+      return removeRowKeepingOutput(tx, job, shared
+        ? `Files kept because "${shared.name}" uses the output folder.`
+        : 'Files kept because the output folder changed since the original deletion.');
+    }
     if (opts.seen) await tx.runClaim.deleteMany({ where: { job_id: jobId, kind: 'run' } });
     if (!holder || (opts.seen && holder.kind === 'run' && holder.job_id === jobId)) {
       await tx.runClaim.create({ data: { resource, job_id: jobId, run_id: deleteRunId(jobId), kind: 'delete' } });
     }
     const r = await tx.job.updateMany({
       where: { id: jobId, status: job.status, run_id: job.run_id },
-      data: { status: 'deleting', info: 'Deleting job...', ...(opts.seen ? { run_id: null, pid: null, launch_phase: null, ownership_note: null } : {}) },
+      data: { status: 'deleting', info: 'Deleting job...', run_dir: target, exit_verified_at: job.exit_verified_at ?? new Date(),
+        ...(opts.seen ? { run_id: null, pid: null, launch_phase: null, ownership_note: null } : {}) },
     });
     if (r.count !== 1) throw new LostRace();
     return { status: 200, body: job };
@@ -393,22 +437,22 @@ export const deleteJob = async (
   trainingRoot: string,
   deps: { rm?: (dir: string) => Promise<void>; afterBegin?: () => Promise<void>; waitMs?: number; seen?: RunSnapshot } = {},
 ): Promise<Outcome> => {
-  const lockFile = path.join(trainingRoot, LOCK_DIR, `delete.${jobId.replace(/[^\w-]/g, '_')}.lock`);
   try {
+    const candidate = await db.job.findUnique({ where: { id: jobId } });
+    if (!candidate) return { status: 404, body: { error: 'Job not found' } };
+    const folder = deletionTarget(trainingRoot, candidate);
+    const lockRoot = folder ? path.dirname(folder) : trainingRoot;
+    const lockFile = path.join(lockRoot, LOCK_DIR, `delete.${jobId.replace(/[^\w-]/g, '_')}.lock`);
     return await withOpLock(
       lockFile,
       async () => {
-        const candidate = await db.job.findUnique({ where: { id: jobId } });
-        if (!candidate) return { status: 404, body: { error: 'Job not found' } };
-        const invalid = jobFolderError(trainingRoot, candidate.name);
-        if (invalid) return { status: 400, body: { error: invalid } };
-        const expectedFolder = canonicalFolder(trainingRoot, candidate.name);
+        if (folder === null) return beginDelete(db, jobId, trainingRoot, { resume: true, expectedFolder: null, seen: deps.seen });
+        const expectedFolder = canonicalFolder(path.dirname(folder), path.basename(folder));
         try {
           return await withOpLock(writerLeasePath(expectedFolder), async () => {
             const begun = await beginDelete(db, jobId, trainingRoot, { resume: true, expectedFolder, seen: deps.seen });
-            if (begun.status !== 200) return begun;
+            if (begun.status !== 200 || begun.body.keptOutput) return begun;
             if (deps.afterBegin) await deps.afterBegin();
-            const folder = path.join(trainingRoot, begun.body.name);
             let error: string | null = null;
             try {
               // force:true makes this a no-op if the folder is already gone (a resumed deletion)
@@ -475,8 +519,8 @@ export const admit = async (db: Db, jobId: string, trainingRoot: string, launche
             await tx.job.updateMany({ where: { id: jobId, status: 'queued' }, data: { status: 'error', info: message } });
             return { admitted: null, reason: message };
           }
-          const folderAbs = path.resolve(trainingRoot, job.name);
-          const set = resourceSet(gpu, canonicalFolder(trainingRoot, job.name));
+          const folderAbs = jobOutputFolder(trainingRoot, job, true);
+          const set = resourceSet(gpu, canonicalFolder(path.dirname(folderAbs), path.basename(folderAbs)));
           const occ = await occupants(tx, trainingRoot);
           if (hooks?.afterRead) await hooks.afterRead(tx);
           const c = firstConflict(occ, set);
@@ -561,7 +605,7 @@ export const markSpawnRequested = async (db: Db, jobId: string, runId: string) =
   (
     await withRetry(() =>
       db.job.updateMany({
-        where: { id: jobId, run_id: runId, launch_phase: 'claimed', stop: false },
+        where: { id: jobId, run_id: runId, launch_phase: 'claimed', stop: false, return_to_queue: false },
         data: { launch_phase: 'spawn_requested', spawn_requested_at: new Date() },
       }),
     )
@@ -618,12 +662,14 @@ export const noteOwnership = async (db: Db, job: Job, note: string | null) => {
   );
 };
 
-// The final status once the run's processes are verified gone. Python's own ending (completed/error) stands; a
-// requested stop/queue return applies otherwise; an active status with no ending means the process died.
-export const finalStatus = (job: Job): { status: string; unexpected: boolean } => {
-  if (job.status === 'completed' || job.status === 'error') return { status: job.status, unexpected: false };
+// A process may finish one extension before the next extension runs. The root exit code covers the whole job.
+export const finalStatus = (job: Job, exitCode?: number): { status: string; unexpected: boolean } => {
+  if (job.status === 'error') return { status: 'error', unexpected: false };
+  // Older supervisors supplied no exit code. Preserve their reported completion.
+  if (exitCode === undefined && job.status === 'completed') return { status: 'completed', unexpected: false };
   if (job.after_exit === 'stopped' || job.after_exit === 'queued') return { status: job.after_exit, unexpected: false };
   if (job.status === 'stopped' || job.status === 'queued') return { status: job.status, unexpected: false };
+  if (exitCode === 0) return { status: 'completed', unexpected: false };
   return { status: 'error', unexpected: true };
 };
 
@@ -631,7 +677,7 @@ export const finalStatus = (job: Job): { status: string; unexpected: boolean } =
 // evidence was gathered for one launch phase (and, when attached, one process identity); the transaction re-checks
 // both, so evidence about an earlier phase can never release a run that has moved on (e.g. 'claimed' evidence
 // arriving after the launcher committed spawn_requested and spawned).
-export type ReleaseOutcome = { kind: 'exited'; unexpectedInfo?: string; evidence?: string } | { kind: 'not_spawned'; info: string };
+export type ReleaseOutcome = { kind: 'exited'; exitCode?: number; unexpectedInfo?: string; evidence?: string } | { kind: 'not_spawned'; info: string };
 export const releaseRun = async (
   db: Db,
   jobId: string,
@@ -652,13 +698,19 @@ export const releaseRun = async (
       let info = job.info;
       let unexpected = false;
       if (outcome.kind === 'not_spawned') {
-        status = job.stop && job.after_exit ? job.after_exit : 'error';
+        status = job.after_exit === 'stopped' || job.after_exit === 'queued' ? job.after_exit : 'error';
         info = outcome.info;
       } else {
-        const f = finalStatus(job);
+        const f = finalStatus(job, outcome.exitCode);
         status = f.status;
         unexpected = f.unexpected;
-        if (unexpected) info = outcome.unexpectedInfo ?? 'Job process exited unexpectedly.';
+        if (unexpected) info = outcome.unexpectedInfo ?? (outcome.exitCode === undefined
+          ? 'Job process exited unexpectedly.' : `Job process exited with code ${outcome.exitCode}.`);
+        else if (status === 'completed' && job.status !== 'completed') info = 'Job completed';
+      }
+      if (job.after_exit === status) {
+        if (status === 'stopped') info = 'Job stopped';
+        if (status === 'queued') info = 'Job queued';
       }
       await tx.job.updateMany({
         where: { id: jobId, run_id: runId, launch_phase: expect.phase },
@@ -675,15 +727,15 @@ export const releaseRun = async (
     }),
   );
 
-// Legacy rows: cleared only on proof of exit (never signalled).
-export const clearLegacy = (db: Db, job: Job, evidence: string) =>
+// Preserve the last completed step while releasing a pre-update launch.
+export const clearLegacy = (db: Db, job: Job, evidence: string, forceStopped = false) =>
   withRetry(() =>
     db.job.updateMany({
       where: { id: job.id, run_id: null, pid: job.pid, status: job.status, updated_at: job.updated_at, stop: job.stop, return_to_queue: job.return_to_queue },
       data: {
         pid: null,
-        ...(ACTIVE.includes(job.status)
-          ? { status: job.return_to_queue && !job.stop ? 'queued' : 'stopped', info: `Previous run ended (${evidence}).` }
+        ...(ACTIVE.includes(job.status) || (forceStopped && job.status === 'queued')
+          ? { status: !forceStopped && job.return_to_queue && !job.stop ? 'queued' : 'stopped', info: `Previous run ended (${evidence}).` }
           : {}),
         stop: false,
         return_to_queue: false,

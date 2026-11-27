@@ -52,7 +52,7 @@ const jobFor = (runDir, config, name = path.basename(runDir), jobType = 'train')
   gpu_ids: '0',
 });
 const ctx = () => ({
-  db: {},
+  db: { job: { findFirst: async () => ({ id: 'job-fixture' }) } },
   toolkitRoot: makeRoot('toolkit'),
   helperPath: 'unused-helper.py',
   helperPython: 'unused-python',
@@ -61,7 +61,7 @@ const ctx = () => ({
   sqliteDbPath: 'fixture.sqlite',
   env: {},
   inFlight: new Set(),
-  platform: 'darwin', // forces a pre-spawn refusal AFTER the real binding/config write, never a child process
+  platform: 'unsupported-test-os', // forces a pre-spawn refusal AFTER the real binding/config write, never a child process
 });
 
 test('launch refuses a held CLI writer lease before config writes or log rotation, including error logging', async () => {
@@ -111,7 +111,7 @@ test('launch binds a stale/mismatched training process to the exact claimed fold
   const beforeOutside = fs.readdirSync(oldOutside);
   const result = await launch.launchRun(ctx(), job);
   assert.equal(result.result, 'not_spawned', JSON.stringify(result));
-  assert.match(result.info, /not supported on darwin/);
+  assert.match(result.info, /not supported on unsupported-test-os/);
   assert.equal(fs.readdirSync(oldOutside).join('|'), beforeOutside.join('|'), 'old Training Folder untouched');
 
   const files = launch.runFiles(runDir, job.run_id);
@@ -190,24 +190,30 @@ test('ambiguous multi-process configs are refused before config/folder writes or
   released.length = 0;
   const result = await launch.launchRun(ctx(), job);
   assert.equal(result.result, 'not_spawned', JSON.stringify(result));
-  assert.match(result.info, /exactly one output folder/);
+  assert.match(result.info, /different output folders/);
   assert.equal(fs.existsSync(runDir), false, 'no run folder/config is created for an unsupported layout');
   assert.equal(released.length, 1);
   assert.equal(released[0].jobId, job.id);
   assert.throws(
     () => bindLaunchConfig(config, 'multi', runDir),
-    err => err instanceof LaunchConfigError && /exactly one output folder/.test(err.message),
+    err => err instanceof LaunchConfigError && /different output folders/.test(err.message),
   );
 });
 
-test('unknown extension writers are refused before creating a run folder', async () => {
-  const root = makeRoot('unknown');
-  const runDir = path.join(root, 'job');
-  const config = { job: 'extension', config: { name: 'job', process: [{ type: 'unregistered_writer' }] } };
-  const result = await launch.launchRun(ctx(), jobFor(runDir, config));
-  assert.equal(result.result, 'not_spawned');
-  assert.match(result.info, /no supported UI output-folder binding/);
-  assert.equal(fs.existsSync(runDir), false);
+test('sequential processes and registered extensions receive the same run folder and status database', async () => {
+  const runDir = path.join(makeRoot('extensions'), 'job');
+  const config = { job: 'extension', config: { name: 'job', process: [
+    { type: 'Qwen3OmniCaptioner', name: 'caption-stage', caption: { path_to_caption: '/data' } },
+    { type: 'my_installed_extension' },
+  ] } };
+  const job = jobFor(runDir, config);
+  await launch.launchRun(ctx(), job);
+  const launched = JSON.parse(fs.readFileSync(launch.runFiles(runDir, job.run_id).config, 'utf8'));
+  assert.equal(launched.config.process[0].caption.path_to_caption, '/data');
+  const [captioner, extension] = launched.config.process;
+  assert.equal(captioner.name, 'caption-stage');
+  assert.equal(path.join(extension.training_folder, extension.name), runDir);
+  for (const proc of launched.config.process) assert.equal(proc.sqlite_db_path, 'fixture.sqlite');
 });
 
 test('Windows folder casing does not change the admitted writer identity', { skip: process.platform !== 'win32' }, () => {

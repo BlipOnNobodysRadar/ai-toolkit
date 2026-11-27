@@ -7,7 +7,7 @@ import { jobTypeOptions } from './options';
 import { JobConfig } from '@/types';
 import { objectCopy } from '@/utils/basic';
 import { useNestedState, setNestedValue } from '@/utils/hooks';
-import { SelectInput } from '@/components/formInputs';
+import { CreatableSelectInput, SelectInput } from '@/components/formInputs';
 import useSettings from '@/hooks/useSettings';
 import useGPUInfo from '@/hooks/useGPUInfo';
 import useDatasetList from '@/hooks/useDatasetList';
@@ -20,17 +20,30 @@ import SimpleJob from './SimpleJob';
 import AdvancedConfigEditor from '@/components/AdvancedConfigEditor';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import { apiClient } from '@/utils/api';
+import { actionError } from '@/utils/jobs';
 
 const isDev = process.env.NODE_ENV === 'development';
 
 export default function TrainingForm() {
-  const router = useRouter();
   const searchParams = useSearchParams();
   const runId = searchParams.get('id');
   const cloneId = searchParams.get('cloneId');
+  return <JobEditor key={runId ? `edit:${runId}` : `clone:${cloneId ?? ''}`} runId={runId} cloneId={cloneId} />;
+}
+
+function JobEditor({ runId, cloneId }: { runId: string | null; cloneId: string | null }) {
+  const router = useRouter();
+  const sourceId = runId || cloneId;
+  const [sourceLoaded, setSourceLoaded] = useState(!sourceId);
+  const [loadError, setLoadError] = useState('');
+  const [retry, setRetry] = useState(0);
   const [gpuIDs, setGpuIDs] = useState<string | null>(null);
   const { settings, isSettingsLoaded } = useSettings();
   const { gpuList, isGPUInfoLoaded } = useGPUInfo();
+  const gpuOptions = [
+    ...gpuList.map(gpu => ({ value: String(gpu.index), label: `GPU #${gpu.index}` })),
+    { value: '-1', label: 'CPU only (-1)' },
+  ];
   const { datasets, status: datasetFetchStatus } = useDatasetList();
   const [datasetOptions, setDatasetOptions] = useState<{ value: string; label: string }[]>([]);
   const [showAdvancedView, setShowAdvancedView] = useState(false);
@@ -89,7 +102,7 @@ export default function TrainingForm() {
     const datasetOptions = datasets.map(name => ({ value: path.join(settings.DATASETS_FOLDER, name), label: name }));
     setDatasetOptions(datasetOptions);
 
-    if (datasetOptions.length > 0) {
+    if (!sourceId && datasetOptions.length > 0) {
       const defaultDatasetPath = defaultDatasetConfig.folder_path;
       // Use functional updater so we check the *current* state, not a stale closure
       setJobConfig((prev: JobConfig) => {
@@ -104,39 +117,28 @@ export default function TrainingForm() {
     }
   }, [datasets, settings, isSettingsLoaded, datasetFetchStatus]);
 
-  // clone existing job
   useEffect(() => {
-    if (cloneId) {
-      apiClient
-        .get(`/api/jobs?id=${cloneId}`)
-        .then(res => res.data)
-        .then(data => {
-          console.log('Clone Training:', data);
-          setGpuIDs(data.gpu_ids);
-          const newJobConfig = migrateJobConfig(JSON.parse(data.job_config));
-          newJobConfig.config.name = `${newJobConfig.config.name}_copy`;
-          setJobConfig(newJobConfig);
-        })
-        .catch(error => console.error('Error fetching training:', error));
-    }
-  }, [cloneId]);
+    if (!sourceId) return;
+    let current = true;
+    setLoadError('');
+    apiClient.get('/api/jobs', { params: { id: sourceId } })
+      .then(({ data }) => {
+        if (!current) return;
+        if (!data) throw new Error('This job no longer exists.');
+        const config = migrateJobConfig(JSON.parse(data.job_config));
+        if (!runId) config.config.name += '_copy';
+        setGpuIDs(data.gpu_ids);
+        setJobConfig(config);
+        setSourceLoaded(true);
+      })
+      .catch(error => {
+        if (current) setLoadError(actionError(error));
+      });
+    return () => { current = false; };
+  }, [sourceId, runId, retry, setJobConfig]);
 
   useEffect(() => {
-    if (runId) {
-      apiClient
-        .get(`/api/jobs?id=${runId}`)
-        .then(res => res.data)
-        .then(data => {
-          console.log('Training:', data);
-          setGpuIDs(data.gpu_ids);
-          setJobConfig(migrateJobConfig(JSON.parse(data.job_config)));
-        })
-        .catch(error => console.error('Error fetching training:', error));
-    }
-  }, [runId]);
-
-  useEffect(() => {
-    if (isGPUInfoLoaded) {
+    if (isGPUInfoLoaded && !sourceId) {
       if (gpuIDs === null && gpuList.length > 0) {
         setGpuIDs(`${gpuList[0].index}`);
       }
@@ -144,13 +146,13 @@ export default function TrainingForm() {
   }, [gpuList, isGPUInfoLoaded]);
 
   useEffect(() => {
-    if (isSettingsLoaded) {
+    if (isSettingsLoaded && !sourceId) {
       setJobConfig(settings.TRAINING_FOLDER, 'config.process[0].training_folder');
     }
   }, [settings, isSettingsLoaded]);
 
   const saveJob = async () => {
-    if (status === 'saving') return;
+    if (!sourceLoaded || status === 'saving') return;
     setStatus('saving');
 
     apiClient
@@ -169,11 +171,7 @@ export default function TrainingForm() {
         }
       })
       .catch(error => {
-        if (error.response?.status === 409) {
-          alert('Training name already exists. Please choose a different name.');
-        } else {
-          alert('Failed to save job. Please try again.');
-        }
+        alert(actionError(error));
         console.log('Error saving training:', error);
       })
       .finally(() =>
@@ -187,6 +185,19 @@ export default function TrainingForm() {
     e.preventDefault();
     saveJob();
   };
+
+  if (!sourceLoaded) {
+    return (
+      <MainContent>
+        {loadError ? (
+          <div role="alert">
+            <p>Could not open the saved job. {loadError}</p>
+            <button onClick={() => setRetry(n => n + 1)}>Retry</button>
+          </div>
+        ) : <p>Loading saved job…</p>}
+      </MainContent>
+    );
+  }
 
   return (
     <>
@@ -205,10 +216,10 @@ export default function TrainingForm() {
         {showAdvancedView && (
           <>
             <div className="hidden sm:block">
-              <SelectInput
-                value={`${gpuIDs}`}
+              <CreatableSelectInput
+                value={gpuIDs ?? ''}
                 onChange={value => setGpuIDs(value)}
-                options={gpuList.map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` }))}
+                options={gpuOptions}
               />
             </div>
             <div className="hidden sm:block mx-4 bg-gray-200 dark:bg-gray-800 w-1 h-6"></div>
@@ -323,9 +334,8 @@ export default function TrainingForm() {
               runId={runId}
               gpuIDs={gpuIDs}
               setGpuIDs={setGpuIDs}
-              gpuList={gpuList}
+              gpuOptions={gpuOptions}
               datasetOptions={datasetOptions}
-              isLoading={!isSettingsLoaded || !isGPUInfoLoaded || datasetFetchStatus !== 'success'}
             />
           </ErrorBoundary>
 

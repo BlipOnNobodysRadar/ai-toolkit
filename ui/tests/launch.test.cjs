@@ -12,6 +12,8 @@ const { setupDb, makeJob, ts, jobConfig } = require('./harness/fixture.cjs');
 const { PYTHON, TOOLKIT_ROOT, SCRATCH } = require('./harness/env.cjs');
 
 const windows = process.platform === 'win32';
+const supportedPlatform = ['win32', 'linux', 'darwin'].includes(process.platform);
+const python = !windows && !process.env.AITK_TEST_PYTHON && !fs.existsSync(PYTHON) ? 'python3' : PYTHON;
 let F, store, launch, recon, procctlMod, forceStop, killRoute, pc, me;
 const startedRuns = new Set();
 const identityLog = path.join(SCRATCH, 'launch-test-identities.log');
@@ -21,20 +23,20 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const PYTHONW = path.join(path.dirname(PYTHON), 'pythonw.exe');
 
 before(async () => {
-  if (!windows) return;
+  if (!supportedPlatform) return;
   F = await setupDb('launch');
   store = require(ts.uiPath('cron/ownership/store.ts'));
   launch = require(ts.uiPath('cron/ownership/launch.ts'));
   recon = require(ts.uiPath('cron/ownership/reconcile.ts'));
   procctlMod = require(ts.uiPath('cron/ownership/procctl.ts'));
   forceStop = require(ts.uiPath('cron/ownership/forceStop.ts')).forceStop;
-  pc = procctlMod.makeProcCtl(PYTHON, TOOLKIT_ROOT);
+  pc = procctlMod.makeProcCtl(python, TOOLKIT_ROOT);
   me = await pc.self(process.pid);
   assert.ok(me?.identity && me.boot_id, 'own identity and boot id');
 });
 
 after(async () => {
-  if (!windows) return;
+  if (!supportedPlatform) return;
   // terminate only this file's run boundaries, then confirm with a complete scan that nothing carries their run ids
   for (const runId of startedRuns) {
     const t = await pc.terminate(runId, null);
@@ -49,9 +51,10 @@ after(async () => {
 
 const self = () => ({ pid: process.pid, identity: me.identity, boot_id: me.boot_id });
 let gpu = 0;
-const admitted = async (steps, name = `L${gpu}`) => {
+const admitted = async (steps, name = `L${gpu}`, laterProcesses = []) => {
   const cfg = jobConfig(name);
   cfg.config.process[0].test_steps = steps;
+  cfg.config.process.push(...laterProcesses);
   const j = await makeJob(F.db, { name, gpu_ids: String(gpu++), status: 'queued', job_config: JSON.stringify(cfg) });
   const r = await store.admit(F.db, j.id, F.trainingRoot, self());
   assert.ok(r.admitted, r.reason);
@@ -62,8 +65,8 @@ const ctx = (extra = {}) => ({
   db: F.db,
   toolkitRoot: TOOLKIT_ROOT,
   helperPath: path.join(TOOLKIT_ROOT, 'toolkit', 'ui_procctl.py'),
-  helperPython: PYTHON,
-  jobPython: PYTHONW,
+  helperPython: python,
+  jobPython: windows ? PYTHONW : python,
   runPy: path.join(__dirname, 'fixtures', 'fake_run.py'),
   sqliteDbPath: F.file,
   env: { CUDA_VISIBLE_DEVICES: '-1' },
@@ -88,6 +91,25 @@ const until = async (fn, label, ms = 30000) => {
     await sleep(100);
   }
 };
+
+for (const [label, steps, later, code] of [
+  ['unreported extension success', [], [], 0],
+  ['later extension failure after reported completion', ['status:completed'], [{ type: 'extension', test_steps: ['exit:9'] }], 9],
+]) {
+  test(`real supervisor records ${label}`, { skip: !supportedPlatform }, async () => {
+    const j = await admitted(steps, undefined, later);
+    assert.equal((await launch.launchRun(ctx(), j)).result, 'attached');
+    const r = await row(j.id);
+    const file = launch.runFiles(r.run_dir, r.run_id).exit;
+    await until(() => fs.existsSync(file), 'exit receipt');
+    assert.equal(launch.readExitReceipt(file, r.run_id, r.supervisor_identity).exit_code, code);
+    await reconcile();
+    const result = await row(j.id);
+    assert.equal(result.status, code === 0 ? 'completed' : 'error');
+    assert.match(result.info, code === 0 ? /completed/i : /exited with code 9/);
+    assert.equal(await claims(j.id), 0);
+  });
+}
 
 test('real launch: attached from the receipt; an early Python "completed" keeps the GPU until the supervisor proves the job object empty', { skip: !windows }, async () => {
   const g = gateDir();
@@ -129,7 +151,7 @@ test('intermediate exits before the first observation, live grandchild: the job 
   assert.equal(await claims(j.id), 2);
   open(`${g}/gc`);
   await until(async () => fs.existsSync(path.join(r.run_dir, `.run.${r.run_id}.exit.json`)), 'exit receipt');
-  assert.match((await reconcile())[r.run_id], /released: exit receipt -> error/, 'no Python ending: died');
+  assert.match((await reconcile())[r.run_id], /released: exit receipt -> completed/);
 });
 
 test('a child created after the first observation is still in the run (delayed child creation)', { skip: !windows }, async () => {
@@ -344,9 +366,9 @@ test('a supervisor delayed before its boundary claim loses to the reconciler fen
 
 test('unsupported platform: refused before anything is spawned', { skip: !windows }, async () => {
   const j = await admitted([]);
-  const res = await launch.launchRun(ctx({ platform: 'darwin' }), j);
+  const res = await launch.launchRun(ctx({ platform: 'unsupported-test-os' }), j);
   assert.equal(res.result, 'not_spawned');
-  assert.match(res.info, /not supported on darwin/);
+  assert.match(res.info, /not supported on unsupported-test-os/);
   const r = await row(j.id);
   assert.equal(r.relay_pid, null);
   assert.equal(r.launch_phase, 'exited');

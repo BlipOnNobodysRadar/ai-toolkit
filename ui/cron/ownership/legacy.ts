@@ -35,3 +35,12 @@ export const legacyProcess = (job: LegacyJob, probe: ProbeResult): 'gone' | 'liv
   const launchSettled = Date.now() - job.updated_at.getTime() > 30_000;
   return scan?.complete && launchSettled ? 'gone' : 'unknown';
 };
+
+// The helper independently checks this identity and the launcher's job-id environment before signalling anything.
+export const legacyIdentity = (job: LegacyJob, probe: ProbeResult): string | undefined => {
+  if (job.pid != null) {
+    const p = probe.describe[String(job.pid)];
+    return p?.state === 'alive' && p.cmdline && usesConfig(p.cmdline, job.name) ? p.identity : undefined;
+  }
+  return probe.scans.legacy?.matches.find(p => usesConfig(p.cmdline, job.name))?.identity;
+};

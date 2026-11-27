@@ -1,4 +1,6 @@
 # This is an example extension for custom training. It is great for experimenting with new ideas.
+import os
+
 from toolkit.extension import Extension
 
 
@@ -15,6 +17,8 @@ class SDTrainerExtension(Extension):
     @classmethod
     def get_process(cls):
         # import your process class here so it is only loaded when needed and return it
+        if os.environ.get("IS_AI_TOOLKIT_UI") == "1" and os.environ.get("AITK_JOB_ID"):
+            return DiffusionTrainerExtension.get_process()
         from .SDTrainer import SDTrainer
 
         return SDTrainer
@@ -33,6 +37,8 @@ class UITrainerExtension(Extension):
     @classmethod
     def get_process(cls):
         # import your process class here so it is only loaded when needed and return it
+        if os.environ.get("IS_AI_TOOLKIT_UI") == "1" and os.environ.get("AITK_JOB_ID"):
+            return DiffusionTrainerExtension.get_process()
         from .UITrainer import UITrainer
 
         return UITrainer

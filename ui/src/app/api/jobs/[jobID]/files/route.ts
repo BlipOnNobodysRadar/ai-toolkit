@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/server/prisma';
 import path from 'path';
 import fs from 'fs';
+import { jobArtifactPath } from '../../../../../../cron/ownership/jobArtifacts';
 import { getTrainingFolder } from '@/server/settings';
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ jobID: string }> }) {
@@ -16,7 +17,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   }
 
   const trainingFolder = await getTrainingFolder();
-  const jobFolder = path.join(trainingFolder, job.name);
+  const jobFolder = await jobArtifactPath(trainingFolder, job);
 
   try {
     await fs.promises.access(jobFolder);
@@ -25,12 +26,12 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   }
 
   // find all safetensors files in the job folder
-  let files = (await fs.promises.readdir(jobFolder))
+  let files = (await fs.promises.readdir(jobFolder, { withFileTypes: true }))
     .filter(file => {
-      return file.endsWith('.safetensors');
+      return file.isFile() && file.name.endsWith('.safetensors');
     })
     .map(file => {
-      return path.join(jobFolder, file);
+      return path.join(jobFolder, file.name);
     })
     .sort();
 
@@ -46,7 +47,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   );
 
   // include the optimizer state if it exists
-  const optimizerPath = path.join(jobFolder, 'optimizer.pt');
+  const optimizerPath = await jobArtifactPath(trainingFolder, job, 'optimizer.pt');
   try {
     const stats = await fs.promises.stat(optimizerPath);
     fileObjects.push({

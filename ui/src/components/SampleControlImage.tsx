@@ -6,6 +6,7 @@ import { useDropzone } from 'react-dropzone';
 import { FaUpload, FaImage, FaTimes } from 'react-icons/fa';
 import { apiClient } from '@/utils/api';
 import { encodeFilePathForUrl } from '@/utils/basic';
+import useReadKey from '@/hooks/useReadKey';
 import { withReadKey } from '@/utils/readKey';
 import type { AxiosProgressEvent } from 'axios';
 
@@ -35,13 +36,14 @@ export default function SampleControlImage({
   const [localPreview, setLocalPreview] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
+  const readKey = useReadKey();
   const backgroundUrl = useMemo(() => {
     if (localPreview) return localPreview;
     // videos preview as a server-generated thumbnail, audio as its waveform art
     if (src && isAudioPath(src)) return withReadKey(`/api/audio/art/${encodeURIComponent(src)}`);
     if (src) return `/api/img/${encodeFilePathForUrl(src, isVideoPath(src) ? 'thumb=1' : '')}`;
     return null;
-  }, [src, localPreview]);
+  }, [src, localPreview, readKey]);
 
   const handleUpload = useCallback(
     async (file: File) => {

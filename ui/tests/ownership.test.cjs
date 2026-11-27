@@ -183,6 +183,26 @@ test('an exit receipt must be bound to this run AND its supervisor', async () =>
   assert.equal((await claimsOf(j.id)).length, 2);
 });
 
+test('exit codes honor stop and queue requests, reported errors, and older receipts', () => {
+  const outcome = (status, after_exit, code) => store.finalStatus({ status, after_exit }, code);
+  assert.deepEqual(outcome('stopping', 'stopped', -9), { status: 'stopped', unexpected: false });
+  assert.deepEqual(outcome('running', 'queued', 0), { status: 'queued', unexpected: false });
+  assert.deepEqual(outcome('error', null, 0), { status: 'error', unexpected: false });
+  assert.deepEqual(outcome('completed', null, undefined), { status: 'completed', unexpected: false });
+  assert.deepEqual(outcome('running', null, undefined), { status: 'error', unexpected: true });
+});
+
+test('a force-stop click after the process failed preserves the failure', async () => {
+  const j = await runningJob('already-exited');
+  writeExitReceipt(j, { exit_code: 7 });
+  const pc = fakeProcCtl();
+  const result = await forceStop(F.db, pc, j.id);
+  assert.equal(result.body.killed, false);
+  assert.equal((await job(j.id)).status, 'error');
+  assert.match((await job(j.id)).info, /code 7/);
+  assert.equal(pc.calls.terminate.length, 0);
+});
+
 test('boundary evidence (decision rev2): only an open+empty job object with its supervisor gone, an exit receipt or a boot change release; a vanished job name never does', async () => {
   const j = await runningJob('desc');
   // root gone, an orphaned grandchild still in the job object
@@ -773,5 +793,46 @@ test('the operation-lock directory name is reserved in every spelling Windows ma
     assert.equal((await jobsRoute.POST({ json: async () => ({ name, gpu_ids: '0', job_config: {} }) })).status, 400, JSON.stringify(name));
   }
   const legacy = await F.db.job.create({ data: { name: '.aitk_locks', gpu_ids: '0', job_config: '{}', status: 'stopped' } });
-  assert.equal((await store.beginDelete(F.db, legacy.id, F.trainingRoot)).status, 400, 'an existing row with that name never deletes the lock directory');
+  const lockFolder = path.join(F.trainingRoot, '.aitk_locks');
+  fs.mkdirSync(lockFolder, { recursive: true });
+  const existingLock = path.join(lockFolder, 'existing.lock');
+  fs.writeFileSync(existingLock, 'preserve');
+  const deleted = await routeCall(deleteRoute, 'POST', legacy.id, legacy);
+  assert.equal(deleted.status, 200);
+  assert.match(deleted.body.keptOutput, /no valid output folder/);
+  assert.equal(await job(legacy.id), null);
+  assert.equal(fs.readFileSync(existingLock, 'utf8'), 'preserve');
+});
+
+test('resuming after a rename and a training-root change retains the original checkpoints', async () => {
+  const name = 'original-name';
+  const folder = path.join(F.trainingRoot, name);
+  fs.mkdirSync(folder);
+  const checkpoint = path.join(folder, name + '_000000010.safetensors');
+  fs.writeFileSync(checkpoint, 'existing checkpoint');
+  const j = await makeJob(F.db, {
+    name: 'renamed-job', status: 'stopped', gpu_ids: '-1', run_id: 'previous-run', run_dir: folder, launch_phase: 'exited',
+  });
+  const newRoot = path.join(F.trainingRoot, 'other-root');
+  assert.equal((await store.requestStart(F.db, j.id, newRoot)).status, 200);
+  const { admitted } = await store.admit(F.db, j.id, newRoot, self);
+  assert.equal(admitted.run_dir, folder);
+  const { bindLaunchConfig } = require(ts.uiPath('cron/ownership/launchConfig.ts'));
+  const config = bindLaunchConfig({ config: { process: [{ type: 'diffusion_trainer' }] } }, admitted.name, admitted.run_dir);
+  assert.equal(config.config.process[0].name, name);
+  assert.equal(fs.readFileSync(checkpoint, 'utf8'), 'existing checkpoint');
+});
+
+test('pausing a queue during startup returns the unspawned run to the queue', async () => {
+  const j = await makeJob(F.db, { name: 'pause-before-spawn', status: 'queued' });
+  const { admitted } = await admit(j);
+  assert.ok(admitted);
+  await F.db.queue.upsert({ where: { gpu_ids: j.gpu_ids }, create: { gpu_ids: j.gpu_ids }, update: { is_running: false } });
+  await store.requestQueueReturn(F.db, admitted);
+  assert.equal(await store.markSpawnRequested(F.db, j.id, admitted.run_id), false);
+  await reconcile(fakeProcCtl());
+  const paused = await job(j.id);
+  assert.equal(paused.status, 'queued');
+  assert.equal(paused.info, 'Job queued');
+  assert.equal((await claimsOf(j.id)).length, 0);
 });

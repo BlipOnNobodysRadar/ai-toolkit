@@ -39,6 +39,7 @@ const row = over => ({
   run_id: null,
   pid: null,
   launch_phase: null,
+  run_dir: null,
   stop: false,
   step: 0,
   job_config: JSON.stringify({ config: { process: [{ train: { steps: 10 } }] } }),
@@ -91,7 +92,9 @@ test('JobActionBar: the Retry Delete button is enabled and labelled for a persis
   assert.match(c.message, /did not finish/);
   await c.onConfirm();
   await flush();
-  assert.deepEqual(requests.slice(-1), ['/api/jobs/J1/delete']);
+  assert.deepEqual(requests.at(-1), { url: '/api/jobs/J1/delete', data: {
+    status: 'deleting', run_id: null, launch_phase: null, pid: null, name: 'job-one', run_dir: null,
+  } });
   h.unmount();
 });
 
@@ -115,7 +118,33 @@ test('a pre-update job can be deleted directly or marked stopped from the job me
   const confirm = confirms.pop();
   assert.match(confirm.message, /checkpoints/);
   await confirm.onConfirm();
-  assert.deepEqual(requests.at(-1), { url: '/api/jobs/J1/delete', data: { status: 'running', run_id: null, launch_phase: null, pid: 123 } });
+  assert.deepEqual(requests.at(-1), { url: '/api/jobs/J1/delete', data: {
+    status: 'running', run_id: null, launch_phase: null, pid: 123, name: 'job-one', run_dir: null,
+  } });
   assert.equal(getAvaliableJobActions(legacy).canMarkStopped, true);
   h.unmount();
+});
+
+test('Force Stop works for a pre-update run and unlocks when refresh returns the same status', async () => {
+  const job = row({ status: 'stopping', pid: 123, stop: true });
+  const h = renderHook(props => JobActionBar(props), { job, onRefresh: () => {} });
+  const force = find(h.result.current, props => props.children?.includes?.('Force Stop') && props.onClick);
+  assert.ok(force, 'Force Stop in the menu');
+  force.props.onClick();
+  await confirms.pop().onConfirm();
+  await flush();
+  assert.equal(requests.at(-1), '/api/jobs/J1/kill');
+  assert.equal(find(h.result.current, props => props['aria-label'] === 'Delete').props.disabled, false);
+  h.unmount();
+});
+
+
+test('training targets reflect edits to a single run and the active process in a sequence', () => {
+  const { getTotalSteps } = require(ts.uiPath('src/utils/jobs.ts'));
+  const config = (...steps) => JSON.stringify({ config: { process: steps.map(n => ({ train: { steps: n } })) } });
+  assert.equal(getTotalSteps(row({ job_config: config(200), total_steps: 100 })), 200);
+  const multi = row({ job_config: config(10, 200), total_steps: 150, step: 150, status: 'completed' });
+  assert.equal(getTotalSteps(multi), 150);
+  assert.equal(getAvaliableJobActions(multi).canStart, true);
+  assert.doesNotThrow(() => getAvaliableJobActions(row({ job_config: '{"config":{"process":{}}}', status: 'completed' })));
 });

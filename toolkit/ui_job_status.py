@@ -7,7 +7,9 @@ standalone helper so other UI-driven processes (the inference engine) can
 share it. Outside the UI (no job id or no db file) every call is a no-op.
 """
 
+from contextlib import contextmanager
 import os
+import signal
 import sqlite3
 import threading
 import time
@@ -16,6 +18,37 @@ from typing import Callable, Literal, Optional
 from toolkit.ui_run_fence import RunFence
 
 AITK_Status = Literal["running", "stopped", "error", "completed", "queued"]
+
+
+@contextmanager
+def watch_training_stop(trainer):
+    """Watch one active training stage, including time spent loading its model."""
+    done = threading.Event()
+    dispatch = threading.Lock()
+
+    def poll():
+        while not done.is_set():
+            try:
+                if trainer.should_stop():
+                    with dispatch:
+                        if not done.is_set() and not trainer.is_stopping:
+                            print("Stop requested; interrupting training.", flush=True)
+                            if os.name == "nt":  # pythonw has no console to receive Ctrl+C
+                                signal.raise_signal(signal.SIGINT)
+                            else:
+                                os.kill(os.getpid(), signal.SIGINT)
+                    return
+            except Exception:
+                pass  # a transient database lock can be retried
+            done.wait(2)
+
+    try:
+        threading.Thread(target=poll, daemon=True).start()
+        yield
+    finally:
+        # A delayed DB read from this stage must never interrupt the next stage.
+        with dispatch:
+            done.set()
 
 
 class UIJobStatus:
@@ -91,6 +124,13 @@ class UIJobStatus:
         return self._retry(_do)
 
     # ---- public api ----
+    def begin_process(self, info: str, total_steps: int):
+        self._write(
+            f"UPDATE Job SET status = 'running', info = ?, step = 0, total_steps = ?, speed_string = '' "
+            f"WHERE {self.fence.job_clause}",
+            self.fence.params(info, total_steps),
+        )
+
     def update_status(self, status: AITK_Status, info: Optional[str] = None):
         if info is None:
             self._write(f"UPDATE Job SET status = ? WHERE {self.fence.job_clause}", self.fence.params(status))

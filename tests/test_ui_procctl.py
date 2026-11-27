@@ -1,7 +1,6 @@
 """toolkit/ui_procctl.py failure classification (docs/STATE_MACHINES.md M10; Codex procctl review points 1-4).
 
-Deterministic: Win32 calls are replaced where a failure has to be injected. The only real processes are this test
-process itself and, in the job-name test, a supervisor that refuses to start anything.
+Deterministic: Win32 calls are replaced where a failure has to be injected. Process-group tests use temporary CPU-only fixtures.
 """
 import json
 import os
@@ -138,3 +137,60 @@ def test_boot_identity_is_read_from_the_os():
     b = pc.boot_id()
     if sys.platform == "win32":
         assert b and b.startswith("win-boot:")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups")
+def test_macos_process_group_waits_for_workers_and_accepts_force_stop(tmp_path, monkeypatch):
+    import time
+
+    files = pc.run_files(str(tmp_path), "group-test")
+    marker = tmp_path / "worker-started"
+    program = [sys.executable, "-c", (
+        "import subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(15)'])\n"
+        "open(sys.argv[1], 'w').close()\n"
+        "time.sleep(.5)"
+    ), str(marker)]
+    supervisor = subprocess.Popen([
+        sys.executable, "-c",
+        "import json, sys; from toolkit import ui_procctl as p; "
+        "sys.exit(p._supervise_process_group(*json.loads(sys.argv[1])))",
+        json.dumps([files, str(tmp_path), program, {"run_id": "group-test", "supervisor": "test-supervisor"}]),
+    ])
+    try:
+        deadline = time.monotonic() + 8
+        while not (os.path.exists(files["receipt"]) and marker.exists()):
+            assert supervisor.poll() is None and time.monotonic() < deadline
+            time.sleep(.05)
+        time.sleep(.7)
+        assert supervisor.poll() is None
+        assert not os.path.exists(files["exit"])
+        monkeypatch.setattr(pc, "IS_MAC", True)
+        assert pc.terminate("group-test", "other-supervisor", run_dir=str(tmp_path)).get("requested") is None
+        assert pc.terminate("group-test", "test-supervisor", run_dir=str(tmp_path))["requested"]
+        assert supervisor.wait(timeout=5) == 0
+        assert json.loads(open(files["exit"]).read())["state"] == "exited"
+    finally:
+        open(files["stop"], "a").close()
+        supervisor.wait(timeout=20)
+
+
+def test_legacy_mac_force_stop_can_match_launch_when_process_environment_is_private(monkeypatch, tmp_path):
+    import psutil
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    script = Path(pc.__file__).resolve().parents[1] / "run.py"
+    argv = ["python", str(script), str(tmp_path / "my job" / ".job_config.json")]
+
+    def hidden():
+        raise psutil.AccessDenied()
+
+    proc = SimpleNamespace(environ=hidden, cmdline=lambda: argv)
+    monkeypatch.setattr(pc, "IS_MAC", True)
+    assert pc.legacy_launch_matches(proc, "old-id", "my job")
+    assert not pc.legacy_launch_matches(proc, "old-id", "different")
+    argv[1] = str(tmp_path / "another-install" / "run.py")
+    assert not pc.legacy_launch_matches(proc, "old-id", "my job")
+    argv[1], argv[2] = str(script), str(tmp_path / "my job" / ".job_config.new-id.json")
+    assert not pc.legacy_launch_matches(proc, "old-id", "my job")

@@ -23,7 +23,7 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
     return NextResponse.json({ error: 'A current job snapshot is required.' }, { status: 400 });
   }
   const { jobID } = await params;
-  const check = await checkStopped(prisma, makeProcCtl(resolvePythonPath(), TOOLKIT_ROOT), jobID, seen);
+  const check = await checkStopped(prisma, makeProcCtl(resolvePythonPath(), TOOLKIT_ROOT), jobID, seen, 'delete');
   const out = check.status === 200 ? await deleteJob(prisma, jobID, await getTrainingFolder(), { seen }) : check;
   return NextResponse.json(out.body, { status: out.status });
 }

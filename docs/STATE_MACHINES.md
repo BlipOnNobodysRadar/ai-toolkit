@@ -1,6 +1,6 @@
 # State machines: catalog, invariants, transitions, defects
 
-**Queue recovery update.** During an upgrade, the worker checks jobs from the older launcher on its first pass. An exited trainer or a reused PID releases the GPU automatically. For an old row without a PID, the worker looks for a process using that job’s config. If the process state is inconclusive and you know training has ended, choose **Mark as Stopped** to keep the checkpoints, or **Delete** to remove the job and its output folder. Both actions check for live processes. This supersedes the reboot requirement in the historical audit below.
+**Queue recovery update.** During an upgrade, the worker checks jobs from the older launcher on its first pass. An exited trainer or a reused PID releases the GPU automatically. For an old row without a PID, the worker looks for a process using that job’s config. If the process check is inconclusive and you have confirmed training ended, choose **Mark as Stopped**. This keeps the checkpoints. **Delete** removes the job and its recorded output directory. It keeps files when another job references the same directory or the old binding is invalid.
 
 **CURRENT STATUS — 2026-11-07.** Section 20 supersedes the relevant older behaviour/status. Commits: UI `bb21cae1`; core and shared CLI/UI leases `964d79a1`; data/cache/inference `cb692933`. Final combined CPU suite: **863 passed, 53 skipped**, with unchanged Python source hashes. Full UI: **101 passed**; both TypeScript projects: **zero diagnostics**. All fixes are committed on `codex/opus-state-machines-20261106`, unmerged and unpushed; main remains `f6c137b4`. The separate detached `db8dafb5` GPU comparison is unchanged and does not validate these new commits. No GPU throughput/full-model validation was run here.
 
@@ -559,10 +559,7 @@ Column jumps are not capped (decided). Test: `ui/tests/terminalEmulator.test.cjs
 ## 13. M10/M18/M19/M35/M36 UI ownership, requests, uploads, deletion, queue
 
 **Status: accepted within the stated test/platform scope and committed locally (phase04 interrupted, completed in phase05, two late fixes in phase06). Four review groups SM-15a-d are listed in section 14; section 19 maps them to commits.** Agreed basis: `ui-ownership-proposal.txt` rev. 2 with `codex-ui-implementation-decision.txt` (all seven
-corrections) and `codex-ui-boundary-decision.txt` rev. 2 (Q1-Q4; run folder, supporting only). Everything below is
-also stated in the source comments of the named files. Windows is the tested platform; Linux is source-only here
-(no Linux host or container was available; Codex found the Docker daemon absent and started nothing); macOS and other
-platforms refuse to launch.
+corrections) and `codex-ui-boundary-decision.txt` rev. 2 (Q1-Q4; run folder, supporting only). The original review used Windows fixtures. Subsequent Linux CPU fixtures cover both the subreaper and the POSIX process-group lifecycle. macOS uses a dedicated trainer process group. Native macOS testing is still outstanding.
 
 ### 13.1 Ownership model (M10)
 
@@ -594,7 +591,7 @@ launched before this schema ("legacy": `run_id` null), while it has an active st
 code never cleared `pid` on a normal exit). Display status is not ownership: Python writes completed/error/stopped/
 queued before its process exits.
 
-**Run boundary** (`toolkit/ui_procctl.py`, stdlib only, run as `python -I -S`). Process chain: worker -> relay
+**Run boundary** (`toolkit/ui_procctl.py`). The supervisor uses the standard library. Force Stop for an identified legacy run also uses the installed psutil package. Process chain: worker -> relay
 (`ui_procctl.py launch`, a child of the worker that exits) -> per-run supervisor (`ui_procctl.py supervise`, detached,
 so training survives normal UI worker shutdown as before) -> root (`pythonw run.py <per-run config>`) and its
 descendants. The run id appears in every command line (per-run config `.job_config.<run_id>.json`), and the worker
@@ -606,10 +603,11 @@ records its own `pid@creation` and boot id on the run at admission.
   instruction (an unassigned root never runs). It writes an atomic spawn receipt (`pid@creation` of root and
   supervisor, boot id), records members (completion-port messages plus pid-list polling; auxiliary only), and writes
   the **exit receipt** only after the kernel's `ActiveProcesses` count is 0.
-* Linux (source only): the supervisor is `PR_SET_CHILD_SUBREAPER` (needs pidfd: Linux 5.3+, Python 3.9+, else the
+* Linux: the supervisor is `PR_SET_CHILD_SUBREAPER` (needs pidfd: Linux 5.3+, Python 3.9+, else the
   launch is refused) and writes the exit receipt only when `waitpid(-1)` reports no children at all. Force stop asks it
   (pidfd-signalled, identity-checked) to kill its **current direct children** repeatedly as orphans are adopted; no
   ancestry walk.
+* macOS: the trainer starts a new process group. The supervisor retains its PID until that group has no live members. Force Stop targets that group.
 * Identity: `pid@creation` (Windows exact 64-bit FILETIME as a decimal string; Linux boot id + start ticks). A pid now
   showing another creation time proves the recorded process exited and is never signalled. `WAIT_FAILED`, denied or
   unreadable states are `unknown`.
@@ -619,13 +617,10 @@ records its own `pid@creation` and boot id on the run at admission.
   name disappears when the last handle closes, before members finish terminating (measured: Opus
   `job_name_lifetime_probe.json`, ERROR_FILE_NOT_FOUND at 0.08 ms with the owned child alive until 5.5 ms; Codex
   `job-name-lifetime-acceptance.json` with a correctly escaped Global name, 1.4 ms, not an upper bound). Recorded
-  members are incomplete by construction. **Limitation:** if a supervisor dies without its exit receipt (e.g. it is
-  killed), the run's GPUs and folder stay reserved until a restart of the computer proves the exit; the job shows
-  "The run's supervisor ended without confirming ... a restart of this computer clears this." No timer releases it.
+  members are incomplete by construction. If a supervisor dies before writing its exit receipt, Mark as Stopped lets the user release the reservation after checking that training has ended.
 * Force stop = `TerminateJobObject` on the run's job (Windows); no pid is signalled. Termination is asynchronous; only
   the kernel's count reaching 0 counts, and claims are released only on the receipt/evidence above.
-* Command-line scans (needle = run id / legacy config path) are diagnostics only: a process that cannot be queried
-  (denied) or read makes a scan incomplete, and no release decision uses a negative scan.
+* For a pre-update job missing its trainer PID, the worker checks the old launch config against running processes before releasing the reservation.
 
 **Python fencing** (phase03, `toolkit/ui_run_fence.py`, now active because the launcher passes `AITK_RUN_ID`): every
 Job read/write of DiffusionTrainer, UITrainer, BaseCaptioner and UIJobStatus is `WHERE id = ? AND run_id = ?`; a write
@@ -654,28 +649,19 @@ releases a run that has moved on (`reconcile_phase_race_probe` reproduction; now
 | attached | Python progress/terminal writes | fenced on run_id | step/info/status | same; terminal status keeps claims | 0 rows: superseded, process stops itself |
 | starting/running | Stop (route) | run owned | `stop=true`, `stop_requested_at`, `after_exit=stopped`, status `stopping` (not overwriting a terminal status) | stopping | nothing is signalled on any platform (the trainer's stop watcher raises SIGINT in-process) |
 | stopping | stop older than 60 s (reconciler backstop) | boundary open, active > 0 | one force stop per 30 s | stopping | termination is not exit proof |
-| attached | Force stop (route) | identified boundary | `TerminateJobObject`, wait for count 0, release on the exit receipt | stopped | not attached: 409 "still starting"; legacy: 409; unsupported platform: 501; partial: 500 with remaining count; claims kept in all these cases |
+| attached | Force stop (route) | identified boundary | `TerminateJobObject`, wait for count 0, release on the exit receipt | stopped | not attached: stop is recorded; unsupported platform: 501; partial: 500 with remaining count; claims kept in all these cases |
 | running (queue paused) | queue tick | the queue is still paused AT COMMIT; only that queue's own jobs | `return_to_queue`, `after_exit=queued`, stopping | stopping | a queue started again after the read: untouched |
-| attached | exit evidence (receipt / open+empty+supervisor gone / boot change) | phase + identity unchanged | delete claims, `phase=exited`, status: Python's completed/error stand, else `after_exit`, else error "exited unexpectedly. Last log line: ..." | final | DB failure: retried next tick |
-| attached | supervisor gone, no receipt, job object absent | — | nothing | same | reserved until restart (limitation above) |
+| attached | exit evidence (receipt / open+empty+supervisor gone / boot change) | phase + identity unchanged | delete claims, `phase=exited`, status from the root exit code, requested stop or queue return, and trainer errors. Earlier receipts retain the status recorded by Python | final | DB failure: retried next tick |
+| attached | supervisor gone, no receipt, job object absent | — | nothing | same | Mark as Stopped is available after the user verifies the job ended |
 | claimed (another worker) | reconciler | admitting worker proved gone | release (nothing spawned) | error | worker alive or unknown: kept |
 | any phase | reconciler | recorded boot id differs from the current one | release | final | boot id unreadable: no proof |
 | queue running, nothing to do | idle stop | AT COMMIT: no queued job and no job of that queue that may own a process (active status, claimed/spawn_requested/attached run, legacy pid) | `is_running=false` (conditional) | stopped queue | an enqueue + start, or another worker's admission, after the read keeps it running |
 
 Edit (`POST /api/jobs` with id): editable status AND no claims AND no legacy occupancy; rename checked for folder
 collisions/reservations (409). Create: folder-key alias of any existing job, or a folder overlapping a run claim or
-deletion reservation, is 409. Mark as Stopped: a display reset only for a row that owns nothing (409 otherwise; no
-confirmation-click bypass).
+deletion reservation, is 409. Mark as Stopped checks the row shown at confirmation and denies recovery when it identifies a live process.
 
-**Legacy rows** (pre-update): occupy their normalized GPU set (empty/unparsable = all GPUs) and folder; are never
-signalled; Stop still sets the flag the old process polls; force stop is refused. They are cleared ONLY by a boot-id
-change since the row was first observed by this code (the boot id is recorded at first observation; writes to legacy
-rows preserve `updated_at`). Dead-looking pids and empty scans are not proof (Codex Q1). **Deployment note:** stop all
-jobs before upgrading; any legacy row with a recorded pid (every finished job of the old code) keeps its GPU and
-folder reserved until the next restart of the computer, with the diagnostic "Started before the run-ownership
-update...". The schema push itself (`npm run update_db`) is not run here; on this host the isolated `prisma db push`
-failed with an empty "Schema engine error" unless `RUST_LOG=info` was set (test harness note; production behaviour not
-verified).
+**Existing installations.** On startup the worker checks pre-update jobs against their recorded processes. It releases stale reservations and keeps checkpoints and completed statuses. Stop asks a live trainer to exit. Force Stop checks a legacy trainer's identity before terminating it. If a finished job still holds a reservation, Mark as Stopped clears its bookkeeping. Delete preserves shared or unidentifiable output directories and reports which files it kept.
 
 ### 13.3 Deletion (M35, `deleteJob` in `ui/cron/ownership/store.ts`)
 
@@ -783,9 +769,9 @@ Reproduce: see section 16 ("UI environment").
 * Windows behaviour is tested with owned hidden CPU fixtures only (no GPU, no real training, no browser, no live UI
   service). Survival of a run when the UI worker is shut down follows the original design (the supervisor is outside
   the worker's process tree) but was not exercised against real UI shutdown or external tree killers.
-* Linux supervisor, subreaper wait and pidfd signalling are source-only; macOS/other refuse before spawn.
-* A supervisor that dies without its exit receipt leaves the run reserved until a restart (no automatic recovery).
-* Legacy rows clear only after a boot change relative to the baseline recorded by the new worker. The new worker must first observe those rows; a reboot before that observation is not proof. Deployment requires the live schema migration (not done).
+* Linux CPU fixtures exercise supervisor launch, graceful stop and force stop. The macOS process-group lifecycle is exercised on POSIX.
+* A lost exit receipt can require the owner to use Mark as Stopped after checking that training ended.
+* Legacy rows reconcile from process evidence on startup.
 * Multi-session Windows use: the `Global\` job namespace is shared across sessions; a worker in another session of
   the same user has not been tested.
 * Browser hook evidence is simulated-host evidence; the UI pages themselves were type-checked, not rendered.
@@ -849,10 +835,9 @@ Reproduce: see section 16 ("UI environment").
   appear briefly; Start/Edit/Delete/Mark as Stopped wait for that and the reason is shown. Jobs on overlapping GPU
   sets (`0` and `0,1`, across queues) never run together; opaque GPU names are exclusive; an empty GPU selection is
   refused; a name colliding by case/junction with another job's folder is refused.
-* Stop never sends a signal (the trainer's watcher stops it); a stop that is not honoured within 60 s gets a force
-  stop. Force Stop terminates the whole run (all child processes), and is refused for jobs started before the update.
-* Upgrade sequence for legacy rows: stop existing jobs, apply the schema/new code, let the new worker record its boot baseline, then restart the computer when other work permits. A reboot before the baseline is recorded does not clear those reservations. A new run whose supervisor died without an exit receipt also stays reserved until a boot change. No upgrade/reboot was performed for this audit.
-* Launching jobs on macOS/other non-Windows/Linux platforms is refused in this version.
+* Stop requests a graceful exit. After 60 seconds the worker can force-stop a supervised run. Force Stop is also available for an identified legacy trainer.
+* Upgrading does not require rebooting. The worker reconciles pre-update process records before running the queue.
+* The UI can launch jobs on Windows, Linux and macOS.
 * Deleting a job that a previous Delete left unfinished completes it: such a row shows "Retry Delete"; two Deletes
   at once: the second is refused.
 * LoRA uploads: a finish to an existing name is refused (unless Overwrite) even when two uploads race; a hole, a
@@ -956,8 +941,7 @@ CPUOffloadOptimizer, CUDA RNG with real devices, real model sampling) is unverif
 
 ## 18. Open decisions and proposals
 1. **C13 `B > 1`**: resolved (Codex rev. 2): unreachable branches deleted, `TrainConfig` refusal kept and tested.
-2. **SM-15a-d**: independent acceptance complete within the evidence scope; all groups are committed locally (sections 14 and 19). Pre-merge production/GPU/browser/platform checks remain. Decided limits (boundary decision rev. 2): no absence-based exit
-   proof; supervisor death without receipt and legacy rows clear only on a restart; macOS refused; Linux source-only.
+2. **SM-15a-d**: independent acceptance complete within the evidence scope; all groups are committed locally (sections 14 and 19). The updated queue and recovery behavior is documented in section 13.
 3. **Schedule-free export point**: option C (out-of-place x for exports) remains future design.
 4. **MiniCPM finalization**: resolved (final training-coordinate checkpoint before evaluation; one eval mode through
    export).
@@ -1065,7 +1049,7 @@ the committed core and UI statuses above are the only accepted integration statu
 | OPUS-PARAM-ID-01 | Resume/optimizer; moments on wrong parameter names | S; Codex reproduced RAWR + AdamW; strict refusal source/test-confirmed | Ordered `(name, shape, dtype)` manifest; `require_named` refuses free/unnamed optimizer parameters before resume, training or save; versioned positional records are refused before loading; module swap/reorder/class changes refuse; legacy record-less pairs warn only. Core committed `964d79a1`. | `tests/test_core_resume_identity.py` (`test_unnamed_parameters_are_refused_before_training`, `test_reordered_unnamed_parameters_are_refused_without_loading_moments`, `test_named_producers_are_certified`) |
 | OPUS-SEC-01 | UI boundary; unauthenticated mutation | C: middleware probe showed mutation routes passing without a bearer token | Public reads are only GET/HEAD under media prefixes; all other `/api/*` require the `AI_TOOLKIT_AUTH` bearer. UI committed `bb21cae1`. | `ui/tests/uiInvariantRoutes.test.cjs`; `ui/tests/uiInvariantLaunchBinding.test.cjs` |
 | OPUS-SEC-02 | UI boundary; delete/caption outside roots | C: traversal probe deleted an outside image/caption | Shared lexical + physical mutation resolver; both image and caption targets validated before mutation; caption extension restricted. UI committed `bb21cae1`. | `ui/tests/uiInvariantRoutes.test.cjs`; `ui/tests/uiInvariantLaunchBinding.test.cjs` |
-| OPUS-UI-01 | UI launch binding; writes outside claimed run folder | S: stale training folder/name could differ from the admitted folder | Launch rewrites a single supported training process to `training_folder=parent` and `name=job name`; inference `job_folder` is bound; multi-process or unknown writer types refuse. UI committed `bb21cae1`. | `ui/tests/uiInvariantLaunchBinding.test.cjs` |
+| OPUS-UI-01 | UI launch binding; writes outside claimed run folder | S: stale training folder/name could differ from the admitted folder | The launcher binds trainers and inference to the recorded run folder. Registered extensions and sequential stages sharing one trainer output are accepted. Stages with distinct model outputs require separate jobs. | `ui/tests/uiInvariantLaunchBinding.test.cjs` |
 | OPUS-ONEWRITER-01 | Writer ownership; overlapping writers corrupt saves/prune | S; core focused and cross-language path tests | Exact-root SQLite writer lease acquired before config writes; same-job holders share, other jobs/processes/delete are busy; release on run/constructor/cleanup/finally; distributed start refuses. UI preparation uses the same path formula but the handoff to the spawned trainer is not an atomic lease transfer. Core committed `964d79a1`; UI lease evidence accepted. | `tests/test_core_save_root_lease.py`; `ui/tests/writerLease.test.cjs` |
 | OPUS-PRUNE-01 | Save pruning; another job's or newer data deleted | C: mixed LoRA/adapter budget, prefix-sharing job and derived-export pruning reproduced | Per-artifact-kind budgets over exactly the kinds this run writes; split save counts once; final save never pruned; only saves older than the oldest kept complete save go; newer interrupted save remains; a failed optimizer write skips pruning. Core committed `964d79a1`. | `tests/test_core_save_discovery.py`; `tests/test_core_resume_identity.py` (`test_a_failed_optimizer_save_prunes_nothing_and_the_resume_falls_back`) |
 | OPUS-CACHE-01 | Data/cache; stale latent from changed media or VAE | S; T focused worker tests | Cache schema v2 latent key includes source SHA-256, schema version, preprocessing policy, model latent-space override and a compact latent-encoder digest. Admission compares the stored key and lazily atomically rebuilds misses/legacy/unreadable files. Data committed `cb692933`; final CPU suite accepted within the limits below. | `tests/test_data_invariants_cache_final.py`; `tests/test_latent_cache_recovery.py` |
@@ -1226,8 +1210,8 @@ certified** for the corrected algorithm; use a fresh optimizer if using affected
 - EMA resume adds CPU copies of raw weights and the EMA shadow to `optimizer.pt`, so save/load RAM, disk and I/O grow
   with trainable parameter count beyond the optimizer state itself. This is an untested overhead policy, not a
   benchmark.
-- RAWR pair mode with a split LoRA layout and distributed multi-process training are explicitly unsupported and refuse
-  at startup; non-pair split layouts still work. Wan 2.2 full fine-tune split remains undeclared.
+- RAWR uses the ordinary checkpoint writer for split LoRAs, including Wan 2.2. Distributed multi-process training
+  remains unsupported. Wan 2.2 full fine-tune split remains undeclared.
 - Root/ancestor junction spellings are canonicalized, but concurrent hostile filesystem replacement after validation
   remains outside the guarantee.
 - The exact-root lease does not serialize arbitrary nested CLI roots, unrelated programs, or network filesystems

@@ -1,4 +1,5 @@
 import processQueue from './actions/processQueue';
+import { recoverTrainingProgress } from './recoverTrainingProgress';
 import { launchesInFlight } from './actions/startJob';
 import prisma from './prisma';
 import { TOOLKIT_ROOT, getTrainingFolder } from './paths';
@@ -85,17 +86,22 @@ class CronWorker {
       this.self = { pid: process.pid, identity: me.identity, boot_id: me.boot_id };
     }
     const self = this.self;
+    const trainingRoot = await getTrainingFolder();
     // reconcile before admission, every tick (the first tick is the startup pass)
     await reconcile({
       db: prisma,
       procctl,
       self,
       inFlight: launchesInFlight,
-      trainingRoot: await getTrainingFolder(),
-      tick: this.tick++,
+      trainingRoot,
+      tick: this.tick,
       backstopAttempts,
       log: message => console.warn(message),
     });
+    if (this.tick++ === 0) {
+      void recoverTrainingProgress(prisma, trainingRoot)
+        .catch(error => console.warn('Could not recover historical training progress:', error));
+    }
     await processQueue(self);
   }
 }

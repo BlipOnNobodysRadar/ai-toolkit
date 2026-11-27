@@ -1,4 +1,5 @@
 import importlib
+import os
 from collections import OrderedDict
 from typing import List
 
@@ -39,6 +40,23 @@ class BaseJob:
         # implement in child class
         # be sure to call super().run() first
         pass
+
+    def run_processes(self):
+        # A UI row tracks the current process. Caption counts and trainer steps are different units.
+        ui = None
+        if len(self.process) > 1 and os.environ.get("IS_AI_TOOLKIT_UI") == "1" and os.environ.get("AITK_JOB_ID"):
+            from toolkit.ui_job_status import UIJobStatus
+            ui = UIJobStatus(self.process[0].get_conf("sqlite_db_path", "./aitk_db.db"))
+        for index, process in enumerate(self.process):
+            self.active_process = process
+            if ui is not None:
+                if ui.should_stop() or ui.should_return_to_queue():
+                    raise KeyboardInterrupt()
+                # Steps belong to this process. Its trainer replaces zero with the checkpoint position on load.
+                info = f"Process {index + 1}/{len(self.process)} · {process.get_conf('type')}"
+                ui.begin_process(info, process.get_conf("train.steps", 0))
+                print(info)
+            process.run()
 
     def load_processes(self, process_dict: dict):
         # only call if you have processes in this job type

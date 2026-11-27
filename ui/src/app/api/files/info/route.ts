@@ -1,5 +1,7 @@
 /* eslint-disable */
 import { NextRequest, NextResponse } from 'next/server';
+import { historicalArtifactFolder } from '../../../../../cron/ownership/jobArtifacts';
+import prisma from '@/server/prisma';
 import fs from 'fs';
 import path from 'path';
 import { getDatasetsRoot, getTrainingFolder } from '@/server/settings';
@@ -24,7 +26,7 @@ export async function POST(request: NextRequest) {
       return new NextResponse('filePath is required', { status: 400 });
     }
 
-    const decodedFilePath = decodeURIComponent(filePath);
+    const decodedFilePath = path.isAbsolute(filePath) ? filePath : decodeURIComponent(filePath);
     const datasetRoot = await getDatasetsRoot();
     const trainingRoot = await getTrainingFolder();
     const allowedDirs = [datasetRoot, trainingRoot];
@@ -33,7 +35,8 @@ export async function POST(request: NextRequest) {
     const isAllowed = allowedDirs.some(
       allowedDir => resolvedFilePath === allowedDir || resolvedFilePath.startsWith(allowedDir + path.sep),
     );
-    if (!isAllowed) {
+    const historicalFolder = isAllowed ? null : await historicalArtifactFolder(prisma, trainingRoot, resolvedFilePath);
+    if (!isAllowed && !historicalFolder) {
       console.warn(`Access denied: ${resolvedFilePath} not in ${allowedDirs.join(', ')}`);
       return new NextResponse('Access denied', { status: 403 });
     }
