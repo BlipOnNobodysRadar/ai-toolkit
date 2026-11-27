@@ -6,8 +6,8 @@ config:
     - type: 'image_reference_slider_trainer'
       training_folder: "/mnt/Train/out/LoRA"
       device: cuda:0
-      # for tensorboard logging
-      log_dir: "/home/jaret/Dev/.tensorboard"
+      # Uncomment to write local TensorBoard logs for this run.
+      # log_dir: "output/.tensorboard"
       network:
         type: "lora"
         linear: 8

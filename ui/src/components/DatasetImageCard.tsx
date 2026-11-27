@@ -105,7 +105,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
           setLoaded(true);
         })
         .catch(err => {
-          if (err?.name !== 'AbortError') console.error('Dataset image fetch failed:', err);
+          if (err?.name !== 'AbortError') console.error('Dataset image fetch failed');
         });
     }, 80);
 
@@ -172,7 +172,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
         dirtyRef.current = false;
       })
       .catch(error => {
-        console.error('Error saving caption:', error);
+        console.error('Error saving caption');
       });
   };
 
@@ -190,7 +190,7 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
       apiClient
         .post('/api/img/caption', { imgPath: url, caption: trimmed, ext })
         .then(() => setCachedCaption(url, trimmed, ext))
-        .catch(err => console.error('Error saving caption on unmount:', err));
+        .catch(() => console.error('Error saving caption on unmount'));
     };
   }, []);
 
@@ -284,11 +284,10 @@ const DatasetImageCard: React.FC<DatasetImageCardProps> = ({
                     apiClient
                       .post('/api/img/delete', { imgPath: imageUrl })
                       .then(() => {
-                        console.log('Image deleted:', imageUrl);
                         onDelete();
                       })
                       .catch(error => {
-                        console.error('Error deleting image:', error);
+                        console.error('Error deleting image');
                       });
                   },
                 });

@@ -42,7 +42,7 @@ export default function FilesWidget({ jobID, jobName }: { jobID: string; jobName
             refreshFiles();
           })
           .catch(error => {
-            console.error('Error deleting checkpoint:', error);
+            console.error('Error deleting checkpoint');
           });
       },
     });

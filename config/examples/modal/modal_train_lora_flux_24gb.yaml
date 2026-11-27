@@ -6,7 +6,7 @@ config:
   process:
     - type: 'sd_trainer'
       # root folder to save training sessions/samples/weights
-      training_folder: "/root/ai-toolkit/modal_output" # must match MOUNT_DIR from run_modal.py
+      training_folder: "/root/ai-toolkit/modal_output" # mounted flux-lora-models volume
       # uncomment to see performance stats in the terminal every N steps
 #      performance_log_every: 1000
       device: cuda:0
@@ -25,10 +25,8 @@ config:
         # datasets are a folder of images. captions need to be txt files with the same name as the image
         # for instance image2.jpg and image2.txt. Only jpg, jpeg, and png are supported currently
         # images will automatically be resized and bucketed into the resolution specified
-        # on windows, escape back slashes with another backslash so
-        # "C:\\path\\to\\images\\folder"
-        # your dataset must be placed in /ai-toolkit and /root is for modal to find the dir:
-        - folder_path: "/root/ai-toolkit/your-dataset"
+        # Upload the selected dataset to the ai-toolkit-datasets Modal volume.
+        - folder_path: "/root/ai-toolkit/datasets/your-dataset"
           caption_ext: "txt"
           caption_dropout_rate: 0.05  # will drop out the caption 5% of time
           shuffle_tokens: false  # shuffle caption order, split by commas

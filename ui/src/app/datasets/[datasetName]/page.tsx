@@ -49,7 +49,7 @@ export default function DatasetPage({ params }: { params: Promise<{ datasetName:
         setStatus('success');
       })
       .catch(error => {
-        console.error('Error fetching images:', error);
+        console.error('Error fetching images');
         setStatus('error');
       })
       .finally(() => {

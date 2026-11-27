@@ -11,7 +11,6 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     },
   });
 
-  console.log(`Job ${jobID} marked to sample on next step`);
 
   return NextResponse.json(job);
 }

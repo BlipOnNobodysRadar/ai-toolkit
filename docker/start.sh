@@ -12,49 +12,47 @@ set -e  # Exit the script if any statement returns a non-true return value
 setup_ssh() {
     if [[ $PUBLIC_KEY ]]; then
         echo "Setting up SSH..."
-        mkdir -p ~/.ssh
-        echo "$PUBLIC_KEY" >> ~/.ssh/authorized_keys
-        chmod 700 -R ~/.ssh
+        local key
+        install -d -m 0700 ~/.ssh
+        touch ~/.ssh/authorized_keys
+        chmod 0600 ~/.ssh/authorized_keys
+        while IFS= read -r key; do
+            if [[ -n $key ]] && ! grep -Fxq -- "$key" ~/.ssh/authorized_keys; then
+                printf '%s\n' "$key" >> ~/.ssh/authorized_keys
+            fi
+        done <<< "$PUBLIC_KEY"
 
-         if [ ! -f /etc/ssh/ssh_host_rsa_key ]; then
-            ssh-keygen -t rsa -f /etc/ssh/ssh_host_rsa_key -q -N ''
-            echo "RSA key fingerprint:"
-            ssh-keygen -lf /etc/ssh/ssh_host_rsa_key.pub
-        fi
-
-        if [ ! -f /etc/ssh/ssh_host_dsa_key ]; then
-            ssh-keygen -t dsa -f /etc/ssh/ssh_host_dsa_key -q -N ''
-            echo "DSA key fingerprint:"
-            ssh-keygen -lf /etc/ssh/ssh_host_dsa_key.pub
-        fi
-
-        if [ ! -f /etc/ssh/ssh_host_ecdsa_key ]; then
-            ssh-keygen -t ecdsa -f /etc/ssh/ssh_host_ecdsa_key -q -N ''
-            echo "ECDSA key fingerprint:"
-            ssh-keygen -lf /etc/ssh/ssh_host_ecdsa_key.pub
-        fi
-
-        if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
-            ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -q -N ''
-            echo "ED25519 key fingerprint:"
-            ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
-        fi
-
+        # The image carries no host private keys. Create this pod's identity on first boot.
+        ssh-keygen -A
         service ssh start
-
-        echo "SSH host keys:"
-        for key in /etc/ssh/*.pub; do
-            echo "Key: $key"
-            ssh-keygen -lf $key
-        done
     fi
 }
 
-# Export env vars
+# SSH sessions do not inherit the pod environment. Keep only the connection
+# and resource information needed there. Other RUNPOD_* variables may be keys.
+write_ssh_env() {
+    local name
+    for name in PATH RUNPOD_POD_ID RUNPOD_POD_HOSTNAME RUNPOD_PUBLIC_IP RUNPOD_DC_ID \
+        RUNPOD_VOLUME_ID RUNPOD_CPU_COUNT RUNPOD_MEM_GB RUNPOD_GPU_COUNT; do
+        if [[ -v $name ]]; then
+            printf 'export %s=%q\n' "$name" "${!name}"
+        fi
+    done
+    while IFS= read -r name; do
+        if [[ $name =~ ^RUNPOD_TCP_PORT_[0-9]+$ ]]; then
+            printf 'export %s=%q\n' "$name" "${!name}"
+        fi
+    done < <(compgen -A variable RUNPOD_TCP_PORT_)
+}
+
 export_env_vars() {
-    echo "Exporting environment variables..."
-    printenv | grep -E '^RUNPOD_|^PATH=|^_=' | awk -F = '{ print "export " $1 "=\"" $2 "\"" }' >> /etc/rp_environment
-    echo 'source /etc/rp_environment' >> ~/.bashrc
+    local env_file=/etc/rp_environment tmp
+    tmp=$(mktemp "${env_file}.XXXXXX")
+    write_ssh_env > "$tmp"
+    mv -f "$tmp" "$env_file"
+    if ! grep -Fxq 'source /etc/rp_environment' ~/.bashrc; then
+        echo 'source /etc/rp_environment' >> ~/.bashrc
+    fi
 }
 
 # ---------------------------------------------------------------------------- #
@@ -64,7 +62,7 @@ export_env_vars() {
 
 echo "Pod Started"
 
-setup_ssh
 export_env_vars
+setup_ssh
 echo "Starting AI Toolkit UI..."
-cd /app/ai-toolkit/ui && npm run start 
+cd /app/ai-toolkit/ui && npm run start

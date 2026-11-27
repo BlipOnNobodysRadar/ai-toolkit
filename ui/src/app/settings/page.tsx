@@ -1,25 +1,31 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import useSettings from '@/hooks/useSettings';
 import { TopBar, MainContent } from '@/components/layout';
 import { apiClient } from '@/utils/api';
 
 export default function Settings() {
-  const { settings, setSettings } = useSettings();
+  const { settings, setSettings, isSettingsLoaded } = useSettings();
+  const [token, setToken] = useState('');
+  const [clearToken, setClearToken] = useState(false);
   const [status, setStatus] = useState<'idle' | 'saving' | 'success' | 'error'>('idle');
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setStatus('saving');
 
+    const { HAS_HF_TOKEN, ...folders } = settings;
+    const tokenUpdate = clearToken ? '' : token || undefined;
     apiClient
-      .post('/api/settings', settings)
+      .post('/api/settings', { ...folders, HF_TOKEN: tokenUpdate })
       .then(() => {
+        setSettings(prev => ({ ...prev, HAS_HF_TOKEN: tokenUpdate === undefined ? HAS_HF_TOKEN : !!tokenUpdate }));
+        setToken('');
+        setClearToken(false);
         setStatus('success');
       })
-      .catch(error => {
-        console.error('Error saving settings:', error);
+      .catch(() => {
         setStatus('error');
       })
       .finally(() => {
@@ -61,11 +67,20 @@ export default function Settings() {
                     type="password"
                     id="HF_TOKEN"
                     name="HF_TOKEN"
-                    value={settings.HF_TOKEN}
-                    onChange={handleChange}
+                    value={token}
+                    disabled={clearToken || status === 'saving'}
+                    onChange={e => setToken(e.target.value)}
+                    autoComplete="new-password"
                     className="w-full px-4 py-2 bg-gray-800 border border-gray-700 rounded-lg focus:ring-2 focus:ring-gray-600 focus:border-transparent"
-                    placeholder="Enter your Hugging Face token"
+                    placeholder={settings.HAS_HF_TOKEN ? 'Token saved. Enter a replacement if needed' : 'Enter your Hugging Face token'}
                   />
+                  {settings.HAS_HF_TOKEN && (
+                    <label className="mt-2 flex items-center gap-2 text-sm">
+                      <input type="checkbox" checked={clearToken} disabled={status === 'saving'}
+                        onChange={e => setClearToken(e.target.checked)} />
+                      Remove saved token
+                    </label>
+                  )}
                 </div>
 
                 <div>
@@ -134,7 +149,7 @@ export default function Settings() {
 
           <button
             type="submit"
-            disabled={status === 'saving'}
+            disabled={!isSettingsLoaded || status === 'saving'}
             className="w-full px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {status === 'saving' ? 'Saving...' : 'Save Settings'}

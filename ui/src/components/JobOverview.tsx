@@ -24,7 +24,6 @@ export default function JobOverview({ job }: JobOverviewProps) {
   const logRef = useRef<HTMLDivElement>(null);
   // Track whether we should auto-scroll to bottom
   const [isScrolledToBottom, setIsScrolledToBottom] = useState(true);
-  console.log('job.gpu_ids', job.gpu_ids);
   const { gpuList, isGPUInfoLoaded } = useGPUInfo(gpuIds, 5000);
   const { cpuInfo, isCPUInfoLoaded } = useCPUInfo(5000);
   const totalSteps = getTotalSteps(job);

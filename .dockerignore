@@ -1,0 +1,2 @@
+# The Dockerfile takes its source and manifests from the specified Git commit.
+**

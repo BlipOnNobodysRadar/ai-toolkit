@@ -38,10 +38,10 @@ class EmptyLogger:
 # Wandb logger class
 # This class logs the data to wandb
 class WandbLogger(EmptyLogger):
-    def __init__(self, project: str, run_name: str | None, config: OrderedDict) -> None:
+    def __init__(self, project: str, run_name: str | None, *, log_samples: bool = False) -> None:
         self.project = project
         self.run_name = run_name
-        self.config = config
+        self.log_samples = log_samples
 
     def start(self):
         try:
@@ -51,8 +51,11 @@ class WandbLogger(EmptyLogger):
                 "Failed to import wandb. Please install wandb by running `pip install wandb`"
             )
 
-        # send the whole config to wandb
-        run = wandb.init(project=self.project, name=self.run_name, config=self.config)
+        # Metrics opt-in does not authorize uploading local paths, code, stdout or job configuration.
+        settings = wandb.Settings(console="off", host="ai-toolkit", disable_git=True, disable_code=True,
+                                  _disable_meta=True, _disable_stats=True, _disable_machine_info=True,
+                                  _save_requirements=False)
+        run = wandb.init(project=self.project, name=self.run_name, settings=settings, save_code=False)
         self.run = run
         self._log = wandb.log  # log function
         self._image = wandb.Image  # image object
@@ -75,7 +78,8 @@ class WandbLogger(EmptyLogger):
         *args,
         **kwargs,
     ):
-        # create a wandb image object and log it
+        if not self.log_samples:
+            return
         image = self._image(image, caption=caption, *args, **kwargs)
         self._log({f"sample_{id}": image}, commit=False)
 
@@ -334,7 +338,7 @@ def create_logger(
     if logging_config.use_wandb:
         project_name = logging_config.project_name
         run_name = logging_config.run_name
-        return WandbLogger(project=project_name, run_name=run_name, config=all_config)
+        return WandbLogger(project=project_name, run_name=run_name, log_samples=logging_config.wandb_log_samples)
     elif logging_config.use_ui_logger:
         if save_root is None:
             raise ValueError("save_root must be provided when using UILogger")

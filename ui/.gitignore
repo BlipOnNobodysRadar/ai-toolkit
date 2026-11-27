@@ -15,6 +15,7 @@
 
 # next.js
 /.next/
+/public/monaco/
 /out/
 
 # production

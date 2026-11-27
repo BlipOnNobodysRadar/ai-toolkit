@@ -1,7 +1,7 @@
 'use client';
 import { useMemo } from 'react';
 import YAML from 'yaml';
-import Editor from '@monaco-editor/react';
+import Editor from '@/components/LocalMonacoEditor';
 
 import { Job } from '@prisma/client';
 

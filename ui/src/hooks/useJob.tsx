@@ -30,7 +30,7 @@ export default function useJob(jobID: string, reloadInterval: null | number = nu
       })
       .catch(error => {
         if (!owner.accept(ticket)) return;
-        console.error('Error fetching job:', error);
+        console.error('Error fetching job');
         setStatus('error');
       });
   };

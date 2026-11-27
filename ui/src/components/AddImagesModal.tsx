@@ -131,7 +131,7 @@ export default function AddImagesModal() {
         setDoneCount(prev => prev + 1);
         return 'done';
       } catch (err) {
-        console.error(`Upload failed for ${entry.file.name}:`, err);
+        console.error('File upload failed');
         setFileEntries(prev =>
           prev.map(e =>
             e.id === id

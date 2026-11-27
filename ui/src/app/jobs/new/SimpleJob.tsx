@@ -647,7 +647,6 @@ export default function SimpleJob({
                   label="Linear Rank"
                   value={jobConfig.config.process[0].network.linear}
                   onChange={value => {
-                    console.log('onChange', value);
                     setJobConfig(value, 'config.process[0].network.linear');
                     setJobConfig(value, 'config.process[0].network.linear_alpha');
                   }}
@@ -661,7 +660,6 @@ export default function SimpleJob({
                     label="Conv Rank"
                     value={jobConfig.config.process[0].network.conv}
                     onChange={value => {
-                      console.log('onChange', value);
                       setJobConfig(value, 'config.process[0].network.conv');
                       setJobConfig(value, 'config.process[0].network.conv_alpha');
                     }}
@@ -1995,7 +1993,7 @@ export default function SimpleJob({
                                   if (!isNaN(intValue)) {
                                     setJobConfig(intValue, `config.process[0].sample.samples[${i}].width`);
                                   } else {
-                                    console.warn('Invalid width value:', value);
+                                    console.warn('Invalid width value');
                                   }
                                 }
                               }}
@@ -2024,7 +2022,7 @@ export default function SimpleJob({
                                   if (!isNaN(intValue)) {
                                     setJobConfig(intValue, `config.process[0].sample.samples[${i}].height`);
                                   } else {
-                                    console.warn('Invalid height value:', value);
+                                    console.warn('Invalid height value');
                                   }
                                 }
                               }}
@@ -2053,7 +2051,7 @@ export default function SimpleJob({
                                   if (!isNaN(intValue)) {
                                     setJobConfig(intValue, `config.process[0].sample.samples[${i}].seed`);
                                   } else {
-                                    console.warn('Invalid seed value:', value);
+                                    console.warn('Invalid seed value');
                                   }
                                 }
                               }}

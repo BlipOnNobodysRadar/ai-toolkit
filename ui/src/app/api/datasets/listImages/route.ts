@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
 import { promisify } from 'util';
+import { pathWithinRoots } from '@/server/safePath';
 import { getDatasetsRoot } from '@/server/settings';
 
 const brotliCompress = promisify(zlib.brotliCompress);
@@ -17,7 +18,7 @@ export async function POST(request: Request) {
   }
   const datasetFolder = path.resolve(datasetsPath, datasetName);
   // Must resolve to a direct child of the datasets root; rejects "..", absolute paths, and the root itself.
-  if (path.dirname(datasetFolder) !== datasetsPath || datasetFolder === datasetsPath) {
+  if (path.dirname(datasetFolder) !== datasetsPath || !(await pathWithinRoots([datasetsPath], datasetFolder))) {
     return NextResponse.json({ error: 'Invalid dataset name' }, { status: 400 });
   }
 

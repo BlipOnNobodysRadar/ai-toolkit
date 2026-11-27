@@ -43,8 +43,8 @@ export const SampleImagesMenu = ({ job }: SampleImagesMenuProps) => {
       document.body.appendChild(a);
       a.click();
       a.remove();
-    } catch (err) {
-      console.error('Error downloading zip:', err);
+    } catch {
+      console.error('Error downloading zip');
     } finally {
       setIsZipping(false);
     }
@@ -153,7 +153,7 @@ export default function SampleImages({ job }: SampleImagesProps) {
             try {
               await apiClient.post('/api/img/delete', { imgPath });
             } catch (error) {
-              console.error('Error deleting sample:', imgPath, error);
+              console.error('Error deleting sample');
             }
             done++;
             setDeleteProgress({ done, total: paths.length });

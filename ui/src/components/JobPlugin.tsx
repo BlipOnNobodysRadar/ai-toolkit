@@ -22,7 +22,7 @@ export default function JobPlugin({ job }: JobPluginProps) {
         setStatus('success');
       })
       .catch(error => {
-        console.error('Error fetching plugin:', error);
+        console.error('Error fetching plugin');
         setStatus('error');
       });
   }, [job.id]);

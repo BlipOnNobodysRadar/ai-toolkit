@@ -1,7 +1,7 @@
 // ErrorBoundary.tsx
 'use client';
 
-import React, { ReactNode, ErrorInfo, Component } from 'react';
+import React, { ReactNode, Component } from 'react';
 
 interface ErrorBoundaryProps {
   children: ReactNode;
@@ -21,11 +21,6 @@ class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
   static getDerivedStateFromError(_: Error): ErrorBoundaryState {
     // Update state so the next render will show the fallback UI
     return { hasError: true };
-  }
-
-  componentDidCatch(error: Error, errorInfo: ErrorInfo): void {
-    // You can log the error to an error reporting service
-    console.error("Error caught by ErrorBoundary:", error, errorInfo);
   }
 
   render(): ReactNode {

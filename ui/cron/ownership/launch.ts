@@ -13,6 +13,7 @@
 // code waits for the relay's real exit, however long it takes.
 import { ChildProcess, spawn } from 'child_process';
 import fs from 'fs';
+import { randomUUID } from 'crypto';
 import path from 'path';
 import type { Job } from '@prisma/client';
 import { AdmittedJob, Db, attachRun, markRelayExited, markSpawnRequested, noteOwnership, recordRelay, releaseRun } from './store';
@@ -120,20 +121,25 @@ export const knownMembers = (job: Job): string[] => {
 };
 
 const writeAtomic = (file: string, text: string) => {
-  const tmp = `${file}.${process.pid}.tmp`;
-  const fd = fs.openSync(tmp, 'w');
+  const tmp = `${file}.${randomUUID()}.tmp`;
+  const fd = fs.openSync(tmp, 'wx', 0o600);
   try {
-    fs.writeSync(fd, text);
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
+    try {
+      fs.writeFileSync(fd, text);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    fs.rmSync(tmp, { force: true });
+    throw error;
   }
-  fs.renameSync(tmp, file);
 };
 
 const appendLog = (logPath: string, message: string) => {
   try {
-    fs.appendFileSync(logPath, message);
+    fs.appendFileSync(logPath, message, { mode: 0o600 });
   } catch (e) {
     console.error('Error writing to job log:', e);
   }
@@ -183,7 +189,7 @@ export const launchRun = async (ctx: LaunchContext, job: AdmittedJob): Promise<L
       if (!resuming) fs.mkdirSync(folder, { recursive: true });
       rotateLog(folder, files.log);
       writeAtomic(files.config, JSON.stringify(jobConfig, null, 2));
-      logFd = fs.openSync(files.log, 'a');
+      logFd = fs.openSync(files.log, 'a', 0o600);
       return true;
     });
     if (!prepared) return { result: 'cancelled' };

@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import type { PrismaClient } from '@prisma/client';
+import { pathWithinRoots } from '../safePath';
 import { jobOutputFolder } from './resources';
 
 type OutputJob = Parameters<typeof jobOutputFolder>[1];
@@ -26,8 +27,20 @@ export const regularJobPath = async (folder: string, candidate: string): Promise
 export const jobArtifactPath = async (trainingRoot: string, job: OutputJob, ...parts: string[]) => {
   const folder = jobOutputFolder(trainingRoot, job);
   const target = path.join(folder, ...parts);
-  if (path.relative(path.resolve(trainingRoot, job.name), folder) && !(await regularJobPath(folder, target))) {
-    throw new Error('The historical output path points outside the saved job directory.');
+  const historical = path.relative(path.resolve(trainingRoot, job.name), folder) !== '';
+  const allowed = historical ? await regularJobPath(folder, target) : await pathWithinRoots([trainingRoot], target);
+  if (!allowed) {
+    // A newly configured root can be absent before the first launch. Let readers return their
+    // normal empty results for a missing run, but never accept a dangling root symlink.
+    if (!historical) {
+      try {
+        await fs.promises.lstat(trainingRoot);
+      } catch (error: any) {
+        if (error.code === 'ENOENT') return target;
+        throw error;
+      }
+    }
+    throw new Error('The output path is outside the job storage.');
   }
   return target;
 };

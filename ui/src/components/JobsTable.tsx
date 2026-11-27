@@ -90,7 +90,7 @@ export default function JobsTable({ onlyActive = false, job_type = null }: JobsT
               return next;
             });
           } catch (e) {
-            console.error('Error deleting job:', job.name, e);
+            console.error('Error deleting job');
             refused.push(`${job.name}: ${actionError(e)}`);
           }
           setDeleteProgress({ done: i + 1, total: deletable.length });

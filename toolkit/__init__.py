@@ -1,5 +1,11 @@
 import importlib
 import logging
+import os
+
+# Hub reads these settings at import time, including during progress-bar setup below.
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["DISABLE_TELEMETRY"] = "YES"
+os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
 
 
 def force_hf_hub_progress_bars():

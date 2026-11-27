@@ -6,8 +6,8 @@ config:
     - type: 'textual_inversion_trainer'
       training_folder: "out/TI"
       device: cuda:0
-      # for tensorboard logging
-      log_dir: "out/.tensorboard"
+      # Uncomment to write local TensorBoard logs for this run.
+      # log_dir: "output/.tensorboard"
       embedding:
         trigger: "your_trigger_here"
         tokens: 12

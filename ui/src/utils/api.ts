@@ -8,7 +8,7 @@ export const apiClient = axios.create();
 // Add a request interceptor to add token from localStorage
 apiClient.interceptors.request.use(config => {
   const token = localStorage.getItem('AI_TOOLKIT_AUTH');
-  if (token) {
+  if (token && new URL(apiClient.getUri(config), window.location.href).origin === window.location.origin) {
     config.headers['Authorization'] = `Bearer ${token}`;
   }
   return config;

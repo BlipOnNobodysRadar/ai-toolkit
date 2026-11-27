@@ -571,8 +571,8 @@ export default function JobLossGraph({ job }: Props) {
           isZoomedRef.current = false;
           setIsZoomed(false);
           handleResetZoom();
-        } catch (e) {
-          console.error('Error deleting loss range:', e);
+        } catch {
+          console.error('Error deleting loss range');
         } finally {
           setDeleting(false);
         }

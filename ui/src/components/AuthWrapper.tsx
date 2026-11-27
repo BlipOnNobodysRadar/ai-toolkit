@@ -50,7 +50,7 @@ export default function AuthWrapper({ authRequired, children }: AuthWrapperProps
     try {
       const response = await apiClient.get('/api/auth');
       if (response.data.isAuthenticated) applyReadKey(response.data);
-    } catch (err) {
+    } catch {
       // server unreachable; a 401 is already handled by the apiClient interceptor
       scheduleReadKeyRefresh(30);
     }
@@ -112,9 +112,8 @@ export default function AuthWrapper({ authRequired, children }: AuthWrapperProps
         setIsAuthorized(false);
         setError('Invalid token. Please try again.');
       }
-    } catch (err) {
+    } catch {
       setIsAuthorized(false);
-      console.log(err);
       setError('Invalid token. Please try again.');
     }
     setIsLoading(false);

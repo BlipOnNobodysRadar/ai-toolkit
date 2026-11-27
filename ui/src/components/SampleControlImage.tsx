@@ -72,8 +72,8 @@ export default function SampleControlImage({
 
         const uploaded = resp?.data?.files?.[0] ?? null;
         onNewImageSelected(uploaded);
-      } catch (err) {
-        console.error('Upload failed:', err);
+      } catch {
+        console.error('Upload failed');
         setLocalPreview(null);
       } finally {
         setIsUploading(false);
@@ -95,7 +95,6 @@ export default function SampleControlImage({
 
   const clearImage = useCallback(
     (e?: React.MouseEvent) => {
-      console.log('clearImage');
       if (e) {
         e.stopPropagation();
         e.preventDefault();

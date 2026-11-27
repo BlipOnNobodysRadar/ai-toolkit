@@ -71,7 +71,7 @@ export default function SampleImageViewer({
         filename = imgPath.split('/').pop() || null;
       }
       if (!filename) {
-        console.error('Filename could not be determined from imgPath:', imgPath);
+        console.error('Filename could not be determined from imgPath');
         return ii;
       }
       ii.filename = filename;
@@ -83,7 +83,7 @@ export default function SampleImageViewer({
         ii.step = parseInt(parts[1]);
         ii.promptIdx = parseInt(parts[2]);
       } else {
-        console.error('Unexpected filename format for sample image:', filename);
+        console.error('Unexpected filename format for sample image');
       }
     }
     return ii;
@@ -142,14 +142,13 @@ export default function SampleImageViewer({
         apiClient
           .post('/api/img/delete', { imgPath: imgPath })
           .then(() => {
-            console.log('Image deleted:', imgPath);
             onChange(null);
             if (refreshSampleImages) {
               refreshSampleImages();
             }
           })
           .catch(error => {
-            console.error('Error deleting image:', error);
+            console.error('Error deleting image');
           });
       },
     });
@@ -214,7 +213,7 @@ export default function SampleImageViewer({
       .then(r => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then(setSampleText)
       .catch(err => {
-        if (err?.name !== 'AbortError') console.error('Sample text fetch failed:', err);
+        if (err?.name !== 'AbortError') console.error('Sample text fetch failed');
       });
     return () => controller.abort();
   }, [displayedImgPath, readKey]);

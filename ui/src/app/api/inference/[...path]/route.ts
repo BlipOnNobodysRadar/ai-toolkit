@@ -78,9 +78,11 @@ async function proxy(request: NextRequest, segments: string[]) {
   const url = `http://${engine.endpoint.host}:${engine.endpoint.port}/${upstreamPath}${qs ? `?${qs}` : ''}`;
 
   const headers = new Headers();
-  request.headers.forEach((value, key) => {
-    if (!HOP_BY_HOP.has(key.toLowerCase())) headers.set(key, value);
-  });
+  // The engine has its own credential. Only forward headers used to negotiate the payload.
+  for (const key of ['accept', 'content-type', 'range', 'if-range']) {
+    const value = request.headers.get(key);
+    if (value) headers.set(key, value);
+  }
   headers.set('x-engine-token', engine.endpoint.token);
 
   const method = request.method.toUpperCase();
@@ -100,7 +102,7 @@ async function proxy(request: NextRequest, segments: string[]) {
 
   const responseHeaders = new Headers();
   upstream.headers.forEach((value, key) => {
-    if (!HOP_BY_HOP.has(key.toLowerCase())) responseHeaders.set(key, value);
+    if (key.toLowerCase() !== 'set-cookie' && !HOP_BY_HOP.has(key.toLowerCase())) responseHeaders.set(key, value);
   });
   responseHeaders.set('Cache-Control', 'no-store');
   // keep intermediaries from buffering the frame stream

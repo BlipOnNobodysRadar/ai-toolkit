@@ -56,7 +56,7 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
         setLoaded(true);
       })
       .catch(err => {
-        if (err?.name !== 'AbortError') console.error('Sample text fetch failed:', err);
+        if (err?.name !== 'AbortError') console.error('Sample text fetch failed');
       });
     return () => {
       controller.abort();
@@ -126,7 +126,7 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
           setLoaded(true);
         })
         .catch(err => {
-          if (err?.name !== 'AbortError') console.error('Sample image fetch failed:', err);
+          if (err?.name !== 'AbortError') console.error('Sample image fetch failed');
         });
     }, 80);
 

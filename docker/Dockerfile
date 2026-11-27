@@ -1,3 +1,10 @@
+# syntax=docker/dockerfile:1
+# Build only the committed fork. Datasets, local settings and credentials in the
+# host checkout are never part of the source copied into an image.
+FROM scratch AS source
+ARG GIT_COMMIT=main
+ADD https://github.com/BlipOnNobodysRadar/ai-toolkit.git#${GIT_COMMIT} /src/
+
 # runtime (not devel) is enough: torch/flash-attn/natten are all prebuilt
 # wheels that bundle their CUDA libs, and triton JITs with its own ptxas.
 # Host requirement: NVIDIA driver >= 580 (CUDA 13) to run the cu130 wheels.
@@ -7,6 +14,7 @@ LABEL authors="jaret"
 
 # Set noninteractive to avoid timezone prompts
 ENV DEBIAN_FRONTEND=noninteractive
+ENV CHECKPOINT_DISABLE=1 NEXT_TELEMETRY_DISABLED=1
 
 # ref https://en.wikipedia.org/wiki/CUDA
 ENV TORCH_CUDA_ARCH_LIST="8.0 8.6 8.9 9.0 10.0 12.0"
@@ -32,8 +40,8 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     openssh-client \
     openssh-server \
     openssl \
-    rsync \
     unzip \
+    && rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -58,13 +66,13 @@ RUN pip install --no-cache-dir torch==2.13.0 torchvision==0.28.0 torchaudio==2.1
 WORKDIR /app/ai-toolkit
 
 # ---------------------------------------------------------------------------- #
-# Dependency layers come BEFORE the source clone so they are only rebuilt (and
+# Dependency layers come BEFORE the application source so they are only rebuilt (and
 # only need to be re-pulled by servers) when the dependency manifests change,
 # not on every code change.
 # ---------------------------------------------------------------------------- #
 
 # Install Python dependencies (only re-runs when the requirements files change)
-COPY requirements.txt requirements_base.txt /app/ai-toolkit/
+COPY --from=source /src/requirements.txt /src/requirements_base.txt /app/ai-toolkit/
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt && \
     pip install setuptools==69.5.1 --no-cache-dir --break-system-packages
 
@@ -85,28 +93,10 @@ RUN pip install --no-cache-dir --break-system-packages flash-linear-attention==0
     python -c "import fla, transformers; print('fla OK:', fla.__version__, 'transformers', transformers.__version__)"
 
 # Install Node dependencies (only re-runs when package.json / package-lock.json change)
-COPY ui/package.json ui/package-lock.json /app/ai-toolkit/ui/
-RUN cd /app/ai-toolkit/ui && npm ci
+COPY --from=source /src/ui/package.json /src/ui/package-lock.json /app/ai-toolkit/ui/
+RUN cd /app/ai-toolkit/ui && npm ci --no-audit
 
-# ---------------------------------------------------------------------------- #
-# Source code comes LAST. Only this layer (plus the UI build below) is rebuilt
-# on a code change, so servers only re-pull the (small) source, not the deps.
-# Clone to a temp dir and rsync the source in, preserving the dependency dirs
-# already populated above (ui/node_modules) and the manifests already used.
-# ---------------------------------------------------------------------------- #
-ARG CACHEBUST=1234
-ARG GIT_COMMIT=main
-RUN echo "Cache bust: ${CACHEBUST}" && \
-    git clone https://github.com/ostris/ai-toolkit.git /tmp/ai-toolkit-src && \
-    cd /tmp/ai-toolkit-src && \
-    git checkout ${GIT_COMMIT} && \
-    rsync -a --delete \
-        --exclude 'ui/node_modules' \
-        --exclude 'requirements.txt' \
-        --exclude 'ui/package.json' \
-        --exclude 'ui/package-lock.json' \
-        /tmp/ai-toolkit-src/ /app/ai-toolkit/ && \
-    rm -rf /tmp/ai-toolkit-src
+COPY --from=source /src/ /app/ai-toolkit/
 
 # Build UI (re-runs on code change, but reuses the cached node_modules above).
 # update_db runs first because it does `prisma generate`, which creates the
@@ -122,7 +112,7 @@ EXPOSE 8675
 
 WORKDIR /
 
-COPY docker/start.sh /start.sh
+COPY --from=source /src/docker/start.sh /start.sh
 RUN chmod +x /start.sh
 
 CMD ["/start.sh"]

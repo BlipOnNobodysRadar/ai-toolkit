@@ -58,7 +58,7 @@ export default function useJobLog(jobID: string, reloadInterval: null | number =
       })
       .catch(error => {
         if (!owner.accept(ticket)) return;
-        console.error('Error fetching log:', error);
+        console.error('Error fetching log');
         setStatus('error');
       })
       .finally(() => {

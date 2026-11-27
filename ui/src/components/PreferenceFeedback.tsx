@@ -122,7 +122,7 @@ function AuthenticatedPreferenceImage({
       })
       .catch(error => {
         if (error?.code === 'ERR_CANCELED' || controller.signal.aborted) return;
-        console.error('Could not load preference image:', error);
+        console.error('Could not load preference image');
         setFailed(true);
       });
     return () => {
@@ -185,7 +185,7 @@ export default function PreferenceFeedback({ job }: { job: Job }) {
         })
         .catch(error => {
           if (!owner.accept(ticket)) return;
-          console.error('Error fetching preference feedback:', error);
+          console.error('Error fetching preference feedback');
           setStatus('error');
         });
     },

@@ -77,15 +77,15 @@ function JobEditor({ runId, cloneId }: { runId: string | null; cloneId: string |
           parsed.config.process[0].training_folder = settings.TRAINING_FOLDER;
           parsed.config.process[0].device = 'cuda';
           parsed.config.process[0].performance_log_every = 10;
-        } catch (err) {
-          console.warn('Could not set required fields on imported config:', err);
+        } catch {
+          console.warn('Could not set required fields on imported config');
         }
 
         migrateJobConfig(parsed);
         setJobConfig(parsed);
         if (parsed.config?.process?.[0]?.train?.training_extras || parsed.config?.process?.[0]?.train?.validation_config?.datasets?.length) setShowAdvancedView(true);
-      } catch (err) {
-        console.error('Failed to parse config file:', err);
+      } catch {
+        console.error('Failed to parse config file');
         alert('Failed to parse config file. Please check the file format.');
       }
     };
@@ -172,7 +172,6 @@ function JobEditor({ runId, cloneId }: { runId: string | null; cloneId: string |
       })
       .catch(error => {
         alert(actionError(error));
-        console.log('Error saving training:', error);
       })
       .finally(() =>
         setTimeout(() => {
@@ -310,8 +309,8 @@ function JobEditor({ runId, cloneId }: { runId: string | null; cloneId: string |
                 parsed.config.process[0].training_folder = settings.TRAINING_FOLDER;
                 parsed.config.process[0].device = 'cuda';
                 parsed.config.process[0].performance_log_every = 10;
-              } catch (e) {
-                console.warn(e);
+              } catch {
+                console.warn('Could not apply the job configuration');
               }
               return migrateJobConfig(parsed);
             }}

@@ -43,7 +43,6 @@ export default function useJobsList({
       .then(data => {
         if (!owner.accept(ticket)) return;
         if (data.error) {
-          console.log('Error fetching jobs:', data.error);
           setStatus('error');
         } else {
           setJobs(data.jobs);
@@ -52,7 +51,7 @@ export default function useJobsList({
       })
       .catch(error => {
         if (!owner.accept(ticket)) return;
-        console.error('Error fetching jobs:', error);
+        console.error('Error fetching jobs');
         setStatus('error');
       });
   };

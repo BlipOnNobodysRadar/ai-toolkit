@@ -8,6 +8,7 @@ import torch
 import torchaudio
 
 from toolkit.audio.album_artwork import add_album_artwork
+from toolkit.config import config_flag
 from toolkit.prompt_utils import PromptEmbeds
 from torchao.quantization.quant_primitives import _DTYPE_TO_BIT_WIDTH
 
@@ -29,16 +30,18 @@ class SaveConfig:
         self.save_format: SaveFormat = kwargs.get('save_format', 'safetensors')
         if self.save_format not in ['safetensors', 'diffusers']:
             raise ValueError(f"save_format must be safetensors or diffusers, got {self.save_format}")
-        self.push_to_hub: bool = kwargs.get("push_to_hub", False)
+        self.push_to_hub: bool = config_flag(kwargs.get('push_to_hub'))
         self.hf_repo_id: Optional[str] = kwargs.get("hf_repo_id", None)
-        self.hf_private: Optional[str] = kwargs.get("hf_private", False)
+        self.hf_upload_samples: bool = config_flag(kwargs.get('hf_upload_samples'))
+        self.hf_private: bool = config_flag(kwargs.get('hf_private'), default=True)
 
 class LoggingConfig:
     def __init__(self, **kwargs):
         self.log_every: int = kwargs.get('log_every', 100)
         self.verbose: bool = kwargs.get('verbose', False)
-        self.use_wandb: bool = kwargs.get('use_wandb', False)
-        self.use_ui_logger: bool = kwargs.get('use_ui_logger', False)
+        self.use_wandb: bool = config_flag(kwargs.get('use_wandb'))
+        self.wandb_log_samples: bool = config_flag(kwargs.get('wandb_log_samples'))
+        self.use_ui_logger: bool = config_flag(kwargs.get('use_ui_logger'))
         self.project_name: str = kwargs.get('project_name', 'ai-toolkit')
         self.run_name: str = kwargs.get('run_name', None)
 

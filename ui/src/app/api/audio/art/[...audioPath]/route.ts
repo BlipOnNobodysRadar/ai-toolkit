@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { historicalArtifactFolder, regularJobPath } from '../../../../../../cron/ownership/jobArtifacts';
 import prisma from '@/server/prisma';
 import fs from 'fs';
+import { mediaPathWithinRoots } from '@/server/safePath';
 import path from 'path';
 import { getDatasetsRoot, getTrainingFolder, getDataRoot } from '@/server/settings';
 import { catchAllToFilePath } from '@/server/catchAllPath';
@@ -143,7 +144,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     // Resolve so `..` segments collapse, then verify still under an allowed root.
     // Substring `.includes('..')` false-positives on filenames containing `..` as text.
     const resolved = path.resolve(filepath);
-    const isAllowed = allowedDirs.some(d => resolved === d || resolved.startsWith(d + path.sep));
+    const isAllowed = await mediaPathWithinRoots(allowedDirs, resolved, trainingRoot);
     const historicalFolder = isAllowed ? null : await historicalArtifactFolder(prisma, trainingRoot, resolved);
     if (!isAllowed && !historicalFolder) {
       return new NextResponse('Access denied', { status: 403 });
@@ -157,7 +158,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     // pre-generated thumb (written by the sampler, or by a previous call here)
     // so the tags are read at most once per file
     const thumbPath = path.join(path.dirname(resolved), '.thumbs', path.basename(resolved) + '.jpg');
-    const thumbAllowed = !historicalFolder || await regularJobPath(historicalFolder, thumbPath);
+    const thumbAllowed = historicalFolder ? await regularJobPath(historicalFolder, thumbPath) : await mediaPathWithinRoots(allowedDirs, thumbPath, trainingRoot);
     const thumbStat = await fs.promises.stat(thumbPath).catch(() => null);
     if (thumbAllowed && thumbStat?.isFile()) {
       const data = await fs.promises.readFile(thumbPath);
@@ -165,7 +166,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         headers: {
           'Content-Type': 'image/jpeg',
           'Content-Length': String(data.length),
-          'Cache-Control': 'public, max-age=604800, immutable',
+          'Cache-Control': 'private, max-age=604800, immutable',
         },
       });
     }
@@ -206,7 +207,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         headers: {
           'Content-Type': art.mime,
           'Content-Length': String(art.data.length),
-          'Cache-Control': 'public, max-age=604800, immutable',
+          'Cache-Control': 'private, max-age=604800, immutable',
         },
       });
     } finally {

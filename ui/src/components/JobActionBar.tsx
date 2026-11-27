@@ -59,7 +59,7 @@ export default function JobActionBar({
     try {
       await fn();
     } catch (e) {
-      console.error(`Error running job action "${action}":`, e);
+      console.error(`Job action ${action} failed`);
       alert(actionError(e));
     } finally {
       inFlight.current = false;

@@ -35,7 +35,7 @@ export default function useJobByRef(jobRef: string | null, reloadInterval: null 
       })
       .catch(error => {
         if (!owner.accept(ticket)) return;
-        console.error('Error fetching job:', error);
+        console.error('Error fetching job');
         setStatus('error');
       });
   };

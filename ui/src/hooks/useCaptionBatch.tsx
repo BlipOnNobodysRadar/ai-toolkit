@@ -148,7 +148,7 @@ export default function useCaptionBatch(imgPath: string | null, refreshKey: numb
       })
       .catch(err => {
         if (err?.name === 'AbortError' || cancelled) return;
-        console.error('Error fetching caption:', err);
+        console.error('Error fetching caption');
         setIsLoaded(true);
       });
 

@@ -4,6 +4,7 @@ import json
 import random
 import shutil
 from collections import OrderedDict
+from pathlib import Path
 import os
 import re
 import traceback
@@ -20,7 +21,8 @@ from safetensors.torch import save_file, load_file
 from torch.utils.data import DataLoader
 import torch
 import torch.backends.cuda
-from huggingface_hub import HfApi, interpreter_login
+from huggingface_hub import CommitOperationAdd, HfApi, interpreter_login
+from toolkit import hub_publish
 from toolkit.memory_management import MemoryManager
 
 from toolkit.basic import value_map
@@ -1048,6 +1050,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if not self.accelerator.is_main_process:
             return
         from training_extras import rawr_pair
+        # Identify exactly what the final writer produces, including model extensions that save a
+        # directory at a .safetensors path. Prior exports sharing the job name stay local.
+        publishing = step is None and getattr(getattr(self, 'save_config', None), 'push_to_hub', False)
+        if publishing:
+            self._hub_files = {}
+            kinds = self._save_artifact_kinds()
+            before = hub_publish.file_state(self.save_root, kinds, self.sd.arch)
         # first, as before: a refused save mode must not touch anything
         rawr_pair_save = rawr_pair.begin(self)
         # the EMA weights are installed only while saving, also when the save fails (docs/STATE_MACHINES.md, P-04)
@@ -1063,6 +1072,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             sampling_state.settle(give_back, primary, 'the raw weights after saving EMA weights')
             raise
         sampling_state.settle(give_back)
+        if publishing:
+            after = hub_publish.file_state(self.save_root, kinds, self.sd.arch)
+            self._hub_files = {name: stamp for name, stamp in after.items() if before.get(name) != stamp}
         flush()
 
     def _save_checkpoint(self, step, rawr_pair_save):
@@ -3757,39 +3769,43 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # after done_hook, so UI status/async work has finished with the job's objects
         self.release_accelerator_state()
 
-    def push_to_hub(
-    self,
-    repo_id: str,
-    private: bool = False,
-    ):  
+    def push_to_hub(self, repo_id: str, private: bool = True):
         if not self.accelerator.is_main_process:
             return
-        readme_content = self._generate_readme(repo_id)
-        readme_path = os.path.join(self.save_root, "README.md")
-        with open(readme_path, "w", encoding="utf-8") as f:
-            f.write(readme_content)
-        
+        saved = getattr(self, '_hub_files', {})
+        now = hub_publish.file_state(self.save_root, self._save_artifact_kinds(), self.sd.arch)
+        if not saved or any(now.get(name) != stamp for name, stamp in saved.items()):
+            raise ValueError("No intact final export from this save was found to publish.")
+        files = {name: hub_publish.publish_payload(Path(self.save_root) / name, self.sd.arch) for name in saved}
+        widgets = self._hub_widgets() if self.save_config.hf_upload_samples else []
+        for widget in widgets:
+            relative = widget["output"]["url"]
+            files[relative] = os.path.join(self.save_root, relative)
+        operations = [CommitOperationAdd(path_in_repo=path, path_or_fileobj=local) for path, local in files.items()]
+        operations.append(CommitOperationAdd(path_in_repo="README.md",
+                                             path_or_fileobj=self._generate_readme(repo_id, widgets).encode("utf-8")))
         api = HfApi()
+        api.create_repo(repo_id, private=private, exist_ok=True)
+        if private and not api.repo_info(repo_id).private:
+            raise ValueError("The destination repo is public. Choose a private repo or set save.hf_private to false to publish publicly.")
+        api.create_commit(repo_id=repo_id, repo_type="model", operations=operations, commit_message="Upload trained model")
 
-        api.create_repo(
-            repo_id,
-            private=private,
-            exist_ok=True
-        )
+    def _hub_widgets(self):
+        samples = os.path.join(self.save_root, "samples")
+        if os.path.islink(samples) or not os.path.isdir(samples):
+            return []
+        final = {}
+        for filename in sorted(os.listdir(samples)):
+            match = re.fullmatch(r"\d+__(\d+)_(\d+)\.(?:jpg|png|webp)", filename)
+            path = os.path.join(samples, filename)
+            if match and int(match[1]) == self.train_config.steps and not os.path.islink(path) and os.path.isfile(path):
+                final[int(match[2])] = f"samples/{filename}"
+        return [{"text": prompt, "output": {"url": final[i]}}
+                for i, prompt in enumerate(self.sample_config.prompts) if i in final]
 
-        api.upload_folder(
-            repo_id=repo_id,
-            folder_path=self.save_root,
-            ignore_patterns=["*.yaml", "*.pt"],
-            repo_type="model",
-        )
-
-
-    def _generate_readme(self, repo_id: str) -> str:
-        """Generates the content of the README.md file."""
-
-        # Gather model info
-        base_model = self.model_config.name_or_path
+    def _generate_readme(self, repo_id: str, widgets) -> str:
+        """Generate a model card without disclosing a local path or private sample prompts."""
+        base_model = hub_publish.repo_reference(self.model_config.name_or_path)
         instance_prompt = self.trigger_word if hasattr(self, "trigger_word") else None
         if base_model == "black-forest-labs/FLUX.1-schnell":
             license = "apache-2.0"
@@ -3820,45 +3836,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 ]
             )
 
-        # Generate the widget section
-        widgets = []
-        sample_image_paths = []
-        samples_dir = os.path.join(self.save_root, "samples")
-        if os.path.isdir(samples_dir):
-            for filename in os.listdir(samples_dir):
-                #The filenames are structured as 1724085406830__00000500_0.jpg
-                #So here we capture the 2nd part (steps) and 3rd (index the matches the prompt)
-                match = re.search(r"__(\d+)_(\d+)\.jpg$", filename)
-                if match:
-                    steps, index = int(match.group(1)), int(match.group(2))
-                    #Here we only care about uploading the latest samples, the match with the # of steps
-                    if steps == self.train_config.steps:
-                        sample_image_paths.append((index, f"samples/{filename}"))
-
-            # Sort by numeric index
-            sample_image_paths.sort(key=lambda x: x[0])
-
-            # Create widgets matching prompt with the index 
-            for i, prompt in enumerate(self.sample_config.prompts):
-                if i < len(sample_image_paths):
-                    # Associate prompts with sample image paths based on the extracted index
-                    _, image_path = sample_image_paths[i]
-                    widgets.append(
-                        {
-                            "text": prompt,
-                            "output": {
-                                "url": image_path
-                            },
-                        }
-                    )
         dtype = "torch.bfloat16" if self.model_config.is_flux else "torch.float16"
         # Construct the README content
         readme_content = f"""---
 tags:
 {yaml.dump(tags, indent=4).strip()}
-{"widget:" if os.path.isdir(samples_dir) else ""}
+{"widget:" if widgets else ""}
 {yaml.dump(widgets, indent=4).strip() if widgets else ""}
-base_model: {base_model}
+{"base_model: " + base_model if base_model else ""}
 {"instance_prompt: " + instance_prompt if instance_prompt else ""}
 license: {license}
 {'license_name: ' + license_name if license == "other" else ""}
@@ -3885,9 +3870,9 @@ Weights for this model are available in Safetensors format.
 from diffusers import AutoPipelineForText2Image
 import torch
 
-pipeline = AutoPipelineForText2Image.from_pretrained('{base_model}', torch_dtype={dtype}).to('cuda')
+pipeline = AutoPipelineForText2Image.from_pretrained('{base_model or 'path/to/base-model'}', torch_dtype={dtype}).to('cuda')
 pipeline.load_lora_weights('{repo_id}', weight_name='{self.job.name}.safetensors')
-image = pipeline('{instance_prompt if not widgets else self.sample_config.prompts[0]}').images[0]
+image = pipeline({(widgets[0]['text'] if widgets else (instance_prompt or 'Your prompt'))!r}).images[0]
 image.save("my_image.png")
 ```
 

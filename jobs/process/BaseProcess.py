@@ -1,5 +1,4 @@
 import copy
-import json
 from collections import OrderedDict
 
 from toolkit.timer import Timer
@@ -23,8 +22,6 @@ class BaseProcess(object):
         self.timer: Timer = Timer(f'{self.name} Timer')
         self.performance_log_every = self.get_conf('performance_log_every', 0)
 
-        print(json.dumps(self.config, indent=4))
-        
     def ui_process_status(self, status, info):
         processes = getattr(getattr(self, 'job', None), 'config', {}).get('process', [])
         if len(processes) > 1:

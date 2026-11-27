@@ -1,6 +1,7 @@
 import os
 import requests
 import tqdm
+from urllib.parse import urlsplit
 from typing import List, Optional, TYPE_CHECKING
 
 
@@ -48,6 +49,9 @@ def get_pexels_images(config: 'DatasetSyncCollectionConfig') -> List[Photo]:
     next_page = f"https://api.pexels.com/v1/collections/{config.collection_id}?page=1&per_page=80&type=photos"
 
     while True:
+        page = urlsplit(next_page)
+        if page.scheme != "https" or page.netloc.lower() not in {"api.pexels.com", "api.pexels.com:443"}:
+            raise ValueError("Pexels returned a pagination link outside its API.")
         response = requests.get(next_page, headers={
             "Authorization": f"{config.api_key}"
         })

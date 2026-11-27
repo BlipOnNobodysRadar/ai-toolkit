@@ -41,6 +41,8 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     headers: {
       'Content-Type': 'text/html; charset=utf-8',
       'Cache-Control': 'no-store',
+      'Content-Security-Policy': 'sandbox allow-scripts',
+      'Referrer-Policy': 'no-referrer',
     },
   });
 }

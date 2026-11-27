@@ -33,6 +33,7 @@ import { pipeline } from 'stream';
 import { randomBytes } from 'crypto';
 import { loadEnvConfig, resetEnv } from '@next/env';
 import prisma from './prisma';
+import { mediaPathWithinRoots } from './safePath';
 import { defaultDatasetsFolder, defaultTrainFolder, defaultDataRoot, TOOLKIT_ROOT } from './paths';
 import { historicalArtifactFolder, regularJobPath } from './ownership/jobArtifacts';
 import { isReadAuthorized } from './readKey';
@@ -40,7 +41,7 @@ import { isReadAuthorized } from './readKey';
 const isDev = process.argv.includes('dev');
 
 // these can live in the .env files Next.js loads; pick them up the same way so both processes agree
-const SHARED_ENV_KEYS = ['AI_TOOLKIT_AUTH', 'AI_TOOLKIT_READ_SECRET', 'AI_TOOLKIT_DISABLE_READ_PROTECTION'];
+const SHARED_ENV_KEYS = ['AI_TOOLKIT_HOST', 'AI_TOOLKIT_AUTH', 'AI_TOOLKIT_READ_SECRET', 'AI_TOOLKIT_DISABLE_READ_PROTECTION'];
 {
   // parsedEnv only holds keys the real environment does not already define
   const { parsedEnv } = loadEnvConfig(process.cwd(), isDev, { info: () => { }, error: console.error });
@@ -200,7 +201,7 @@ async function generateThumb(sourcePath: string, thumbBase: string): Promise<str
   // Write to a per-process tmp name, then atomically rename into place (same
   // as the Python generator) so a concurrent request never reads a partial
   // thumb. The suffix is required for ffmpeg's output format detection.
-  const tmpPath = `${thumbPath}.${process.pid}.tmp${hasAlpha ? '.png' : '.jpg'}`;
+  const tmpPath = `${thumbPath}.${randomBytes(12).toString('hex')}.tmp${hasAlpha ? '.png' : '.jpg'}`;
   try {
     if (isImage) {
       // sharp opens animated formats on the first frame by default
@@ -240,8 +241,8 @@ function ensureThumb(sourcePath: string, thumbBase: string, sourceMtimeMs: numbe
   let pending = inFlightThumbs.get(thumbBase);
   if (!pending) {
     pending = withThumbGenSlot(() => generateThumb(sourcePath, thumbBase))
-      .catch(err => {
-        console.warn(`Failed to generate thumbnail for ${sourcePath}: ${err?.message || err}`);
+      .catch(() => {
+        console.warn('Failed to generate thumbnail');
         return null;
       })
       .then(written => {
@@ -305,24 +306,17 @@ async function serveFile(req: http.IncomingMessage, res: http.ServerResponse, pr
       .join('/');
 
     let resolvedFilePath = path.resolve(decodedFilePath);
-    const checkAllowed = (roots: Roots) => {
-      const dirs = isImg ? [roots.datasets, roots.training, roots.data] : [roots.datasets, roots.training];
-      return {
-        dirs,
-        allowed: dirs.some(
-          allowedDir => resolvedFilePath === allowedDir || resolvedFilePath.startsWith(allowedDir + path.sep),
-        ),
-      };
-    };
-    let { dirs: allowedDirs, allowed: isAllowed } = checkAllowed(await getRoots());
+    const allowedDirsFor = (roots: Roots) => isImg ? [roots.datasets, roots.training, roots.data] : [roots.datasets, roots.training];
+    let roots = await getRoots();
+    let allowedDirs = allowedDirsFor(roots);
+    let isAllowed = await mediaPathWithinRoots(allowedDirs, resolvedFilePath, roots.training);
     if (!isAllowed) {
-      // The cached roots may be stale — settings can be changed from the UI at
-      // any moment. Re-fetch before denying so a just-updated path never 403s.
-      ({ dirs: allowedDirs, allowed: isAllowed } = checkAllowed(await getRoots(true)));
+      roots = await getRoots(true);
+      allowedDirs = allowedDirsFor(roots);
+      isAllowed = await mediaPathWithinRoots(allowedDirs, resolvedFilePath, roots.training);
     }
-    const historicalFolder = isAllowed ? null : await historicalArtifactFolder(prisma, (await getRoots()).training, resolvedFilePath);
+    const historicalFolder = isAllowed ? null : await historicalArtifactFolder(prisma, roots.training, resolvedFilePath);
     if (!isAllowed && !historicalFolder) {
-      console.warn(`Access denied: ${resolvedFilePath} not in ${allowedDirs.join(', ')}`);
       res.writeHead(403);
       res.end('Access denied');
       return true;
@@ -336,7 +330,9 @@ async function serveFile(req: http.IncomingMessage, res: http.ServerResponse, pr
     if (isArt || (isImg && new URL(req.url || '', 'http://localhost').searchParams.has('thumb'))) {
       const thumbBase = path.join(path.dirname(resolvedFilePath), '.thumbs', path.basename(resolvedFilePath));
       const thumbTargets = [`${thumbBase}.png`, `${thumbBase}.jpg`];
-      const thumbsAllowed = !historicalFolder || (await Promise.all(thumbTargets.map(file => regularJobPath(historicalFolder, file)))).every(Boolean);
+      const thumbsAllowed = (await Promise.all(thumbTargets.map(file =>
+        historicalFolder ? regularJobPath(historicalFolder, file) : mediaPathWithinRoots(allowedDirs, file, roots.training),
+      ))).every(Boolean);
       let thumbPath: string | null = null;
       let thumbStat: fs.Stats | null = null;
       for (const candidate of thumbsAllowed ? thumbTargets : []) {
@@ -390,7 +386,9 @@ async function serveFile(req: http.IncomingMessage, res: http.ServerResponse, pr
       // Weak ETag from inode/size/mtime — cheap and stable enough for
       // revalidation of thumbnails/videos the UI requests over and over.
       const etag = `W/"${stat.ino.toString(36)}-${stat.size.toString(36)}-${stat.mtimeMs.toString(36)}"`;
-      headers['Cache-Control'] = 'public, max-age=86400, immutable';
+      headers['X-Content-Type-Options'] = 'nosniff';
+      if (contentType === 'image/svg+xml') headers['Content-Security-Policy'] = "sandbox; default-src 'none'; style-src 'unsafe-inline'";
+      headers['Cache-Control'] = 'private, max-age=86400, immutable';
       headers['ETag'] = etag;
       if (req.headers['if-none-match'] === etag) {
         res.writeHead(304, { ETag: etag, 'Cache-Control': headers['Cache-Control'] });
@@ -398,7 +396,7 @@ async function serveFile(req: http.IncomingMessage, res: http.ServerResponse, pr
         return true;
       }
     } else {
-      headers['Cache-Control'] = 'public, max-age=86400';
+      headers['Cache-Control'] = 'private, max-age=86400';
       headers['Content-Disposition'] = `attachment; filename="${encodeURIComponent(filename)}"`;
       headers['X-Content-Type-Options'] = 'nosniff';
     }
@@ -586,7 +584,8 @@ function startServer(publicPort: number, upstreamPort: number): void {
   // request timeout would kill them mid-transfer.
   server.requestTimeout = 0;
 
-  server.listen(publicPort);
+  const host = process.env.AI_TOOLKIT_HOST?.trim() || (process.env.AI_TOOLKIT_AUTH ? '0.0.0.0' : '127.0.0.1');
+  server.listen(publicPort, host);
 }
 
 // ---------------------------------------------------------------------------
@@ -675,12 +674,9 @@ async function primaryMain(): Promise<void> {
     return;
   }
 
-  // AI_TOOLKIT_QUIET_PATHS keeps each forked worker from re-printing the
-  // TOOLKIT_ROOT line from paths.ts.
   const workerEnv = {
     UPSTREAM_PORT: String(upstreamPort),
     PUBLIC_PORT: String(PUBLIC_PORT),
-    AI_TOOLKIT_QUIET_PATHS: '1',
   };
   for (let i = 0; i < numWorkers; i++) {
     cluster.fork(workerEnv);

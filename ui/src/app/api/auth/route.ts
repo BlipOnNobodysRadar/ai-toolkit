@@ -5,11 +5,12 @@ import { getReadKeys, isReadProtectionDisabled, secondsUntilReadKeyRoll } from '
 export const dynamic = 'force-dynamic';
 
 export async function GET() {
+  const headers = { 'Cache-Control': 'private, no-store' };
   // if this gets hit, auth has already been verified
   // no read key without a password or with read protection disabled; URLs then carry none
   if (!process.env.AI_TOOLKIT_AUTH || isReadProtectionDisabled()) {
-    return NextResponse.json({ isAuthenticated: true });
+    return NextResponse.json({ isAuthenticated: true }, { headers });
   }
   const [readKey = ''] = await getReadKeys();
-  return NextResponse.json({ isAuthenticated: true, readKey, readKeyRefreshIn: secondsUntilReadKeyRoll() });
+  return NextResponse.json({ isAuthenticated: true, readKey, readKeyRefreshIn: secondsUntilReadKeyRoll() }, { headers });
 }
