@@ -35,6 +35,17 @@ def replace_env_vars_in_string(s: str) -> str:
     return re.sub(r'\$\{([^}]+)\}', replacer, s)
 
 
+def config_flag(value, default=False):
+    # Quoted YAML and values supplied by templates can be strings, including "false".
+    if isinstance(value, str):
+        value = value.strip().lower()
+    if value in (True, 'true', 'yes', 'on', '1'):
+        return True
+    if value in (False, 'false', 'no', 'off', '0'):
+        return False
+    return default
+
+
 def preprocess_config(config: OrderedDict, name: str = None):
     if "job" not in config:
         raise ValueError("config file must have a job key")
@@ -107,4 +118,32 @@ def get_config(
         else:
             raise ValueError(f"Config file {config_file_path} must be a json or yaml file")
 
-    return preprocess_config(config, name)
+    result = preprocess_config(config, name)
+    result.source_template = content
+    return result
+
+
+def config_for_backup(config):
+    """Use the original environment references and omit inline credentials in a requested local snapshot."""
+    source = getattr(config, 'source_template', None)
+    if source is not None:
+        config = yaml.safe_load(source)
+
+    def public_fields(value):
+        if isinstance(value, list):
+            return [public_fields(item) for item in value]
+        if isinstance(value, dict):
+            result = {}
+            for key, field in value.items():
+                compact = re.sub(r'[^a-z0-9]', '', str(key).lower())
+                if (compact == 'token' or compact.endswith(('apikey', 'accesstoken', 'authtoken', 'bearertoken', 'hftoken',
+                                                           'password', 'secret', 'secretkey', 'privatekey'))
+                        or compact in {'authorization', 'credentials'}):
+                    if isinstance(field, str) and re.fullmatch(r'\$\{[\w]+\}', field):
+                        result[key] = field
+                    continue
+                result[key] = public_fields(field)
+            return result
+        return value
+
+    return public_fields(config)

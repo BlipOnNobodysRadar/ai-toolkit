@@ -105,7 +105,7 @@ The only requirement is **git** (on Windows the manager can even fetch a
 portable git for updates, but you need one installed to clone the repo first).
 
 ```bash
-git clone https://github.com/ostris/ai-toolkit.git
+git clone https://github.com/BlipOnNobodysRadar/ai-toolkit.git
 cd ai-toolkit
 ```
 
@@ -146,7 +146,7 @@ Requirements:
 
 Linux:
 ```bash
-git clone https://github.com/ostris/ai-toolkit.git
+git clone https://github.com/BlipOnNobodysRadar/ai-toolkit.git
 cd ai-toolkit
 python3 -m venv venv
 source venv/bin/activate
@@ -163,7 +163,7 @@ Windows:
 If you are having issues with Windows. I recommend using the easy install script at [https://github.com/Tavris1/AI-Toolkit-Easy-Install](https://github.com/Tavris1/AI-Toolkit-Easy-Install)
 
 ```bash
-git clone https://github.com/ostris/ai-toolkit.git
+git clone https://github.com/BlipOnNobodysRadar/ai-toolkit.git
 cd ai-toolkit
 python -m venv venv
 .\venv\Scripts\activate
@@ -176,7 +176,16 @@ pip install -r requirements.txt
 
 <img src="https://ostris.com/wp-content/uploads/2025/02/toolkit-ui.jpg" alt="AI Toolkit UI" width="100%">
 
-The AI Toolkit UI is a web interface for the AI Toolkit. It allows you to easily start, stop, and monitor jobs. It also allows you to easily train models with a few clicks. It also allows you to set a token for the UI to prevent unauthorized access so it is mostly safe to run on an exposed server.
+The UI starts, stops, and monitors training jobs. By default, an installation without a UI password listens on loopback. To serve another machine, set `AI_TOOLKIT_AUTH` and use HTTPS or an SSH tunnel. `AI_TOOLKIT_HOST` explicitly selects a listen address.
+
+Training keeps progress, checkpoints, and job settings on your machine. Model and dependency downloads contact their providers. Model publishing, remote experiment tracking, and the Gradio public share link each require an explicit choice. Review the job configuration before enabling an external integration.
+
+| Setting | Data shared when enabled |
+| --- | --- |
+| `logging.use_wandb` | Training metrics go to the configured W&B project. Add `logging.wandb_log_samples: true` to include sample images and prompts. |
+| `save.push_to_hub` | Final model artifacts and their generated model card go to Hugging Face. New repositories are private by default. Set `save.hf_private: false` for a public repository. |
+| `save.hf_upload_samples` | Includes final sample images and their prompts in an explicitly requested Hub publication. |
+| `logging.save_config` | Writes a local config snapshot with inline credential fields filtered. This is separate from the job settings the UI needs to launch and resume. |
 
 ## Running the UI
 
@@ -244,54 +253,29 @@ I have also created a short video showing how to get started using AI Toolkit wi
 
 ## Training in Modal
 
-### 1. Setup
-#### ai-toolkit:
+Install and authenticate the Modal CLI from this Git checkout.
+
+```sh
+python -m pip install modal
+modal setup
 ```
-git clone https://github.com/ostris/ai-toolkit.git
-cd ai-toolkit
-git submodule update --init --recursive
-python -m venv venv
-source venv/bin/activate
-pip install torch
-pip install -r requirements.txt
-pip install --upgrade accelerate transformers diffusers huggingface_hub #Optional, run it if you run into issues
+
+Copy a training config from `config/examples/modal/` and edit it locally. Set `folder_path` to `/root/ai-toolkit/datasets/your-dataset` and `training_folder` to `/root/ai-toolkit/modal_output` so your checkpoints and samples persist. Create the input volumes in your Modal workspace, then upload the selected config and dataset.
+
+```sh
+modal volume create ai-toolkit-configs
+modal volume create ai-toolkit-datasets
+modal volume put ai-toolkit-configs ./my-training.yaml /my-training.yaml
+modal volume put ai-toolkit-datasets ./your-dataset /your-dataset
+modal run run_modal.py --config-file-list-str=/root/ai-toolkit/config/my-training.yaml
 ```
-#### Modal:
-- Run `pip install modal` to install the modal Python package.
-- Run `modal setup` to authenticate (if this doesn’t work, try `python -m modal setup`).
 
-#### Hugging Face:
-- Get a READ token from [here](https://huggingface.co/settings/tokens) and request access to Flux.1-dev model from [here](https://huggingface.co/black-forest-labs/FLUX.1-dev).
-- Run `huggingface-cli login` and paste your token.
+The launcher sends tracked toolkit runtime code and its dependency manifests. Modal stores the files you upload to the input volumes and runs the job on an A100 with a two-hour timeout. For a gated model, create a Modal Secret containing `HF_TOKEN` and set `AITK_MODAL_HF_SECRET` to that secret’s name before launching. The secret is supplied to the training container.
 
-### 2. Upload your dataset
-- Drag and drop your dataset folder containing the .jpg, .jpeg, or .png images and .txt files in `ai-toolkit`.
-
-### 3. Configs
-- Copy an example config file located at ```config/examples/modal``` to the `config` folder and rename it to ```whatever_you_want.yml```.
-- Edit the config following the comments in the file, **<ins>be careful and follow the example `/root/ai-toolkit` paths</ins>**.
-
-### 4. Edit run_modal.py
-- Set your entire local `ai-toolkit` path at `code_mount = modal.Mount.from_local_dir` like:
-  
-   ```
-   code_mount = modal.Mount.from_local_dir("/Users/username/ai-toolkit", remote_path="/root/ai-toolkit")
-   ```
-- Choose a `GPU` and `Timeout` in `@app.function` _(default is A100 40GB and 2 hour timeout)_.
-
-### 5. Training
-- Run the config file in your terminal: `modal run run_modal.py --config-file-list-str=/root/ai-toolkit/config/whatever_you_want.yml`.
-- You can monitor your training in your local terminal, or on [modal.com](https://modal.com/).
-- Models, samples and optimizer will be stored in `Storage > flux-lora-models`.
-
-### 6. Saving the model
-- Check contents of the volume by running `modal volume ls flux-lora-models`. 
-- Download the content by running `modal volume get flux-lora-models your-model-name`.
-- Example: `modal volume get flux-lora-models my_first_flux_lora_v1`.
-
-### Screenshot from Modal
-
-<img width="1728" alt="Modal Traning Screenshot" src="https://github.com/user-attachments/assets/7497eb38-0090-49d6-8ad9-9c8ea7b5388b">
+```sh
+modal volume ls flux-lora-models
+modal volume get flux-lora-models my_first_flux_lora_v1
+```
 
 ---
 

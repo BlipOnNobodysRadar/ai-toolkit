@@ -1,4 +1,5 @@
 import random
+import tempfile
 from datetime import datetime
 import os
 from collections import OrderedDict
@@ -9,6 +10,7 @@ import yaml
 
 from jobs.process.BaseProcess import BaseProcess
 from toolkit import save_root_lease
+from toolkit.config import config_flag, config_for_backup
 
 if TYPE_CHECKING:
     from jobs import TrainJob, BaseJob, ExtensionJob
@@ -94,6 +96,19 @@ class BaseTrainProcess(BaseProcess):
 
     def save_training_config(self):
         os.makedirs(self.save_root, exist_ok=True)
-        save_dif = os.path.join(self.save_root, f'config.yaml')
-        with open(save_dif, 'w') as f:
-            yaml.dump(self.job.raw_config, f)
+        if not config_flag(self.get_conf('logging.save_config', False)):
+            return
+        save_dif = os.path.join(self.save_root, 'config.yaml')
+        try:
+            snapshot = config_for_backup(self.job.raw_config)
+        except yaml.YAMLError:
+            self.print("Skipped local config snapshot because the unexpanded template could not be parsed.")
+            return
+        fd, temporary = tempfile.mkstemp(dir=self.save_root)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                yaml.safe_dump(snapshot, f, sort_keys=False)
+            os.replace(temporary, save_dif)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)

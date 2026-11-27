@@ -12,7 +12,7 @@ if "SEED" in os.environ:
     try:
         seed = int(os.environ["SEED"])
     except ValueError:
-        print(f"Invalid SEED value: {os.environ['SEED']}. SEED must be an integer.")
+        print("Invalid SEED value. SEED must be an integer.")
 
 sys.path.insert(0, os.getcwd())
 
@@ -29,9 +29,6 @@ patch_huggingface_downloads()
 
 # must come before ANY torch or fastai imports
 # import toolkit.cuda_malloc
-
-# turn off diffusers telemetry until I can figure out how to make it opt-in
-os.environ['DISABLE_TELEMETRY'] = 'YES'
 
 # set torch to trace mode
 import torch
