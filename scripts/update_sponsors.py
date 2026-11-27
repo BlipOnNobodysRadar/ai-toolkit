@@ -1,6 +1,6 @@
 import os
+from urllib.parse import urlsplit
 import requests
-import json
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -17,8 +17,8 @@ GITHUB_ORG = os.getenv("GITHUB_ORG")  # Organization name (optional)
 # Output file
 README_PATH = "SUPPORTERS.md"
 
-def fetch_patreon_supporters():
-    """Fetch current Patreon supporters"""
+def fetch_patreon_supporter_count():
+    """Count active patrons without collecting names or profile pictures."""
     print("Fetching Patreon supporters...")
     
     headers = {
@@ -36,62 +36,33 @@ def fetch_patreon_supporters():
         
         if not campaign_data.get('data'):
             print("No campaigns found for this Patreon account")
-            return []
+            return 0
         
         campaign_id = campaign_data['data'][0]['id']
         
-        # Now get the supporters for this campaign
         members_url = f"https://www.patreon.com/api/oauth2/v2/campaigns/{campaign_id}/members"
-        params = {
-            "include": "user",
-            "fields[member]": "full_name,is_follower,patron_status",  # Removed profile_url
-            "fields[user]": "image_url"
-        }
-        
-        supporters = []
+        params = {"fields[member]": "patron_status"}
+        count = 0
         while members_url:
+            target = urlsplit(members_url)
+            if target.scheme != "https" or target.netloc.lower() not in {"www.patreon.com", "www.patreon.com:443"}:
+                raise requests.exceptions.RequestException("Unexpected Patreon pagination origin")
             members_response = requests.get(members_url, headers=headers, params=params)
             members_response.raise_for_status()
             members_data = members_response.json()
             
-            # Process the response to extract active patrons
-            for member in members_data.get('data', []):
-                attributes = member.get('attributes', {})
-                
-                # Only include active patrons
-                if attributes.get('patron_status') == 'active_patron':
-                    name = attributes.get('full_name', 'Anonymous Supporter')
-                    
-                    # Get user data which contains the profile image
-                    user_id = member.get('relationships', {}).get('user', {}).get('data', {}).get('id')
-                    profile_image = None
-                    profile_url = None  # Removed profile_url since it's not supported
-                    
-                    if user_id:
-                        for included in members_data.get('included', []):
-                            if included.get('id') == user_id and included.get('type') == 'user':
-                                profile_image = included.get('attributes', {}).get('image_url')
-                                break
-                    
-                    supporters.append({
-                        'name': name,
-                        'profile_image': profile_image,
-                        'profile_url': profile_url,  # This will be None
-                        'platform': 'Patreon',
-                        'amount': 0  # Placeholder, as Patreon API doesn't provide this in the current response
-                    })
-            
-            # Handle pagination
-            members_url = members_data.get('links', {}).get('next')
-        
-        print(f"Found {len(supporters)} active Patreon supporters")
-        return supporters
-    
+            count += sum(
+                member.get("attributes", {}).get("patron_status") == "active_patron"
+                for member in members_data.get("data", [])
+            )
+            members_url = members_data.get("links", {}).get("next")
+        print(f"Found {count} active Patreon supporters")
+        return count
     except requests.exceptions.RequestException as e:
-        print(f"Error fetching Patreon data: {e}")
-        print(f"Response content: {e.response.content if hasattr(e, 'response') else 'No response content'}")
-        return []
-    
+        detail = e.response.status_code if e.response is not None else type(e).__name__
+        print(f"Error fetching Patreon supporter count ({detail})")
+        return 0
+
 def fetch_github_sponsors():
     """Fetch current GitHub sponsors for a user or organization"""
     print("Fetching GitHub sponsors...")
@@ -133,7 +104,7 @@ def fetch_github_sponsors():
                 tier {
                   monthlyPriceInDollars
                 }
-                isOneTimePayment
+                privacyLevel
                 isActive
               }
             }
@@ -163,7 +134,7 @@ def fetch_github_sponsors():
                 tier {
                   monthlyPriceInDollars
                 }
-                isOneTimePayment
+                privacyLevel
                 isActive
               }
             }
@@ -188,8 +159,8 @@ def fetch_github_sponsors():
         
         sponsors = []
         for sponsor in sponsors_data:
-            # Only include active sponsors
-            if sponsor.get('isActive'):
+            # This list is published. The maintainer's token can also see private sponsors.
+            if sponsor.get('isActive') and sponsor.get('privacyLevel') == 'PUBLIC':
                 entity = sponsor.get('sponsorEntity', {})
                 name = entity.get('name') or entity.get('login', 'Anonymous Sponsor')
                 profile_image = entity.get('avatarUrl')
@@ -211,7 +182,7 @@ def fetch_github_sponsors():
         print(f"Error fetching GitHub sponsors data: {e}")
         return []
 
-def generate_readme(supporters):
+def generate_readme(supporters, patreon_count=0):
     """Generate a README.md file with supporter information"""
     print(f"Generating {README_PATH}...")
     
@@ -251,21 +222,15 @@ def generate_readme(supporters):
                     f.write(f"[{sponsor['name']}]({sponsor['profile_url']}) ")
             f.write("\n\n")
         
-        # Write Patreon section
-        patreon_supporters = [s for s in supporters if s['platform'] == 'Patreon']
-        if patreon_supporters:
+        # Membership data carries no consent for publishing a patron's name.
+        if patreon_count:
             f.write("### Patreon Supporters\n\n")
-            for supporter in patreon_supporters:
-                if supporter['profile_image']:
-                    f.write(f"<a href=\"{supporter['profile_url']}\" title=\"{supporter['name']}\"><img src=\"{supporter['profile_image']}\" width=\"50\" height=\"50\" alt=\"{supporter['name']}\" style=\"border-radius:50%;display:inline-block;\"></a> ")
-                else:
-                    f.write(f"[{supporter['name']}]({supporter['profile_url']}) ")
-            f.write("\n\n")
-        
+            f.write(f"Thank you to our {patreon_count} active Patreon supporters.\n\n")
+
         f.write("\n---\n\n")
         
     
-    print(f"Successfully generated {README_PATH} with {len(supporters)} supporters!")
+    print(f"Successfully generated {README_PATH} with {len(supporters) + patreon_count} supporters!")
 
 def main():
     """Main function"""
@@ -292,18 +257,15 @@ def main():
         print("Warning: PATREON_ACCESS_TOKEN not set. Will only fetch GitHub sponsors.")
     
     # Fetch data from both platforms
-    patreon_supporters = fetch_patreon_supporters() if PATREON_TOKEN else []
+    patreon_count = fetch_patreon_supporter_count() if PATREON_TOKEN else 0
     github_sponsors = fetch_github_sponsors()
     
-    # Combine supporters from both platforms
-    all_supporters = patreon_supporters + github_sponsors
-    
-    if not all_supporters:
+    if not patreon_count and not github_sponsors:
         print("No supporters found on either platform")
         return
     
     # Generate README
-    generate_readme(all_supporters)
+    generate_readme(github_sponsors, patreon_count)
 
 if __name__ == "__main__":
     main()

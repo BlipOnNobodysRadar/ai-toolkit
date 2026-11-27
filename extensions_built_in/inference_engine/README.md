@@ -40,12 +40,12 @@ The server binds `127.0.0.1` on an ephemeral port and writes
 
 ## HTTP API
 
-All routes except `/health` need the token (`X-Engine-Token: <token>` or
+All routes with job details need the token (`X-Engine-Token: <token>` or
 `Authorization: Bearer <token>`).
 
 | route | |
 |---|---|
-| `GET /health` | busy/queue, active model, VRAM, pool residents + hit/miss stats |
+| `GET /health` | Returns `{"ok": true}` for liveness. With a token, includes busy/queue, active model, VRAM, pool residents and hit/miss stats. |
 | `GET /models` | every arch with modality, defaults, control-image requirement (`toolkit/models/registry.py`) |
 | `POST /generate` | body `{model, sample, stream}` → binary frame stream (below). `{"wait": true}` returns JSON when done instead |
 | `POST /cancel/{request_id}` | cancel a queued/running request |

@@ -1,7 +1,13 @@
+import argparse
 import os
-from huggingface_hub import whoami    
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 import sys
+import tempfile
+
+os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+
+from huggingface_hub import whoami
 
 # Add the current working directory to the Python path
 sys.path.insert(0, os.getcwd())
@@ -10,7 +16,6 @@ import gradio as gr
 from PIL import Image
 import torch
 import uuid
-import os
 import shutil
 import json
 import yaml
@@ -51,10 +56,7 @@ def load_captioning(uploaded_files, concept_sentence):
         corresponding_caption = False
         if(image_value):
             base_name = os.path.splitext(os.path.basename(image_value))[0]
-            print(base_name)
-            print(image_value)
             if base_name in txt_files_dict:
-                print("entrou")
                 with open(txt_files_dict[base_name], 'r') as file:
                     corresponding_caption = file.read()
                     
@@ -107,7 +109,6 @@ def run_captioning(images, concept_sentence, *captions):
 
     captions = list(captions)
     for i, image_path in enumerate(images):
-        print(captions[i])
         if isinstance(image_path, str):  # If image is a file path
             image = Image.open(image_path).convert("RGB")
 
@@ -154,20 +155,10 @@ def start_training(
     sample_3,
     use_more_advanced_options,
     more_advanced_options,
+    push_to_hub=False,
 ):
-    push_to_hub = True
     if not lora_name:
         raise gr.Error("You forgot to insert your LoRA name! This name has to be unique.")
-    try:
-        if whoami()["auth"]["accessToken"]["role"] == "write" or "repo.write" in whoami()["auth"]["accessToken"]["fineGrained"]["scoped"][0]["permissions"]:
-            gr.Info(f"Starting training locally {whoami()['name']}. Your LoRA will be available locally and in Hugging Face after it finishes.")
-        else:
-            push_to_hub = False
-            gr.Warning("Started training locally. Your LoRa will only be available locally because you didn't login with a `write` token to Hugging Face")
-    except:
-        push_to_hub = False
-        gr.Warning("Started training locally. Your LoRa will only be available locally because you didn't login with a `write` token to Hugging Face")
-            
     print("Started training")
     slugged_lora_name = slugify(lora_name)
 
@@ -184,14 +175,6 @@ def start_training(
     config["config"]["process"][0]["network"]["linear"] = int(rank)
     config["config"]["process"][0]["network"]["linear_alpha"] = int(rank)
     config["config"]["process"][0]["datasets"][0]["folder_path"] = dataset_folder
-    config["config"]["process"][0]["save"]["push_to_hub"] = push_to_hub
-    if(push_to_hub):
-        try:
-            username = whoami()["name"]
-        except:
-            raise gr.Error("Error trying to retrieve your username. Are you sure you are logged in with Hugging Face?")
-        config["config"]["process"][0]["save"]["hf_repo_id"] = f"{username}/{slugged_lora_name}"
-        config["config"]["process"][0]["save"]["hf_private"] = True
     if concept_sentence:
         config["config"]["process"][0]["trigger_word"] = concept_sentence
     
@@ -215,18 +198,24 @@ def start_training(
     if(use_more_advanced_options):
         more_advanced_options_dict = yaml.safe_load(more_advanced_options)
         config["config"]["process"][0] = recursive_update(config["config"]["process"][0], more_advanced_options_dict)
-        print(config)
-    
-    # Save the updated config
-    # generate a random name for the config
-    random_config_name = str(uuid.uuid4())
-    os.makedirs("tmp", exist_ok=True)
-    config_path = f"tmp/{random_config_name}-{slugged_lora_name}.yaml"
-    with open(config_path, "w") as f:
-        yaml.dump(config, f)
-    
-    # run the job locally
-    job = get_job(config_path)
+
+    save = config["config"]["process"][0]["save"]
+    save["push_to_hub"] = push_to_hub
+    if push_to_hub:
+        save.setdefault("hf_private", True)
+        if not save.get("hf_repo_id"):
+            try:
+                username = whoami()["name"]
+            except Exception as error:
+                raise gr.Error("Sign in to Hugging Face to upload the trained model.") from error
+            save["hf_repo_id"] = f"{username}/{slugged_lora_name}"
+
+    # Use the normal YAML loader (including its environment substitutions), then discard the input.
+    with tempfile.TemporaryDirectory() as directory:
+        config_path = os.path.join(directory, "training.yaml")
+        with open(config_path, "w") as f:
+            yaml.safe_dump(config, f)
+        job = get_job(config_path)
     job.run()
     job.cleanup()
 
@@ -255,7 +244,6 @@ save:
   dtype: float16
   hf_private: true
   max_step_saves_to_keep: 4
-  push_to_hub: true
   save_every: 10000
 train:
   batch_size: 1
@@ -273,7 +261,8 @@ train:
 
 theme = gr.themes.Monochrome(
     text_size=gr.themes.Size(lg="18px", md="15px", sm="13px", xl="22px", xs="12px", xxl="24px", xxs="9px"),
-    font=[gr.themes.GoogleFont("Source Sans Pro"), "ui-sans-serif", "system-ui", "sans-serif"],
+    font=["system-ui", "sans-serif"],
+    font_mono=["ui-monospace", "monospace"],
 )
 css = """
 h1{font-size: 2em}
@@ -349,6 +338,7 @@ with gr.Blocks(theme=theme, css=css) as demo:
             rank = gr.Number(label="LoRA Rank", value=16, minimum=4, maximum=128, step=4)
             model_to_train = gr.Radio(["dev", "schnell"], value="dev", label="Model to train")
             low_vram = gr.Checkbox(label="Low VRAM", value=True)
+            push_to_hub = gr.Checkbox(label="Upload the trained model to Hugging Face", value=False)
             with gr.Accordion("Even more advanced options", open=False):
                 use_more_advanced_options = gr.Checkbox(label="Use more advanced options", value=False)
                 more_advanced_options = gr.Code(config_yaml, language="yaml")
@@ -403,7 +393,8 @@ with gr.Blocks(theme=theme, css=css) as demo:
             sample_2,
             sample_3,
             use_more_advanced_options,
-            more_advanced_options
+            more_advanced_options,
+            push_to_hub,
         ],
         outputs=progress_area,
     )
@@ -411,4 +402,6 @@ with gr.Blocks(theme=theme, css=css) as demo:
     do_captioning.click(fn=run_captioning, inputs=[images, concept_sentence] + caption_list, outputs=caption_list)
 
 if __name__ == "__main__":
-    demo.launch(share=True, show_error=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--share", action="store_true", help="Create a public Gradio link to this training UI")
+    demo.launch(share=parser.parse_args().share, show_error=True)

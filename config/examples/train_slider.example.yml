@@ -12,8 +12,8 @@ config:
   # it can be relative to the project root or absolute
   training_folder: "output/LoRA"
   device: cuda:0 # cpu, cuda:0, etc
-  # for tensorboard logging, we will make a subfolder for this job
-  log_dir: "output/.tensorboard"
+  # Uncomment to write local TensorBoard logs for this run.
+  # log_dir: "output/.tensorboard"
   # you can stack processes for other jobs, It is not tested with sliders though
   # just use one for now
   process:

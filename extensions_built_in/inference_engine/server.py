@@ -37,7 +37,12 @@ def create_app(engine: Engine, token: Optional[str] = None) -> FastAPI:
             raise HTTPException(status_code=401, detail="bad engine token")
 
     @app.get("/health")
-    async def health():
+    async def health(request: Request):
+        # External liveness probes need only know that the server is up. Detailed
+        # health includes the current user's prompt, model configuration and paths.
+        if token and "x-engine-token" not in request.headers and "authorization" not in request.headers:
+            return {"ok": True}
+        check_auth(request)
         return engine.health()
 
     @app.get("/models")

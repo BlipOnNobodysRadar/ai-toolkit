@@ -20,6 +20,7 @@ import json
 import os
 import secrets
 import signal
+import tempfile
 import time
 from collections import OrderedDict
 
@@ -135,10 +136,14 @@ class InferenceEngine(BaseExtensionProcess):
             "output_folder": self.output_folder,
             "started_at": time.time(),
         }
-        tmp = self.endpoint_path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(self.endpoint, f, indent=2)
-        os.replace(tmp, self.endpoint_path)
+        tmp = tempfile.NamedTemporaryFile(mode="w", dir=self.job_folder, prefix=".engine-", delete=False)
+        try:
+            with tmp:
+                json.dump(self.endpoint, tmp, indent=2)
+            os.replace(tmp.name, self.endpoint_path)
+        finally:
+            if os.path.exists(tmp.name):
+                os.remove(tmp.name)
         print(f"[AITK] Inference engine listening on http://{host}:{port} (endpoint file: {self.endpoint_path})")
 
     def shutdown(self, primary=None):
