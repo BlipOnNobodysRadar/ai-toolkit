@@ -587,3 +587,50 @@ def test_dpo_failure_restores_grad_mode_gradients_and_network_scope(monkeypatch)
         for parameter in network.parameters()
         if parameter.requires_grad
     )
+
+
+@pytest.mark.parametrize("key,val", [("dpo_anchor_weight", -1.0), ("dpo_anchor_weight", True), ("dpo_sft_weight", -0.1), ("dpo_sft_weight", math.nan)])
+def test_dpo_rejects_invalid_anchor_and_sft_weights(key, val):
+    with pytest.raises(ValueError, match="finite nonnegative"):
+        TrainConfig(loss_type="dpo", **{key: val})
+
+
+def test_dpo_anchor_and_sft_penalties_and_drift_logs():
+    model, transformer = _make_model()
+    network, network_config = _make_network(model, transformer)
+    trainer = _make_trainer(model, transformer, network, network_config)
+    batch = _make_latent_batch(seed=919)
+
+    # Zero-delta start: anchor penalty is 0, logs carry chosen_delta/rejected_delta
+    trainer.train_config.dpo_anchor_weight = 25.0
+    torch.manual_seed(111)
+    loss0 = SDTrainer.train_single_accumulation(trainer, batch, accum_scale=1.0)
+    assert loss0.item() == pytest.approx(math.log(2.0), abs=1e-6)
+    assert "dpo/chosen_delta" in trainer.additional_logs
+    assert "dpo/rejected_delta" in trainer.additional_logs
+    assert "dpo/chosen_pos_drift" in trainer.additional_logs
+
+    # Perturb LoRA weights so chosen_delta becomes nonzero; verify anchor increases loss iff chosen_delta > 0
+    with torch.no_grad():
+        for name, parameter in network.named_parameters():
+            if "lora_up" in name:
+                parameter.normal_(0.0, 0.25)
+    network.zero_grad()
+    trainer.train_config.dpo_anchor_weight = 0.0
+    trainer.train_config.dpo_sft_weight = 0.0
+    torch.manual_seed(222)
+    loss_plain = SDTrainer.train_single_accumulation(trainer, batch, accum_scale=1.0)
+    pos_drift = trainer.additional_logs["dpo/chosen_pos_drift"]
+
+    network.zero_grad()
+    trainer.train_config.dpo_anchor_weight = 25.0
+    torch.manual_seed(222)
+    loss_anchored = SDTrainer.train_single_accumulation(trainer, batch, accum_scale=1.0)
+    assert loss_anchored.item() == pytest.approx(loss_plain.item() + 25.0 * pos_drift, rel=1e-4, abs=1e-5)
+
+    network.zero_grad()
+    trainer.train_config.dpo_anchor_weight = 0.0
+    trainer.train_config.dpo_sft_weight = 2.0
+    torch.manual_seed(222)
+    loss_sft = SDTrainer.train_single_accumulation(trainer, batch, accum_scale=1.0)
+    assert loss_sft.item() > loss_plain.item()

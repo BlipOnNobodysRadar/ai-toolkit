@@ -141,9 +141,20 @@ def train_dpo_accumulation(trainer, batch, accum_scale):
         with network:
             with trainer.timer('dpo_policy'):
                 policy_errors = prediction_errors(trainer.predict_noise(noisy, timesteps, conditioning), target)
-                logits = preference_logits(policy_errors, frozen_errors, trainer.train_config.dpo_beta)
+                chosen_err, _rejected_err = policy_errors.chunk(2)
+                chosen_delta, rejected_delta = (policy_errors - frozen_errors.detach()).chunk(2)
+                logits = (0.5 * trainer.train_config.dpo_beta) * (rejected_delta - chosen_delta)
                 weights = logits.new_tensor(batch.loss_multiplier_list)
-                loss = (-F.logsigmoid(logits) * weights).mean()
+                dpo_loss = -F.logsigmoid(logits)
+                anchor_w = float(getattr(trainer.train_config, 'dpo_anchor_weight', 0.0) or 0.0)
+                sft_w = float(getattr(trainer.train_config, 'dpo_sft_weight', 0.0) or 0.0)
+                pos_drift = F.relu(chosen_delta)
+                total_loss = dpo_loss
+                if anchor_w > 0.0:
+                    total_loss = total_loss + anchor_w * pos_drift
+                if sft_w > 0.0:
+                    total_loss = total_loss + sft_w * chosen_err
+                loss = (total_loss * weights).mean()
                 if not torch.isfinite(loss):
                     raise FloatingPointError('Non-finite DPO loss')
             with trainer.timer('backward'):
@@ -155,4 +166,7 @@ def train_dpo_accumulation(trainer, batch, accum_scale):
     trainer.additional_logs['dpo/margin'] = logits.detach().mean().item()
     trainer.additional_logs['dpo/gain_gap'] = trainer.additional_logs['dpo/margin'] * (2 / trainer.train_config.dpo_beta)
     trainer.additional_logs['dpo/accuracy'] = (logits.detach() > 0).float().mean().item()
+    trainer.additional_logs['dpo/chosen_delta'] = chosen_delta.detach().mean().item()
+    trainer.additional_logs['dpo/rejected_delta'] = rejected_delta.detach().mean().item()
+    trainer.additional_logs['dpo/chosen_pos_drift'] = pos_drift.detach().mean().item()
     return loss.detach()

@@ -587,10 +587,16 @@ class TrainConfig:
             if self.loss_type == 'dpo':
                 raise ValueError('Use an ordinary loss_type for interleaved DPO feedback')
         self.dpo_beta = kwargs.get('dpo_beta', 100.0)
+        self.dpo_anchor_weight = kwargs.get('dpo_anchor_weight', 0.0)
+        self.dpo_sft_weight = kwargs.get('dpo_sft_weight', 0.0)
         if self.loss_type == 'dpo' or self.dpo_feedback is not None:
             if (isinstance(self.dpo_beta, bool) or not isinstance(self.dpo_beta, (int, float))
                     or not math.isfinite(self.dpo_beta) or self.dpo_beta <= 0):
                 raise ValueError('dpo_beta must be a finite positive number')
+            for _name, _val in (('dpo_anchor_weight', self.dpo_anchor_weight), ('dpo_sft_weight', self.dpo_sft_weight)):
+                if (isinstance(_val, bool) or not isinstance(_val, (int, float))
+                        or not math.isfinite(_val) or _val < 0):
+                    raise ValueError(f'{_name} must be a finite nonnegative number')
         self.training_extras = kwargs.get('training_extras', None)
         if self.training_extras is not None and not isinstance(self.training_extras, dict):
             raise ValueError('training_extras must be a mapping')
