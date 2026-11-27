@@ -101,6 +101,31 @@ def inverted_prior_mask_multiplier(mask: torch.Tensor, latent_shape, pred_shape)
 
 class SDTrainer(BaseSDTrainProcess):
 
+    def hook_after_model_load(self):
+        super().hook_after_model_load()
+        path = self.train_config.dpo_reference_lora_path
+        if path is None:
+            return
+        from toolkit.cache_identity import file_generation, sha256_file
+        from toolkit.inference_lora import InferenceLoRA
+
+        if not os.path.isfile(path):
+            raise ValueError(f"Frozen DPO LoRA file does not exist: {path}")
+        warm_start = self.network_config.pretrained_lora_path
+        if warm_start and os.path.isfile(warm_start) and os.path.samefile(path, warm_start):
+            raise ValueError("The same LoRA is configured as both the frozen reference and the trainable policy")
+        # Independent forward hooks run on both DPO passes and during checkpoint
+        # recomputation. Only the new policy network is optimized and saved.
+        reference = InferenceLoRA(path, self.train_config.dpo_reference_lora_strength)
+        generation = file_generation(path)
+        digest = sha256_file(path)
+        reference.load(self.sd, strict_transformer_lora=True)
+        if file_generation(path) != generation:
+            raise ValueError(f"Frozen DPO LoRA changed while loading: {path}")
+        reference.attach()
+        self._dpo_reference_identity = {'sha256': digest, 'strength': reference.strength}
+        print_acc(f"Frozen DPO reference at strength {reference.strength}: {reference.report_line()}")
+
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
         super().__init__(process_id, job, config, **kwargs)
         from toolkit.diffusion_dpo import validate_dpo_config

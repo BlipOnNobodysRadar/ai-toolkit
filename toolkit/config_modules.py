@@ -587,6 +587,19 @@ class TrainConfig:
             if self.loss_type == 'dpo':
                 raise ValueError('Use an ordinary loss_type for interleaved DPO feedback')
         self.dpo_beta = kwargs.get('dpo_beta', 100.0)
+        self.dpo_reference_lora_path = kwargs.get('dpo_reference_lora_path')
+        self.dpo_reference_lora_strength = kwargs.get('dpo_reference_lora_strength', 1.0)
+        if self.dpo_reference_lora_path is not None:
+            if self.loss_type != 'dpo':
+                raise ValueError('dpo_reference_lora_path requires offline loss_type: dpo')
+            if not isinstance(self.dpo_reference_lora_path, str) or not self.dpo_reference_lora_path.strip():
+                raise ValueError('dpo_reference_lora_path must be a path to a LoRA file')
+        elif 'dpo_reference_lora_strength' in kwargs:
+            raise ValueError('dpo_reference_lora_strength requires dpo_reference_lora_path')
+        if (isinstance(self.dpo_reference_lora_strength, bool)
+                or not isinstance(self.dpo_reference_lora_strength, (int, float))
+                or not math.isfinite(self.dpo_reference_lora_strength)):
+            raise ValueError('dpo_reference_lora_strength must be a finite number')
         if self.loss_type == 'dpo' or self.dpo_feedback is not None:
             if (isinstance(self.dpo_beta, bool) or not isinstance(self.dpo_beta, (int, float))
                     or not math.isfinite(self.dpo_beta) or self.dpo_beta <= 0):

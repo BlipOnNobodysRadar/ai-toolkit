@@ -195,7 +195,7 @@ class InferenceLoRA:
         return file_generation(local) if local is not None else None
 
     # ---- loading / key resolution ----
-    def load(self, holder, status_fn=None) -> "InferenceLoRA":
+    def load(self, holder, status_fn=None, *, strict_transformer_lora=False) -> "InferenceLoRA":
         from toolkit.models.v2.resolver import resolve_lora_file
 
         # a spec path may be a hub reference (org/repo/file.safetensors); it is
@@ -234,6 +234,20 @@ class InferenceLoRA:
                 self.num_skipped_keys += 1
                 continue
             grouped.setdefault(base, {})[part] = tensor
+        if strict_transformer_lora:
+            # A partially loaded adapter would silently change the DPO reference.
+            if self.convert_error or self.num_skipped_keys or not grouped:
+                raise ValueError(f"Invalid frozen transformer LoRA: {self.report()}")
+            for base, parts in grouped.items():
+                if (base.startswith(tuple(_TE_PREFIXES)) or not {"A", "B"} <= parts.keys()
+                        or parts.keys() - {"A", "B", "alpha"}):
+                    raise ValueError(f"Expected a transformer LoRA matrix pair at {base}")
+                a, b = parts["A"], parts["B"]
+                if a.ndim != 2 or b.ndim != 2 or a.shape[0] == 0 or a.shape[0] != b.shape[1]:
+                    raise ValueError(f"Incompatible frozen LoRA matrices at {base}: {a.shape}, {b.shape}")
+                if "alpha" in parts and (parts["alpha"].numel() != 1 or not math.isfinite(parts["alpha"].item())):
+                    raise ValueError(f"Invalid frozen LoRA alpha at {base}")
+            roots = [r for r in roots if r[0] == "dit"]
         self.entries = []
         self.unmatched = []
         for base, parts in grouped.items():
@@ -257,7 +271,14 @@ class InferenceLoRA:
             alpha = parts.get("alpha")
             if alpha is not None:
                 e.alpha = float(alpha.flatten()[0])
-            w_shape = getattr(getattr(module, "weight", None), "shape", None)
+            # Accessing .weight on an OstrisLinear materializes the dequantized matrix.
+            if isinstance(module, torch.nn.Linear):
+                w_shape = (module.out_features, module.in_features)
+            else:
+                w_shape = getattr(getattr(module, "weight", None), "shape", None)
+            if strict_transformer_lora and (w_shape is None or len(w_shape) != 2):
+                self.unmatched.append(f"{base} (expected linear weight)")
+                continue
             if e.A is not None and e.B is not None and e.A.dim() == 2:
                 if w_shape is not None and (e.B.shape[0] != w_shape[0] or e.A.shape[1] != w_shape[1]):
                     self.unmatched.append(f"{base} (shape {tuple(e.B.shape[0:1]) + tuple(e.A.shape[1:])} vs {tuple(w_shape)})")
@@ -279,6 +300,8 @@ class InferenceLoRA:
             if e.A is None and e.kron is None and e.diff is None and e.diff_b is None:
                 continue
             self.entries.append(e)
+        if strict_transformer_lora and self.unmatched:
+            raise ValueError(f"Frozen LoRA does not match this transformer: {self.report(max_unmatched=10)}")
         return self
 
     @staticmethod
@@ -362,7 +385,9 @@ class InferenceLoRA:
                     x = inputs[0] if inputs else None
                     if x is None:
                         return output
-                    key = (x.device, x.dtype, lora.strength)
+                    # Sampling can create inference tensors. Rebuild the factors
+                    # for training so autograd can save them for the input gradient.
+                    key = (x.device, x.dtype, lora.strength, torch.is_inference_mode_enabled())
                     if key not in cache:
                         cache.clear()
                         # A^T stored [in, r] contiguous: cuBLAS runs x @ A^T 2.5x faster in that

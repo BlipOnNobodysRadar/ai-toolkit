@@ -174,6 +174,8 @@ export const clearDpoConfig = (
   setJobConfig: (value: any, key: string) => void,
 ) => {
   const process = jobConfig.config.process[0];
+  setJobConfig(undefined, 'config.process[0].train.dpo_reference_lora_path');
+  setJobConfig(undefined, 'config.process[0].train.dpo_reference_lora_strength');
   if (!isDpoFeedbackEnabled(process.train.dpo_feedback)) {
     setJobConfig(undefined, 'config.process[0].train.dpo_beta');
   }
@@ -226,6 +228,8 @@ export const handleModelArchChange = (
     }
     setJobConfig(undefined, 'config.process[0].train.dpo_beta');
     setJobConfig(undefined, 'config.process[0].train.dpo_feedback');
+    setJobConfig(undefined, 'config.process[0].train.dpo_reference_lora_path');
+    setJobConfig(undefined, 'config.process[0].train.dpo_reference_lora_strength');
   }
 
   // update vram setting

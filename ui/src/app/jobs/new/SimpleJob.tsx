@@ -936,6 +936,28 @@ export default function SimpleJob({
                       </p>
                     </>
                   )}
+                  {isDpoActive && (
+                    <>
+                      <TextInput
+                        label="Frozen reference LoRA (optional)"
+                        className="pt-2"
+                        value={jobConfig.config.process[0].train.dpo_reference_lora_path ?? ''}
+                        placeholder="Path to the LoRA used to generate your images"
+                        onChange={value => {
+                          setJobConfig(value || undefined, 'config.process[0].train.dpo_reference_lora_path');
+                          if (!value) setJobConfig(undefined, 'config.process[0].train.dpo_reference_lora_strength');
+                        }}
+                      />
+                      {jobConfig.config.process[0].train.dpo_reference_lora_path && (
+                        <NumberInput
+                          label="Reference LoRA strength"
+                          className="pt-2"
+                          value={jobConfig.config.process[0].train.dpo_reference_lora_strength ?? 1}
+                          onChange={value => setJobConfig(value ?? undefined, 'config.process[0].train.dpo_reference_lora_strength')}
+                        />
+                      )}
+                    </>
+                  )}
                   {modelArch?.additionalSections?.includes('train.audio_loss_multiplier') && (
                     <NumberInput
                       label="Audio Loss Multiplier"

@@ -53,6 +53,24 @@ def _dpo_relative_key(path: str, root: str) -> str:
     return os.path.normcase(os.path.normpath(os.path.relpath(path, root)))
 
 
+def _read_preference_probability(chosen_path: str) -> float:
+    path = os.path.splitext(chosen_path)[0] + ".dpo.json"
+    try:
+        with open(path, encoding="utf-8") as stream:
+            metadata = json.load(stream)
+    except FileNotFoundError:
+        return 1.0  # A legacy chosen/rejected pair is a hard preference.
+    except (ValueError, OSError) as exc:
+        raise ValueError(f"Cannot read DPO sidecar {path}: {exc}") from exc
+    if (not isinstance(metadata, dict) or type(metadata.get("version")) is not int
+            or metadata["version"] != 1):
+        raise ValueError(f"Expected a version 1 DPO sidecar at {path}")
+    probability = metadata.get("preference_probability")
+    if type(probability) not in (float, int) or not 0.5 <= probability <= 1:
+        raise ValueError(f"Expected a numeric preference_probability in [0.5, 1] at {path}")
+    return float(probability)
+
+
 def validate_dpo_roots(folder_path: str, rejected_path: str):
     """Validate the chosen/rejected roots before any file is read.
 
@@ -758,6 +776,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     rejected_item.dpo_pair_signature = pair_signature
                     file_item.rejected_path = rejected_file
                     file_item.rejected_item = rejected_item
+                    file_item.preference_probability = _read_preference_probability(file)
                 source_items.append(file_item)
             except Exception as e:
                 # A DPO pair is atomic. Never continue with the chosen half alone
