@@ -43,9 +43,8 @@ class _StubModel:
         return ["blocks"]
 
 
-def _names(base_model, ignore=None):
+def _names(base_model, ignore=None, **kw):
     toy = ToyH3()
-    kw = {}
     if ignore is not None:
         kw['ignore_if_contains'] = ignore
     n = LoRASpecialNetwork(
@@ -101,6 +100,25 @@ def test_opt_out_keeps_adaln_for_legacy_resume():
     names = [m.lora_name for m in n.unet_loras]
     assert sum('adaln_proj' in x for x in names) == 2
     assert n.model_lora_ignores == []
+
+
+def test_historical_checkpoint_restores_its_targets_without_config_edits(tmp_path):
+    from safetensors.torch import save_file
+    from toolkit.network_mixins import resume_lora_kwargs
+    stub = _StubModel('minimax_h3', ['adaln_proj', 'unused'])
+    path = str(tmp_path / 'old.safetensors')
+    save_file({'lora_transformer_blocks_0_adaln_proj_linear.lora_up.weight': torch.ones(1)}, path)
+    options = {'ignore_if_contains': ['blocks.1.']}
+    restored = resume_lora_kwargs(options, stub.lora_ignore_if_contains, path)
+    names = _names(stub, **restored)
+    assert any('adaln_proj' in name for name in names)
+    assert all('blocks$$0$$' in name for name in names)
+    assert restored['ignore_if_contains'] == ['blocks.1.', 'unused']
+    assert options == {'ignore_if_contains': ['blocks.1.']}
+    explicit = {'use_model_lora_ignores': True}
+    assert resume_lora_kwargs(explicit, stub.lora_ignore_if_contains, path) == explicit
+    save_file({'lora_transformer_blocks_0_qkv_proj.lora_up.weight': torch.ones(1)}, path)
+    assert resume_lora_kwargs(options, stub.lora_ignore_if_contains, path) == options
 
 
 def _resume_probe(model_lora_ignores, pretrained=None):

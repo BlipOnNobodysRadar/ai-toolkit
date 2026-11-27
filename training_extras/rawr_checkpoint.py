@@ -111,7 +111,10 @@ def restore(scheduler, captured, config, trainer_step):
             stochastic = payload['training_state'].get('stochastic')
             if not isinstance(stochastic, dict) or type(stochastic.get('supported')) is not bool:
                 raise ValueError('Missing RAWR stochastic checkpoint state')
-        if payload.get('config') != config:
+        # The loop target can change after saving. The optimizer groups already
+        # hold the cycle length, including when it originally defaulted to train.steps.
+        saved_config = payload.get('config')
+        if not isinstance(saved_config, dict) or {**saved_config, 'total_steps': config['total_steps']} != config:
             raise ValueError('RAWR resume configuration changed; use the saved configuration or start a new run')
         if payload.get('trainer_step') != int(trainer_step):
             raise ValueError('RAWR optimizer checkpoint step does not match selected training metadata')

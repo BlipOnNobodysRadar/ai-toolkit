@@ -113,6 +113,22 @@ def saved_keys_for_model_ignores(keys, model_ignores):
     return [k for k in keys if any(w in k for w in pats)]
 
 
+def resume_lora_kwargs(network_kwargs, model_ignores, path):
+    """Rebuild the checkpoint's targets if a model added default excludes after the run began."""
+    from safetensors import safe_open
+    if not path or not path.endswith('.safetensors') or 'use_model_lora_ignores' in network_kwargs:
+        return network_kwargs
+    with safe_open(path, framework='pt') as checkpoint:
+        keys = checkpoint.keys()
+    saved = [pattern for pattern in model_ignores if saved_keys_for_model_ignores(keys, [pattern])]
+    if not saved:
+        return network_kwargs
+    ignores = list(network_kwargs.get('ignore_if_contains') or [])
+    ignores.extend(pattern for pattern in model_ignores if pattern not in saved and pattern not in ignores)
+    print(f"Resuming LoRA targets from {path}, including {', '.join(saved)}")
+    return {**network_kwargs, 'ignore_if_contains': ignores, 'use_model_lora_ignores': False}
+
+
 def add_bias(tensor, bias):
     if bias is None:
         return tensor

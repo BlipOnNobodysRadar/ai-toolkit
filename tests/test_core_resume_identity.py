@@ -125,6 +125,20 @@ def test_a_same_shaped_module_swap_is_refused(tmp_path):
     assert b.optimizer.state_dict()['state'] == {}
 
 
+def test_resume_loads_moments_when_the_original_gpu_is_unavailable(tmp_path, monkeypatch):
+    a = trainer(tmp_path)
+    train(a, 3)
+    with monkeypatch.context() as patch:
+        # Serialize the device label of a GPU which is absent on this CPU runner.
+        registry = [(0, lambda storage: 'cuda:19', lambda storage, location: None)]
+        patch.setattr(torch.serialization, '_package_registry', registry + torch.serialization._package_registry)
+        save(a)
+    b = trainer(tmp_path)
+    resume(b)
+    assert b.step_num == 3
+    assert same(moments(b), moments(a))
+
+
 def test_the_swap_is_refused_by_the_optimizer_check_too(tmp_path):
     # the network check comes first in a resume; the optimizer check holds on its own (also the RAWR path)
     a = trainer(tmp_path, only='block_a')
