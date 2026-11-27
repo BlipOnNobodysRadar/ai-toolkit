@@ -37,6 +37,7 @@ const Sidebar = () => {
   const navigation = [
     { name: 'Dashboard', href: '/dashboard', icon: Home },
     { name: 'Generate', href: '/generate', icon: Sparkles, badge: 'alpha' },
+    { name: 'Step distillation', href: '/distill', icon: BrainCircuit },
     { name: 'New Job', href: '/jobs/new', icon: Plus },
     { name: 'Queue', href: '/jobs', icon: BrainCircuit },
     { name: 'Datasets', href: '/datasets', icon: Images },

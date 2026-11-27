@@ -100,6 +100,7 @@ class MossImagePipeline:
         isolate_refs: bool = False,
         batched_cfg: bool = True,
         sigmas: Optional[List[float]] = None,
+        solver: str = "euler",
         **kwargs,
     ):
         model = self.model
@@ -155,8 +156,10 @@ class MossImagePipeline:
         else:
             sigmas = moss_sigmas(num_inference_steps, shift=shift).to(device)
         num_steps = len(sigmas) - 1
-        for step_index in range(num_steps):
-            sigma, sigma_next = sigmas[step_index], sigmas[step_index + 1]
+        if solver not in ("euler", "heun"):
+            raise ValueError(f"Unsupported MOSS sampler: {solver}")
+
+        def predict_at(latents, sigma):
             timestep = (sigma * NUM_TRAIN_TIMESTEPS).reshape(1)
             # CFG combines fp32 predictions even though the DiT runs in bf16
             if batched:
@@ -184,9 +187,17 @@ class MossImagePipeline:
                     **ref_kwargs,
                 ).float()
                 pred = pred_uncond + guidance_scale * (pred - pred_uncond)
+            return pred
+
+        for step_index in range(num_steps):
+            sigma, sigma_next = sigmas[step_index], sigmas[step_index + 1]
+            pred = predict_at(latents, sigma)
             if getattr(model, "sample_step_hook", None) is not None:
                 # inference engine preview: x0 estimate
                 model._emit_sample_step(latents - sigma * pred, step_index, num_steps)
+            if solver == "heun" and step_index + 1 < num_steps:
+                proposal = latents + (sigma_next - sigma) * pred
+                pred = 0.5 * (pred + predict_at(proposal, sigma_next))
             latents = latents + (sigma_next - sigma) * pred
 
         images = model.decode_latents(latents, device=device, dtype=torch.float32)
