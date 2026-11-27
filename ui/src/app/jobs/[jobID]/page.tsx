@@ -18,6 +18,7 @@ import JobNotes from '@/components/JobNotes';
 import JobReports from '@/components/JobReports';
 import { Job } from '@prisma/client';
 import { apiClient } from '@/utils/api';
+import Link from 'next/link';
 
 type PageKey = 'overview' | 'samples' | 'config' | 'loss_log' | 'reports' | 'notes' | 'plugin';
 
@@ -151,6 +152,11 @@ export default function JobPage({ params }: { params: Promise<{ jobID: string }>
         {status === 'success' && job == null && <p>This job is no longer in the queue.</p>}
         {job && (
           <>
+            {jobType === 'moss_distill' && job.status === 'completed' &&
+              JSON.parse(job.job_config)?.config?.process?.[0]?.stage === 'prepare' &&
+              <Link href={'/distill?teacher=' + job.id} className="inline-block mb-3 rounded bg-blue-700 px-3 py-2">
+                Review teacher outputs and create student
+              </Link>}
             {pages.map(page => {
               const Component = page.component;
               return page.value === pageKey ? <Component key={page.value} job={job} /> : null;
