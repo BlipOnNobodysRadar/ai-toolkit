@@ -3,6 +3,7 @@ import requests
 import os
 import json
 import tqdm
+import tempfile
 
 
 class ModelCache:
@@ -174,41 +175,31 @@ def get_model_path_from_url(url: str):
         file_info, model_version_id = get_model_download_info(model_id, query_params.get('modelVersionId', None))
 
         download_url = file_info['downloadUrl']  # url does not work directly
-        size_kb = file_info['sizeKB']
         filename = file_info['name']
         model_path = os.path.join(MODELS_PATH, filename)
-
-        # download model
-        print(f"Did not find model locally, downloading from model from: {download_url}")
-
-        # use tqdm to show status of downlod
-        response = requests.get(download_url, stream=True)
-        response.raise_for_status()
-        total_size_in_bytes = int(response.headers.get('content-length', 0))
-        block_size = 1024  # 1 Kibibyte
-        progress_bar = tqdm.tqdm(total=total_size_in_bytes, unit='iB', unit_scale=True)
-        tmp_path = os.path.join(MODELS_PATH, f".download_tmp_{filename}")
+        tmp_path = None
         os.makedirs(os.path.dirname(model_path), exist_ok=True)
-        # remove tmp file if it exists
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
+        print(f"Downloading Civitai model {model_id}, version {model_version_id}")
         try:
-
-            with open(tmp_path, 'wb') as f:
-                for data in response.iter_content(block_size):
-                    progress_bar.update(len(data))
-                    f.write(data)
-                progress_bar.close()
-                # move to final path
-                os.rename(tmp_path, model_path)
-                model_cache.update_cache(model_id, model_version_id, model_path)
-
-                return model_path
-        except Exception as e:
-            # remove tmp file
-            os.remove(tmp_path)
-            raise e
+            with requests.get(download_url, stream=True) as response:
+                response.raise_for_status()
+                total = int(response.headers.get('content-length', 0))
+                with tempfile.NamedTemporaryFile(dir=os.path.dirname(model_path), prefix='.download_tmp_', delete=False) as f:
+                    tmp_path = f.name
+                    with tqdm.tqdm(total=total, unit='iB', unit_scale=True) as progress:
+                        for data in response.iter_content(1024):
+                            f.write(data)
+                            progress.update(len(data))
+            os.replace(tmp_path, model_path)
+        except requests.RequestException as error:
+            # HTTP and streaming errors can contain the full signed storage URL.
+            status = f" (HTTP {error.response.status_code})" if error.response is not None else ""
+            raise OSError(f"Civitai download failed for model {model_id}{status}") from None
+        finally:
+            if tmp_path is not None and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        model_cache.update_cache(model_id, model_version_id, model_path)
+        return model_path
 
 
 # if is main

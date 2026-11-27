@@ -40,12 +40,15 @@ from __future__ import annotations
 import hashlib
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 import zipfile
+from functools import wraps
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping, Optional
 
@@ -185,37 +188,102 @@ def _safe_header_lines(headers: Optional[Mapping[str, Any]]) -> list[str]:
     return [f"  header={key}: {value}" for key, value in clean.items()]
 
 
-def _write_aria2_input(url: str, headers: Optional[Mapping[str, Any]], target: Path) -> str:
-    if "\n" in url or "\r" in url:
+def _aria2_input(url: str, headers: Optional[Mapping[str, Any]], target: Path) -> str:
+    if any(c in url for c in "\t\r\n"):
         raise RuntimeError("Refusing to pass a malformed download URL to aria2")
     if any(c in str(target) for c in "\r\n"):
         raise RuntimeError("Refusing to pass a malformed download path to aria2")
 
-    fd, path = tempfile.mkstemp(prefix="aitk-aria2-", suffix=".txt")
-    try:
-        os.chmod(path, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(url)
-            handle.write("\n")
-            # per-item options: aria2 ignores the command-line --dir/--out for
-            # input-file items and would name the file from Content-Disposition
-            # (e.g. config.json) instead of Hugging Face's .incomplete path
-            handle.write(f"  dir={target.parent}\n")
-            handle.write(f"  out={target.name}\n")
-            for line in _safe_header_lines(headers):
-                handle.write(line)
-                handle.write("\n")
-        return path
-    except Exception:
+    # Per-item options override Content-Disposition. The entire item goes through
+    # stdin so a terminated job cannot leave a signed URL or headers on disk.
+    lines = [url, f"  dir={target.parent}", f"  out={target.name}", *_safe_header_lines(headers)]
+    return "\n".join(lines) + "\n"
+
+
+# aria2 reapplies custom headers on every redirect. Only pass these noncredential
+# headers to it. Authenticated requests stay inside the Python HTTP client.
+_PUBLIC_HEADERS = {"user-agent", "accept", "accept-encoding", "range"}
+_PROGRESS = re.compile(r"^\[#[0-9a-f]+ (\d+)B/(\d+)B(?:\(\d+%\))? CN:\d+")
+
+
+def _origin(url):
+    import httpx
+    address = httpx.URL(url)
+    return address.scheme, address.host, address.port
+
+
+def _authenticated_download(url, headers, temp_file, resume_size, expected_size, label, bar, retries):
+    """Consume a private response or return its first off-origin URL with no credentials."""
+    import httpx
+    from huggingface_hub import constants
+    from huggingface_hub.utils import get_session
+
+    client = get_session()
+    offset = resume_size
+    if temp_file.seekable():
+        temp_file.seek(offset)
+        temp_file.truncate()
+    for attempt in range(retries + 1):
+        request_headers = httpx.Headers(headers)
+        request_headers["Accept-Encoding"] = "identity"
+        if offset:
+            request_headers["Range"] = f"bytes={offset}-"
+        request = client.build_request("GET", url, headers=request_headers, timeout=constants.HF_HUB_DOWNLOAD_TIMEOUT)
         try:
-            os.close(fd)
-        except OSError:
-            pass
+            for _ in range(client.max_redirects + 1):
+                response = client.send(request, stream=True, follow_redirects=False)
+                try:
+                    redirect = response.next_request
+                    if redirect is not None:
+                        if _origin(request.url) != _origin(redirect.url):
+                            return str(redirect.url), offset
+                        request = redirect
+                        continue
+                    response.raise_for_status()
+                    if offset and response.status_code == 200:
+                        temp_file.seek(0)
+                        temp_file.truncate()
+                        offset = 0
+                    for chunk in response.iter_bytes(chunk_size=constants.DOWNLOAD_CHUNK_SIZE):
+                        temp_file.write(chunk)
+                        offset += len(chunk)
+                    if expected_size is not None and expected_size != offset:
+                        raise OSError(f"Download size mismatch for {label}: expected {expected_size} bytes, got {offset}")
+                    _update_aggregate_bar(bar, max(0, offset - resume_size))
+                    return None
+                finally:
+                    response.close()
+            raise RuntimeError(f"Too many HTTP redirects while downloading {label}")
+        except httpx.HTTPStatusError as error:
+            status = error.response.status_code
+            if status not in (408, 429, 500, 502, 503, 504) or attempt == retries:
+                raise OSError(f"HTTP {status} while downloading {label}") from None
+        except httpx.TransportError as error:
+            if attempt == retries:
+                raise OSError(f"{type(error).__name__} while downloading {label}") from None
+        time.sleep(2)
+
+
+def _run_aria2(command: list[str], item: str) -> int:
+    # aria2 prints complete signed URLs even on ordinary redirects and errors.
+    # Keep numeric transfer progress and the exit code, never relay raw output.
+    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          encoding="utf-8", errors="replace") as child:
         try:
-            os.unlink(path)
-        except OSError:
-            pass
-        raise
+            try:
+                child.stdin.write(item)
+                child.stdin.close()
+            except BrokenPipeError:
+                pass
+            for line in child.stdout:
+                progress = _PROGRESS.match(line.strip())
+                if progress:
+                    done, total = map(int, progress.groups())
+                    print(f"[ai-toolkit/aria2] {_human_bytes(done)} / {_human_bytes(total)}", flush=True)
+            return child.wait()
+        finally:
+            if child.poll() is None:
+                child.kill()
 
 
 def _update_aggregate_bar(bar: Any, delta: int) -> None:
@@ -282,8 +350,6 @@ def aria2_http_get(
 ) -> None:
     """Drop-in replacement for ``huggingface_hub.file_download.http_get``."""
 
-    del tqdm_class, _nb_retries, kwargs  # aria2 handles retries/progress itself.
-
     if expected_size is not None and resume_size == expected_size:
         target_name = getattr(temp_file, "name", None)
         if isinstance(target_name, (str, bytes, os.PathLike)):
@@ -292,41 +358,31 @@ def aria2_http_get(
         return
 
     target_name = getattr(temp_file, "name", None)
-    if not isinstance(target_name, (str, bytes, os.PathLike)):
-        # This is not how hf_hub_download normally invokes http_get, but retain
-        # compatibility with unusual callers rather than guessing a path.
-        if _ORIGINAL_HTTP_GET is None:
-            raise RuntimeError("Hugging Face provided aria2 with a non-path temporary file")
-        return _ORIGINAL_HTTP_GET(
-            url,
-            temp_file,
-            resume_size=resume_size,
-            headers=headers,
-            expected_size=expected_size,
-            displayed_filename=displayed_filename,
-            _tqdm_bar=_tqdm_bar,
-        )
+    target = Path(os.fsdecode(target_name)).resolve() if isinstance(target_name, (str, bytes, os.PathLike)) else None
+    label = displayed_filename or (target.name if target is not None else "Hub download")
+    # The Hub normally supplies a model filename. Some callers pass a signed URL.
+    if "://" in label:
+        label = "Hub download"
 
-    target = Path(os.fsdecode(os.fspath(target_name))).resolve()
-    if _too_long_for_aria2(target):
-        # aria2c on Windows can't open a path past MAX_PATH; Hugging Face reaches those through the long-path prefix.
-        # Seen 14 Nov 2026: aria2 exit 16 on a 279-character cache temp path under a deep worktree's models folder.
-        # Download this file with the hub's own code instead of failing the job.
+    native = target is None or _too_long_for_aria2(target)
+    public_headers = {k: v for k, v in (headers or {}).items() if k.lower() in _PUBLIC_HEADERS}
+    if len(public_headers) != len(headers or {}):
+        # Use the originating server's credentials only up to an origin change.
+        # Gated models can still use segmented downloads at their signed CDN URL.
+        location = _authenticated_download(url, headers, temp_file, resume_size, expected_size,
+                                           label, _tqdm_bar, _nb_retries)
+        if location is None:
+            return
+        url, resume_size = location
+        headers = public_headers
+
+    if native:
         if _ORIGINAL_HTTP_GET is None:
-            raise RuntimeError(f"Path too long for aria2c on Windows: {target}")
-        print(
-            f"[ai-toolkit/aria2] Path too long for aria2c on Windows ({len(_plain_path(target))} characters); "
-            f"using the Hugging Face downloader for {displayed_filename or target.name}",
-            flush=True,
-        )
+            raise RuntimeError("The Hugging Face downloader is unavailable for this transfer")
         return _ORIGINAL_HTTP_GET(
-            url,
-            temp_file,
-            resume_size=resume_size,
-            headers=headers,
-            expected_size=expected_size,
-            displayed_filename=displayed_filename,
-            _tqdm_bar=_tqdm_bar,
+            url, temp_file, resume_size=resume_size, headers=headers,
+            expected_size=expected_size, displayed_filename=label, tqdm_class=tqdm_class,
+            _nb_retries=_nb_retries, _tqdm_bar=_tqdm_bar,
         )
     target.parent.mkdir(parents=True, exist_ok=True)
     _remove_orphaned_control_files(target.parent)
@@ -349,7 +405,6 @@ def aria2_http_get(
     log_interval = _env_int("AITK_ARIA2_LOG_INTERVAL", 5, 1, 3600)
     binary = _aria2_binary()
 
-    label = displayed_filename or target.name
     if resume_size:
         print(
             f"[ai-toolkit/aria2] Resuming {label} at {_human_bytes(resume_size)}",
@@ -358,7 +413,7 @@ def aria2_http_get(
     else:
         print(f"[ai-toolkit/aria2] Downloading {label}", flush=True)
 
-    input_file = _write_aria2_input(url, headers, target)
+    item = _aria2_input(url, headers, target)
     command = [
         binary,
         "--continue=true",
@@ -375,19 +430,19 @@ def aria2_http_get(
         "--timeout=60",
         f"--summary-interval={log_interval}",
         "--console-log-level=notice",
-        "--show-console-readout=true",
+        "--show-console-readout=false",
+        "--human-readable=false",
+        "--enable-color=false",
         f"--dir={target.parent}",
         f"--out={target.name}",
-        f"--input-file={input_file}",
+        "--input-file=-",
     ]
 
     try:
-        # Inherit stdout/stderr so aria2's live progress is visible in the
-        # ai-toolkit terminal/UI job log.
-        completed = subprocess.run(command, check=False)
-        if completed.returncode != 0:
+        returncode = _run_aria2(command, item)
+        if returncode != 0:
             raise RuntimeError(
-                f"aria2c exited with code {completed.returncode} while downloading "
+                f"aria2c exited with code {returncode} while downloading "
                 f"{label}. {_PARTIAL_FILE_NOTE}"
             )
     except KeyboardInterrupt:
@@ -396,11 +451,6 @@ def aria2_http_get(
             flush=True,
         )
         raise
-    finally:
-        try:
-            os.unlink(input_file)
-        except OSError:
-            pass
 
     # The same file is open in this Python process while aria2 writes it.
     # Seek again so Hugging Face sees the new on-disk length.
@@ -445,6 +495,26 @@ def patch_huggingface_downloads() -> bool:
     current = file_download.http_get
     if getattr(current, "_aitk_aria2_patch", False):
         return True
+
+    # The Hub can hand a signed CDN URL directly to http_get after a metadata
+    # lookup. Its built-in strip covers only lowercase "authorization" and
+    # compares hosts alone. Keep custom API keys, cookies and case variants at
+    # the actual Hub endpoint, including an endpoint supplied by the caller.
+    metadata = file_download._get_metadata_or_catch_error
+    if not getattr(metadata, "_aitk_scoped_headers", False):
+        @wraps(metadata)
+        def scoped_metadata(**kwargs):
+            result = metadata(**kwargs)
+            endpoint = kwargs.get("endpoint") or hub_constants.ENDPOINT
+            if result[0] and _origin(endpoint) != _origin(result[0]):
+                headers = kwargs["headers"]
+                for key in list(headers):
+                    if key.lower() not in _PUBLIC_HEADERS:
+                        del headers[key]
+            return result
+
+        scoped_metadata._aitk_scoped_headers = True
+        file_download._get_metadata_or_catch_error = scoped_metadata
 
     _ORIGINAL_HTTP_GET = current
     aria2_http_get._aitk_aria2_patch = True

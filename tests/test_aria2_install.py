@@ -121,13 +121,88 @@ def test_input_file_names_the_target_per_item(tmp_path):
     # Hugging Face blobs under their Content-Disposition name (config.json) and the
     # .incomplete file stayed empty
     target = tmp_path / "blobs" / "abc123.incomplete"
-    path = aria2._write_aria2_input("https://example.invalid/f", {"authorization": "Bearer x"}, target)
-    try:
-        lines = open(path, encoding="utf-8").read().splitlines()
-    finally:
-        aria2.os.unlink(path)
+    lines = aria2._aria2_input("https://example.invalid/f", {"user-agent": "Hub"}, target).splitlines()
     assert lines[0] == "https://example.invalid/f"
     assert f"  dir={target.parent}" in lines and "  out=abc123.incomplete" in lines
-    assert "  header=authorization: Bearer x" in lines
+    assert "  header=user-agent: Hub" in lines
     with pytest.raises(RuntimeError, match="malformed download path"):
-        aria2._write_aria2_input("https://example.invalid/f", None, tmp_path / "bad\nname")
+        aria2._aria2_input("https://example.invalid/f", None, tmp_path / "bad\nname")
+
+
+def test_only_numeric_aria2_output_reaches_the_job_log(capsys):
+    import sys
+
+    # A subprocess echoing its entire signed input models aria2's redirects and errors.
+    script = ("import sys; item = sys.stdin.read(); assert item.endswith('signature'); "
+              "assert sys.argv[1:] == ['--input-file=-']; "
+              "print(item); print('[#aa311d 10B/100B(10%) CN:1 DL:1B ETA:90s]'); "
+              "print(item, file=sys.stderr); sys.exit(3)")
+    rc = aria2._run_aria2([sys.executable, "-c", script, "--input-file=-"],
+                          "https://cdn.invalid/blob?private-signature")
+    assert rc == 3
+    logs = capsys.readouterr()
+    assert "10.0 B / 100.0 B" in logs.out
+    assert "signature" not in logs.out + logs.err
+
+
+def test_credentials_follow_same_origin_only_and_cdn_input_uses_stdin(tmp_path, monkeypatch):
+    import httpx
+    import huggingface_hub.utils
+
+    def route(req):
+        assert req.url.host == "hub.invalid" and req.headers["Authorization"] == "Bearer private-token"
+        assert req.headers["X-Api-Key"] == "private-key"
+        dest = "/renamed" if req.url.path == "/repo" else "https://storage.invalid/blob?private-signature"
+        return httpx.Response(302, headers={"Location": dest})
+
+    with httpx.Client(transport=httpx.MockTransport(route)) as client:
+        monkeypatch.setattr(huggingface_hub.utils, "get_session", lambda: client)
+        target = tmp_path / "model.incomplete"
+        def run(command, item):
+            assert "--input-file=-" in command and all("private-" not in a for a in command)
+            assert "private-token" not in item and "private-key" not in item
+            assert item.startswith("https://storage.invalid/blob?private-signature\n")
+            target.write_bytes(b"weights")
+            return 0
+        monkeypatch.setattr(aria2, "_aria2_binary", lambda: "aria2c")
+        monkeypatch.setattr(aria2, "_run_aria2", run)
+        with target.open("w+b") as f:
+            aria2.aria2_http_get("https://hub.invalid/repo", f, expected_size=7,
+                                 headers={"Authorization": "Bearer private-token", "X-Api-Key": "private-key"})
+            assert f.tell() == 7
+
+
+def test_private_file_without_redirect_still_resumes(tmp_path, monkeypatch):
+    import httpx
+    import huggingface_hub.utils
+
+    def route(req):
+        assert req.headers["Authorization"] == "Bearer private-token" and req.headers["Range"] == "bytes=3-"
+        return httpx.Response(206, content=b"ghts")
+    with httpx.Client(transport=httpx.MockTransport(route)) as client:
+        monkeypatch.setattr(huggingface_hub.utils, "get_session", lambda: client)
+        with (tmp_path / "model").open("w+b") as f:
+            f.write(b"wei")
+            aria2.aria2_http_get("https://hub.invalid/repo", f, expected_size=7, resume_size=3,
+                                 headers={"Authorization": "Bearer private-token"})
+            f.seek(0)
+            assert f.read() == b"weights"
+
+def test_hub_metadata_handoff_drops_every_private_header_at_an_origin_change(monkeypatch):
+    from huggingface_hub import constants, file_download
+
+    endpoint = "https://private-hub.invalid"
+    monkeypatch.setenv("AITK_HF_DOWNLOADER", "aria2")
+    monkeypatch.setenv("HF_HUB_DISABLE_XET", "0")
+    monkeypatch.setattr(aria2, "_ORIGINAL_HTTP_GET", None)
+    monkeypatch.setattr(constants, "HF_HUB_DISABLE_XET", False)
+    monkeypatch.setattr(file_download, "http_get", lambda *args: None)
+    monkeypatch.setattr(file_download, "_get_metadata_or_catch_error", lambda **kwargs: (kwargs["location"],))
+    aria2.patch_huggingface_downloads()
+
+    private = {"Authorization": "Bearer private-token", "Cookie": "private-cookie", "X-API-Key": "private-key"}
+    for location in [endpoint + "/repo", "http://private-hub.invalid/file", "https://cdn.invalid/file"]:
+        headers = {**private, "User-Agent": "Hub"}
+        result = file_download._get_metadata_or_catch_error(headers=headers, endpoint=endpoint, location=location)
+        assert result == (location,)
+        assert headers == ({**private, "User-Agent": "Hub"} if location.startswith(endpoint) else {"User-Agent": "Hub"})
