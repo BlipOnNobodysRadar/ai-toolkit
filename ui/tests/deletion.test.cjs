@@ -126,6 +126,7 @@ test('a retry after changing Training Folder removes the original run only', asy
 test('renamed runs retain their launch folder, and deleting one of two references keeps the other checkpoints', async () => {
   const runDir = folderWithBytes('before-rename');
   const renamed = await makeJob(F.db, { name: 'after-rename', run_id: 'old-run', run_dir: runDir, launch_phase: 'exited' });
+  fs.writeFileSync(path.join(runDir, '.job_config.old-run.json'), '{}');
   const alias = await jobsRoute.POST({ json: async () => ({ name: 'before-rename', gpu_ids: '0', job_config: {} }) });
   assert.equal(alias.status, 409);
   const existing = await makeJob(F.db, { name: 'before-rename' });
@@ -170,7 +171,7 @@ test('a historical root junction resolves the original run and preserves files w
   fs.writeFileSync(path.join(original, name, '.job_config.last-run.json'), '{}');
   const { jobOutputFolder } = require(ts.uiPath('cron/ownership/resources.ts'));
   assert.equal(jobOutputFolder(F.trainingRoot, j), j.run_dir);
-  assert.equal(jobOutputFolder(F.trainingRoot, j, true), path.join(fs.realpathSync(original), name));
+  assert.equal(jobOutputFolder(F.trainingRoot, j, 'delete'), path.join(fs.realpathSync(original), name));
   fs.unlinkSync(link);
   fs.symlinkSync(replacement, link, 'junction');
   const checkpoint = path.join(replacement, name, 'keep.safetensors');
@@ -216,4 +217,46 @@ test('Delete from an older job row keeps a real live process, then succeeds afte
     worker.stdin.end();
     await ended;
   }
+});
+
+test('deletion retains both verified copies and protects a renamed relocated owner from another job', async () => {
+  const oldRoot = fs.mkdtempSync(path.join(SCRATCH, 'moved-from-'));
+  const old = path.join(oldRoot, 'output-name');
+  const moved = folderWithBytes('output-name');
+  const marker = '.job_config.rel-generation.json';
+  fs.writeFileSync(path.join(moved, marker), '{}');
+  const j = await makeJob(F.db, { name: 'display-name', run_id: 'rel-generation', run_dir: old, launch_phase: 'exited', step: 800 });
+  const alias = await makeJob(F.db, { name: 'output-name' });
+  const shared = await store.deleteJob(F.db, alias.id, F.trainingRoot);
+  assert.equal(shared.status, 200);
+  assert.match(shared.body.keptOutput, /display-name/);
+  assert.equal(fs.existsSync(path.join(moved, marker)), true);
+  fs.mkdirSync(old);
+  fs.writeFileSync(path.join(old, marker), '{}');
+  const ambiguous = await store.deleteJob(F.db, j.id, F.trainingRoot);
+  assert.equal(ambiguous.status, 200);
+  assert.ok(ambiguous.body.keptOutput);
+  assert.equal(fs.existsSync(path.join(old, marker)), true);
+  assert.equal(fs.existsSync(path.join(moved, marker)), true);
+});
+
+test('deleting a missing historical run leaves an unrelated same-name folder in the configured root alone', async () => {
+  const oldRoot = fs.mkdtempSync(path.join(SCRATCH, 'missing-old-'));
+  const name = 'unrelated-output';
+  const unrelated = folderWithBytes(name);
+  fs.writeFileSync(path.join(unrelated, '.job_config.other-generation.json'), '{}');
+  const j = await makeJob(F.db, { name, run_id: 'lost-generation', run_dir: path.join(oldRoot, name), launch_phase: 'exited', step: 800 });
+  assert.equal((await store.deleteJob(F.db, j.id, F.trainingRoot)).status, 200);
+  assert.equal(fs.existsSync(path.join(unrelated, 'samples', 'a.bin')), true);
+  const replaced = path.join(oldRoot, name);
+  fs.mkdirSync(replaced);
+  fs.writeFileSync(path.join(replaced, 'foreign'), 'keep');
+  const old = await makeJob(F.db, { name, run_id: 'lost-generation', run_dir: replaced, launch_phase: 'exited', step: 800 });
+  assert.equal((await store.requestStart(F.db, old.id, F.trainingRoot)).status, 409, 'foreign files do not identify the original run');
+  fs.writeFileSync(path.join(replaced, name + '_other_000000800.safetensors'), 'foreign');
+  assert.equal((await store.requestStart(F.db, old.id, F.trainingRoot)).status, 409, 'a different checkpoint prefix does not identify the run');
+  fs.writeFileSync(path.join(replaced, name + '_000000800.safetensors'), 'weights');
+  assert.equal((await store.requestStart(F.db, old.id, F.trainingRoot)).status, 200, 'the original named checkpoint can resume without its UI config');
+  assert.ok((await store.deleteJob(F.db, old.id, F.trainingRoot)).body.keptOutput);
+  assert.equal(fs.readFileSync(path.join(replaced, 'foreign'), 'utf8'), 'keep');
 });

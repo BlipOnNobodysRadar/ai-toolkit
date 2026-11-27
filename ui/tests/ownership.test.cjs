@@ -836,3 +836,53 @@ test('pausing a queue during startup returns the unspawned run to the queue', as
   assert.equal(paused.info, 'Job queued');
   assert.equal((await claimsOf(j.id)).length, 0);
 });
+
+test('moving or copying the run to the configured root preserves the checkpoint name and chooses the verified copy', async () => {
+  const movedRoot = path.join(F.trainingRoot, 'new-location');
+  const name = 'writer-prefix';
+  const old = path.join(F.trainingRoot, name);
+  const moved = path.join(movedRoot, name);
+  const marker = '.job_config.moved-generation.json';
+  const weights = name + '_000000800.safetensors';
+  fs.mkdirSync(moved, { recursive: true });
+  fs.writeFileSync(path.join(moved, marker), '{}');
+  fs.writeFileSync(path.join(moved, weights), 'moved');
+  const j = await makeJob(F.db, { name: 'renamed-in-the-ui', status: 'stopped', step: 800, run_id: 'moved-generation', run_dir: old, launch_phase: 'exited' });
+  // Even a leftover directory at the former location must not win over the matching launch generation.
+  fs.mkdirSync(old);
+  fs.writeFileSync(path.join(old, 'unrelated'), 'keep');
+  assert.equal(resources.jobOutputFolder(movedRoot, j), moved);
+  fs.writeFileSync(path.join(old, marker), '{}'); // the user kept a copy at both locations
+  assert.equal(resources.jobOutputFolder(movedRoot, j), moved);
+  assert.equal((await store.requestStart(F.db, j.id, movedRoot)).status, 200);
+  const { admitted } = await store.admit(F.db, j.id, movedRoot, self);
+  assert.equal(admitted.run_dir, moved);
+  assert.equal(admitted.previousRunId, j.run_id, 'launch can still verify the file for the previous generation');
+  fs.unlinkSync(path.join(moved, weights));
+  assert.doesNotThrow(() => resources.checkResumeFolder(moved, admitted, admitted.previousRunId));
+  fs.writeFileSync(path.join(moved, weights), 'moved');
+  const { bindLaunchConfig } = require(ts.uiPath('cron/ownership/launchConfig.ts'));
+  const bound = bindLaunchConfig({ config: { process: [{ type: 'sd_trainer' }] } }, admitted.name, admitted.run_dir);
+  assert.equal(path.join(bound.config.process[0].training_folder, bound.config.process[0].name, weights), path.join(moved, weights));
+});
+
+test('a missing resume directory reports the path and yields the queue without starting from zero', async () => {
+  const name = 'unmounted-run';
+  const old = path.join(F.trainingRoot, 'disconnected', name);
+  const current = path.join(F.trainingRoot, name);
+  fs.mkdirSync(current);
+  fs.writeFileSync(path.join(current, '.job_config.unrelated.json'), '{}');
+  const j = await makeJob(F.db, { name, status: 'stopped', step: 800, run_dir: old, run_id: 'previous-generation', launch_phase: 'exited' });
+  const start = await store.requestStart(F.db, j.id, F.trainingRoot);
+  assert.equal(start.status, 409);
+  assert.ok(start.body.error.includes(old));
+  await F.db.job.update({ where: { id: j.id }, data: { status: 'queued' } });
+  assert.equal((await admit(j)).admitted, null);
+  assert.equal((await job(j.id)).status, 'error');
+  assert.equal((await job(j.id)).step, 800);
+  assert.equal(fs.existsSync(path.dirname(old)), false);
+  fs.mkdirSync(old, { recursive: true });
+  assert.equal((await store.requestStart(F.db, j.id, F.trainingRoot)).status, 409, 'empty remounted folder is still missing its run');
+  await F.db.job.update({ where: { id: j.id }, data: { step: 0 } });
+  assert.equal((await store.requestStart(F.db, j.id, F.trainingRoot)).status, 200, 'a job interrupted before it made progress can retry');
+});

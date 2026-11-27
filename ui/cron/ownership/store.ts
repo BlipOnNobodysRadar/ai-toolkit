@@ -14,12 +14,14 @@ import { writerLeasePath } from './writerLease';
 import type { Job, Prisma, PrismaClient, RunClaim } from '@prisma/client';
 import {
   FolderIdentityError,
+  ResumeFolderError,
   ResourceSet,
   foldersOverlap,
   canonicalFolder,
   claimKeys,
   jobFolderError,
   jobOutputFolder,
+  trainingLaunchFolder,
   overlap,
   parseGpuIds,
   resourceSet,
@@ -186,6 +188,12 @@ export const requestStart = (db: Db, jobId: string, trainingRoot: string): Promi
     if (gpu.ok === false) return { status: 400, body: { error: gpu.error } };
     const nameError = jobFolderError(trainingRoot, job.name);
     if (nameError) return { status: 400, body: { error: nameError } };
+    try {
+      trainingLaunchFolder(trainingRoot, job);
+    } catch (error) {
+      if (error instanceof FolderIdentityError) return conflict(error.message);
+      throw error;
+    }
     const top = await tx.job.aggregate({ _max: { queue_position: true } });
     if (!(await tx.queue.findUnique({ where: { gpu_ids: job.gpu_ids } }))) {
       await tx.queue.create({ data: { gpu_ids: job.gpu_ids, is_running: false } });
@@ -299,13 +307,20 @@ export const markStopped = (db: Db, jobId: string, seen?: RunSnapshot): Promise<
 export const findOutputConflict = async (tx: Tx, trainingRoot: string, folder: string, exceptJobId?: string) => {
   const others = await tx.job.findMany({
     where: exceptJobId ? { id: { not: exceptJobId } } : {},
-    select: { name: true, run_dir: true },
+    select: { name: true, run_dir: true, run_id: true, exit_verified_at: true },
   });
   return others.find(other => {
     if (!jobFolderError(trainingRoot, other.name) && foldersOverlap(canonicalFolder(trainingRoot, other.name), folder)) return true;
     if (!other.run_dir || !path.isAbsolute(other.run_dir)) return false;
     if (jobFolderError(path.dirname(other.run_dir), path.basename(other.run_dir))) return false;
-    return foldersOverlap(canonicalFolder(path.dirname(other.run_dir), path.basename(other.run_dir)), folder);
+    if (foldersOverlap(canonicalFolder(path.dirname(other.run_dir), path.basename(other.run_dir)), folder)) return true;
+    try {
+      const actual = jobOutputFolder(trainingRoot, other);
+      return foldersOverlap(canonicalFolder(path.dirname(actual), path.basename(actual)), folder);
+    } catch (error) {
+      if (error instanceof FolderIdentityError) return false; // its configured and recorded names are checked above
+      throw error;
+    }
   });
 };
 
@@ -364,7 +379,7 @@ export const saveJob = (db: Db, body: any, trainingRoot: string, forcedGpuIds?: 
 
 const deletionTarget = (trainingRoot: string, job: Job): string | null => {
   try {
-    return jobOutputFolder(trainingRoot, job, true);
+    return jobOutputFolder(trainingRoot, job, 'delete');
   } catch (error) {
     if (error instanceof FolderIdentityError) return null;
     throw error;
@@ -498,7 +513,8 @@ export const finishDelete = async (db: Db, jobId: string, error: string | null) 
 // ---------------------------------------------------------------- admission (worker)
 export type Launcher = { pid: number; identity: string; boot_id?: string | null };
 
-export type Admission = { admitted: Job | null; reason?: string };
+export type AdmittedJob = Job & { previousRunId: string | null };
+export type Admission = { admitted: AdmittedJob | null; reason?: string };
 
 export const admit = async (db: Db, jobId: string, trainingRoot: string, launcher: Launcher, hooks?: { afterRead?: (tx: Tx) => Promise<void>; requireQueueRunning?: boolean }): Promise<Admission> => {
   try {
@@ -519,7 +535,14 @@ export const admit = async (db: Db, jobId: string, trainingRoot: string, launche
             await tx.job.updateMany({ where: { id: jobId, status: 'queued' }, data: { status: 'error', info: message } });
             return { admitted: null, reason: message };
           }
-          const folderAbs = jobOutputFolder(trainingRoot, job, true);
+          let folderAbs: string;
+          try {
+            folderAbs = trainingLaunchFolder(trainingRoot, job);
+          } catch (error) {
+            if (!(error instanceof ResumeFolderError)) throw error;
+            await tx.job.update({ where: { id: job.id }, data: { status: 'error', info: error.message, ownership_note: null } });
+            return { admitted: null, reason: error.message };
+          }
           const set = resourceSet(gpu, canonicalFolder(path.dirname(folderAbs), path.basename(folderAbs)));
           const occ = await occupants(tx, trainingRoot);
           if (hooks?.afterRead) await hooks.afterRead(tx);
@@ -561,7 +584,8 @@ export const admit = async (db: Db, jobId: string, trainingRoot: string, launche
             },
           });
           if (r.count !== 1) throw new LostRace();
-          return { admitted: await tx.job.findUnique({ where: { id: jobId } }) };
+          const claimed = await tx.job.findUniqueOrThrow({ where: { id: jobId } });
+          return { admitted: { ...claimed, previousRunId: job.run_id } };
         },
         { maxWait: 5000, timeout: 10000 },
       ),

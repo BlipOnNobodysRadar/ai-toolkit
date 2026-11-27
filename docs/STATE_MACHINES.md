@@ -591,6 +591,8 @@ launched before this schema ("legacy": `run_id` null), while it has an active st
 code never cleared `pid` on a normal exit). Display status is not ownership: Python writes completed/error/stopped/
 queued before its process exits.
 
+**Resume after a move or outage.** Keep the original output directory name because the trainer uses it as the checkpoint prefix. If the entire job folder moved to the current Training Folder, its saved per-run config identifies it. When both locations contain the same generation, resume uses the configured copy. Delete keeps both copies. For training jobs with recorded steps, the UI looks for the saved run config, named checkpoint, or matching RAWR manifest in the recorded directory. If it finds none, it reports where to restore the files or remount the disk. Older rows without a recorded path use the current Training Folder and job name. The displayed step is evidence of work performed. The trainer reads its resume position from the saved checkpoint.
+
 **Run boundary** (`toolkit/ui_procctl.py`). The supervisor uses the standard library. Force Stop for an identified legacy run also uses the installed psutil package. Process chain: worker -> relay
 (`ui_procctl.py launch`, a child of the worker that exits) -> per-run supervisor (`ui_procctl.py supervise`, detached,
 so training survives normal UI worker shutdown as before) -> root (`pythonw run.py <per-run config>`) and its

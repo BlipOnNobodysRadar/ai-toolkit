@@ -15,8 +15,9 @@ import { ChildProcess, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import type { Job } from '@prisma/client';
-import { Db, attachRun, markRelayExited, markSpawnRequested, noteOwnership, recordRelay, releaseRun } from './store';
+import { AdmittedJob, Db, attachRun, markRelayExited, markSpawnRequested, noteOwnership, recordRelay, releaseRun } from './store';
 import { bindLaunchConfig } from './launchConfig';
+import { checkResumeFolder } from './resources';
 import { withOpLock } from './opLock';
 import { writerLeasePath } from './writerLease';
 
@@ -157,7 +158,7 @@ class PreSpawnError extends Error {}
 // The helper implements a Windows job object, Linux subreaper, and macOS process group.
 export const SUPPORTED_PLATFORMS = ['win32', 'linux', 'darwin'];
 
-export const launchRun = async (ctx: LaunchContext, job: Job): Promise<LaunchResult> => {
+export const launchRun = async (ctx: LaunchContext, job: AdmittedJob): Promise<LaunchResult> => {
   const runId = job.run_id!;
   const folder = job.run_dir!;
   const files = runFiles(folder, runId);
@@ -169,6 +170,8 @@ export const launchRun = async (ctx: LaunchContext, job: Job): Promise<LaunchRes
     // ---- claimed: nothing exists yet; every failure is a known pre-spawn failure
     // Bind the saved config to the claimed folder BEFORE any run-folder/config write. In particular this rebinds a
     // stale Training Folder setting and process/config names, and refuses ambiguous multi-process layouts.
+    const resuming = job.job_type === 'train' && job.step > 0;
+    checkResumeFolder(folder, job, job.previousRunId);
     const jobConfig = bindLaunchConfig(job.job_config, job.name, folder);
     for (const proc of jobConfig.config.process) proc.sqlite_db_path = ctx.sqliteDbPath;
     // CLI trainers have no UI claim. Respect their lease during launch preparation too, before rotating their log
@@ -177,7 +180,7 @@ export const launchRun = async (ctx: LaunchContext, job: Job): Promise<LaunchRes
     const prepared = await withOpLock(writerLeasePath(folder), async () => {
       // A delayed launch may acquire this lock after Delete or a later run. Check before touching either one's files.
       if (!(await db.job.findFirst({ where: { id: job.id, run_id: runId, launch_phase: 'claimed' }, select: { id: true } }))) return false;
-      fs.mkdirSync(folder, { recursive: true });
+      if (!resuming) fs.mkdirSync(folder, { recursive: true });
       rotateLog(folder, files.log);
       writeAtomic(files.config, JSON.stringify(jobConfig, null, 2));
       logFd = fs.openSync(files.log, 'a');
