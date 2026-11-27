@@ -144,7 +144,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     // Resolve so `..` segments collapse, then verify still under an allowed root.
     // Substring `.includes('..')` false-positives on filenames containing `..` as text.
     const resolved = path.resolve(filepath);
-    const isAllowed = await mediaPathWithinRoots(allowedDirs, resolved);
+    const isAllowed = await mediaPathWithinRoots(allowedDirs, resolved, trainingRoot);
     const historicalFolder = isAllowed ? null : await historicalArtifactFolder(prisma, trainingRoot, resolved);
     if (!isAllowed && !historicalFolder) {
       return new NextResponse('Access denied', { status: 403 });
@@ -158,7 +158,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     // pre-generated thumb (written by the sampler, or by a previous call here)
     // so the tags are read at most once per file
     const thumbPath = path.join(path.dirname(resolved), '.thumbs', path.basename(resolved) + '.jpg');
-    const thumbAllowed = historicalFolder ? await regularJobPath(historicalFolder, thumbPath) : await mediaPathWithinRoots(allowedDirs, thumbPath);
+    const thumbAllowed = historicalFolder ? await regularJobPath(historicalFolder, thumbPath) : await mediaPathWithinRoots(allowedDirs, thumbPath, trainingRoot);
     const thumbStat = await fs.promises.stat(thumbPath).catch(() => null);
     if (thumbAllowed && thumbStat?.isFile()) {
       const data = await fs.promises.readFile(thumbPath);

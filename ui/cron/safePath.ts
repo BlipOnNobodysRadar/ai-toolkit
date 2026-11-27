@@ -103,32 +103,32 @@ export const resolveAllowedMutationPath = async (
 };
 
 /** Physical containment for reads, including destinations for thumbnails that may not exist yet. */
-export const pathWithinRoots = async (roots: string[], candidate: string): Promise<boolean> => {
+const readableTarget = async (roots: string[], candidate: string) => {
   try {
-    await resolveAllowedMutationPath(roots, candidate);
-    return true;
+    return await resolveAllowedMutationPath(roots, candidate);
   } catch (error) {
-    if (error instanceof UnsafePathError) return false;
+    if (error instanceof UnsafePathError) return null;
     throw error;
   }
 };
 
+export const pathWithinRoots = async (roots: string[], candidate: string) =>
+  (await readableTarget(roots, candidate)) !== null;
 
-// Generic download and image URLs can be opened with a media read key. Keep service
-// credentials and private run records behind their dedicated authenticated APIs.
-const privateArtifact = (file: string) => {
-  const parts = file.toLowerCase().split(path.sep);
-  const name = parts[parts.length - 1];
-  return parts.includes('.git') || /^(?:\.env(?:\..*)?|aitk_db\.db(?:-wal|-shm)?|engine\.json|\.job_config(?:\..+)?\.json)$/.test(name);
-};
-
-export const mediaPathWithinRoots = async (roots: string[], candidate: string): Promise<boolean> => {
-  if (privateArtifact(candidate)) return false;
-  try {
-    const { realPath } = await resolveAllowedMutationPath(roots, candidate);
-    return !privateArtifact(realPath);
-  } catch (error) {
-    if (error instanceof UnsafePathError) return false;
-    throw error;
+// Generic download and image URLs can be opened with a media read key. Engine credentials
+// and launch configs belong to the training tree. The same filename may be ordinary dataset content.
+export const mediaPathWithinRoots = async (roots: string[], candidate: string, trainingRoot: string) => {
+  const target = await readableTarget(roots, candidate);
+  if (!target) return false;
+  for (const file of [target.lexicalPath, target.realPath]) {
+    const parts = file.toLowerCase().split(path.sep);
+    const name = parts[parts.length - 1];
+    if (parts.includes('.git') || /^(?:\.env(?:\..*)?|aitk_db\.db(?:-(?:wal|shm|journal))?)$/.test(name)) return false;
+    if (/^(?:engine\.json|\.job_config(?:\..+)?\.json)$/.test(name)) {
+      if (isContained(path.resolve(trainingRoot), target.lexicalPath)) return false;
+      const realTraining = await fs.promises.realpath(trainingRoot).catch(() => null);
+      if (realTraining && isContained(realTraining, target.realPath)) return false;
+    }
   }
+  return true;
 };

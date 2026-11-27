@@ -309,11 +309,11 @@ async function serveFile(req: http.IncomingMessage, res: http.ServerResponse, pr
     const allowedDirsFor = (roots: Roots) => isImg ? [roots.datasets, roots.training, roots.data] : [roots.datasets, roots.training];
     let roots = await getRoots();
     let allowedDirs = allowedDirsFor(roots);
-    let isAllowed = await mediaPathWithinRoots(allowedDirs, resolvedFilePath);
+    let isAllowed = await mediaPathWithinRoots(allowedDirs, resolvedFilePath, roots.training);
     if (!isAllowed) {
       roots = await getRoots(true);
       allowedDirs = allowedDirsFor(roots);
-      isAllowed = await mediaPathWithinRoots(allowedDirs, resolvedFilePath);
+      isAllowed = await mediaPathWithinRoots(allowedDirs, resolvedFilePath, roots.training);
     }
     const historicalFolder = isAllowed ? null : await historicalArtifactFolder(prisma, roots.training, resolvedFilePath);
     if (!isAllowed && !historicalFolder) {
@@ -331,7 +331,7 @@ async function serveFile(req: http.IncomingMessage, res: http.ServerResponse, pr
       const thumbBase = path.join(path.dirname(resolvedFilePath), '.thumbs', path.basename(resolvedFilePath));
       const thumbTargets = [`${thumbBase}.png`, `${thumbBase}.jpg`];
       const thumbsAllowed = (await Promise.all(thumbTargets.map(file =>
-        historicalFolder ? regularJobPath(historicalFolder, file) : mediaPathWithinRoots(allowedDirs, file),
+        historicalFolder ? regularJobPath(historicalFolder, file) : mediaPathWithinRoots(allowedDirs, file, roots.training),
       ))).every(Boolean);
       let thumbPath: string | null = null;
       let thumbStat: fs.Stats | null = null;

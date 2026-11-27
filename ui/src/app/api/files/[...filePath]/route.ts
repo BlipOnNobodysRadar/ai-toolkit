@@ -25,7 +25,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     // an allowed root. Substring `.includes('..')` false-positives on filenames
     // containing `..` as text (e.g. an ellipsis in a filename).
     const resolvedFilePath = path.resolve(decodedFilePath);
-    const isAllowed = await mediaPathWithinRoots(allowedDirs, resolvedFilePath);
+    const isAllowed = await mediaPathWithinRoots(allowedDirs, resolvedFilePath, trainingRoot);
 
     const historicalFolder = isAllowed ? null : await historicalArtifactFolder(prisma, trainingRoot, resolvedFilePath);
     if (!isAllowed && !historicalFolder) {

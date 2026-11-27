@@ -283,14 +283,15 @@ test('media keys cover dataset files and thumbnails within configured storage an
   const elsewhere = makeRoot('other-storage');
   const photo = path.join(dataset, 'sample.png');
   fs.writeFileSync(photo, 'sample');
-  assert.equal(await mediaPathWithinRoots([dataset], photo), true);
-  assert.equal(await mediaPathWithinRoots([dataset], path.join(dataset, '.thumbs', 'sample.png.jpg')), true);
-  assert.equal(await mediaPathWithinRoots([dataset], path.join(dataset, 'engine.json')), false);
-  assert.equal(await mediaPathWithinRoots([dataset], path.join(dataset, '.job_config.example.json')), false);
+  assert.equal(await mediaPathWithinRoots([dataset], photo, elsewhere), true);
+  assert.equal(await mediaPathWithinRoots([dataset], path.join(dataset, '.thumbs', 'sample.png.jpg'), elsewhere), true);
+  assert.equal(await mediaPathWithinRoots([dataset], path.join(dataset, 'engine.json'), dataset), false);
+  assert.equal(await mediaPathWithinRoots([dataset], path.join(dataset, '.job_config.example.json'), dataset), false);
+  assert.equal(await mediaPathWithinRoots([dataset], path.join(dataset, 'engine.json'), elsewhere), true);
   const linked = path.join(dataset, 'other-library');
   fs.symlinkSync(elsewhere, linked, 'junction');
-  assert.equal(await mediaPathWithinRoots([dataset], path.join(linked, 'sample.png')), false);
-  assert.equal(await mediaPathWithinRoots([linked], path.join(linked, 'sample.png')), true);
+  assert.equal(await mediaPathWithinRoots([dataset], path.join(linked, 'sample.png'), elsewhere), false);
+  assert.equal(await mediaPathWithinRoots([linked], path.join(linked, 'sample.png'), elsewhere), true);
 });
 
 test('caption reads preserve custom sidecar extensions and leave missing captions blank', async () => {

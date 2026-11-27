@@ -33,7 +33,7 @@ export async function POST(request: NextRequest) {
     const allowedDirs = [datasetRoot, trainingRoot];
 
     const resolvedFilePath = path.resolve(decodedFilePath);
-    const isAllowed = await mediaPathWithinRoots(allowedDirs, resolvedFilePath);
+    const isAllowed = await mediaPathWithinRoots(allowedDirs, resolvedFilePath, trainingRoot);
     const historicalFolder = isAllowed ? null : await historicalArtifactFolder(prisma, trainingRoot, resolvedFilePath);
     if (!isAllowed && !historicalFolder) {
       return new NextResponse('Access denied', { status: 403 });

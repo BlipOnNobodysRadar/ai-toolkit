@@ -51,7 +51,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     // then ensure it's still under an allowed root. (Plain `.includes('..')`
     // false-positives on filenames that contain `..` as text, e.g. an ellipsis.)
     let resolved = path.resolve(filepath);
-    const isAllowed = await mediaPathWithinRoots(allowedDirs, resolved);
+    const isAllowed = await mediaPathWithinRoots(allowedDirs, resolved, trainingRoot);
 
     const historicalFolder = isAllowed ? null : await historicalArtifactFolder(prisma, trainingRoot, resolved);
     if (!isAllowed && !historicalFolder) {
@@ -66,7 +66,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       const thumbBase = path.join(path.dirname(resolved), '.thumbs', path.basename(resolved));
       for (const thumbPath of [`${thumbBase}.png`, `${thumbBase}.jpg`]) {
         const thumbStat = await fs.promises.stat(thumbPath).catch(() => null);
-        if (thumbStat?.isFile() && (historicalFolder ? await regularJobPath(historicalFolder, thumbPath) : await mediaPathWithinRoots(allowedDirs, thumbPath))) {
+        if (thumbStat?.isFile() && (historicalFolder ? await regularJobPath(historicalFolder, thumbPath) : await mediaPathWithinRoots(allowedDirs, thumbPath, trainingRoot))) {
           resolved = thumbPath;
           break;
         }

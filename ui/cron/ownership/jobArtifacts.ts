@@ -29,7 +29,19 @@ export const jobArtifactPath = async (trainingRoot: string, job: OutputJob, ...p
   const target = path.join(folder, ...parts);
   const historical = path.relative(path.resolve(trainingRoot, job.name), folder) !== '';
   const allowed = historical ? await regularJobPath(folder, target) : await pathWithinRoots([trainingRoot], target);
-  if (!allowed) throw new Error('The output path is outside the job storage.');
+  if (!allowed) {
+    // A newly configured root can be absent before the first launch. Let readers return their
+    // normal empty results for a missing run, but never accept a dangling root symlink.
+    if (!historical) {
+      try {
+        await fs.promises.lstat(trainingRoot);
+      } catch (error: any) {
+        if (error.code === 'ENOENT') return target;
+        throw error;
+      }
+    }
+    throw new Error('The output path is outside the job storage.');
+  }
   return target;
 };
 
