@@ -16,6 +16,8 @@ parent links (a reused parent pid or an exited intermediate makes those wrong):
   * Linux (source only on this repository's Windows test host): the supervisor is a child subreaper; every orphan in
     the subtree is re-parented to it, and the exit receipt is written only when waitpid reports no children at all.
     Without that receipt (supervisor died) there is no proof and the run stays owned.
+  * macOS: the trainer leads a dedicated POSIX process group. Its supervisor keeps the leader unreaped until
+    all live group members exit, so the group id cannot be reused during a stop.
   * Other platforms: no boundary is implemented, so nothing is launched (the supervisor refuses before spawning).
 
 Boundary claim. Before creating anything the supervisor publishes its claim on the run by hard-linking a complete
@@ -29,6 +31,7 @@ legacy row recorded under another boot id cannot have a live process.
 Process identity is "<pid>@<creation>" (Windows: exact 64-bit FILETIME as decimal; Linux: boot id and start ticks).
 A pid that now shows another creation time is a different process: the recorded one exited. Unknown is never exited.
 """
+from functools import lru_cache
 import json
 import os
 import subprocess
@@ -37,6 +40,7 @@ import time
 
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
+IS_MAC = sys.platform == "darwin"
 
 # relay (launch) and supervisor exit codes, read by the worker together with the receipts
 EXIT_SPAWNED = 0
@@ -67,6 +71,7 @@ def run_files(run_dir, run_id):
         "receipt": os.path.join(run_dir, f".run.{run_id}.receipt.json"),
         "members": os.path.join(run_dir, f".run.{run_id}.members.json"),
         "exit": os.path.join(run_dir, f".run.{run_id}.exit.json"),
+        "stop": os.path.join(run_dir, f".run.{run_id}.stop"),
         "boundary": os.path.join(run_dir, f".run.{run_id}.boundary.json"),
     }
 
@@ -226,6 +231,7 @@ if IS_WINDOWS:
     OpenProcess = _fn(_k32, "OpenProcess", H, D, B, D)
     CloseHandle = _fn(_k32, "CloseHandle", B, H)
     GetProcessTimes = _fn(_k32, "GetProcessTimes", B, H, *[ctypes.POINTER(ctypes.c_ulonglong)] * 4)
+    GetExitCodeProcess = _fn(_k32, "GetExitCodeProcess", B, H, ctypes.POINTER(D))
     WaitForSingleObject = _fn(_k32, "WaitForSingleObject", D, H, D)
     CreateToolhelp32Snapshot = _fn(_k32, "CreateToolhelp32Snapshot", H, D, D)
     Process32FirstW = _fn(_k32, "Process32FirstW", B, H, ctypes.POINTER(PROCESSENTRY32W))
@@ -288,7 +294,7 @@ if IS_WINDOWS:
         return None, f"error {err}"
 
     def _snapshot():
-        """[(pid, ppid)] from one Toolhelp snapshot; raises unless enumeration reached its normal end."""
+        """[(pid, ppid, executable name)] from one Toolhelp snapshot; raises unless enumeration reached its normal end."""
         snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
         if not snap or snap == INVALID_HANDLE_VALUE:
             raise OSError(f"CreateToolhelp32Snapshot failed ({ctypes.get_last_error()})")
@@ -298,7 +304,7 @@ if IS_WINDOWS:
             out = []
             ok = Process32FirstW(snap, ctypes.byref(entry))
             while ok:
-                out.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID)))
+                out.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID), entry.szExeFile))
                 ok = Process32NextW(snap, ctypes.byref(entry))
             err = ctypes.get_last_error()
             if err != ERROR_NO_MORE_FILES:
@@ -368,6 +374,7 @@ if IS_LINUX:
         except (FileNotFoundError, ProcessLookupError, PermissionError):
             return None
 
+    @lru_cache(maxsize=1)
     def _btime():
         with open("/proc/stat") as f:
             for line in f:
@@ -404,11 +411,34 @@ def boot_id():
             finally:
                 winreg.CloseKey(key)
             return f"win-boot:{int(value)}"
+        if IS_MAC:
+            value = subprocess.check_output(["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"], text=True).strip()
+            return f"mac-boot:{value}" if value else None
         if IS_LINUX:
             return f"linux-boot:{_BOOT}" if _BOOT != "noboot" else None
     except Exception:  # noqa: BLE001
         return None
     return None
+
+
+def _mac_processes(pid=None):
+    selection = ["-p", str(pid)] if pid is not None else ["-ax"]
+    out = subprocess.run(["/bin/ps", "-ww", *selection, "-o", "pid=,ppid=,stat=,lstart=,command="],
+                         capture_output=True, text=True, errors="replace", env={**os.environ, "LC_ALL": "C"}, timeout=10)
+    if pid is not None and out.returncode == 1 and not out.stdout.strip() and not out.stderr.strip():
+        return []
+    out.check_returncode()
+    rows = []
+    for line in out.stdout.splitlines():
+        fields = line.split(None, 8)
+        if len(fields) < 8:
+            raise ValueError("Incomplete ps process entry")
+        start = " ".join(fields[3:8])
+        rows.append({"pid": int(fields[0]), "ppid": int(fields[1]), "state": "gone" if "Z" in fields[2] else "alive",
+                     "identity": _identity(fields[0], start.replace(" ", "_")),
+                     "started_ms": int(time.mktime(time.strptime(start, "%a %b %d %H:%M:%S %Y"))) * 1000,
+                     "cmdline": fields[8] if len(fields) == 9 else None})
+    return rows
 
 
 # ================================================================ identity / liveness
@@ -428,14 +458,22 @@ def describe(pid):
                 return {"state": "unknown", "why": "wait failed"}
             if not alive:
                 return {"state": "gone", "why": "exited", "identity": _identity(pid, creation)}
-            return {"state": "alive", "identity": _identity(pid, creation), "cmdline": _cmdline(h)}
+            return {"state": "alive", "identity": _identity(pid, creation),
+                    "started_ms": int(creation) // 10000 - 11644473600000, "cmdline": _cmdline(h)}
         finally:
             CloseHandle(h)
     if IS_LINUX:
         st = _stat(pid)
         if st is None or st[0] == "Z":
             return {"state": "gone", "why": "no process" if st is None else "zombie"}
-        return {"state": "alive", "identity": _identity(pid, f"{_BOOT}:{st[2]}"), "cmdline": _cmdline_linux(pid)}
+        return {"state": "alive", "identity": _identity(pid, f"{_BOOT}:{st[2]}"),
+                "started_ms": int((_btime() + int(st[2]) / _CLK) * 1000), "cmdline": _cmdline_linux(pid)}
+    if IS_MAC:
+        try:
+            rows = _mac_processes(pid)
+            return rows[0] if rows else {"state": "gone"}
+        except (OSError, ValueError, subprocess.SubprocessError) as e:
+            return {"state": "unknown", "why": str(e)}
     try:
         out = subprocess.run(["ps", "-o", "lstart=", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
                              timeout=10)
@@ -463,15 +501,17 @@ def check(identity):
     return "unknown"
 
 
-def scan(needle, since_ms):
+def scan(needle, since_ms, legacy_launchers_only=False):
     """Live processes created at/after since_ms whose command line contains needle.
     complete=False if any such process could be opened but its creation time or command line could not be read.
-    A process that cannot be queried at all ('denied') may be anything, so it also makes the scan incomplete. Scans are
-    diagnostics; no release decision uses a negative scan."""
+    A process that cannot be queried at all ('denied') also makes the scan incomplete.
+    Legacy launch scans on Windows consider Python and its Node relay."""
     matches, unreadable, denied = [], 0, 0
     if IS_WINDOWS:
         since_ft = (int(since_ms) + 11644473600000) * 10000
-        for pid, ppid in _snapshot():
+        for pid, ppid, executable in _snapshot():
+            if legacy_launchers_only and not (executable.lower().startswith("python") or executable.lower() == "node.exe"):
+                continue
             if pid in (0, 4):
                 continue
             h, why = _open(pid)
@@ -511,6 +551,15 @@ def scan(needle, since_ms):
             elif needle in cmd:
                 matches.append({"identity": _identity(int(name), f"{_BOOT}:{st[2]}"), "ppid": st[1], "cmdline": cmd})
         return {"complete": unreadable == 0, "matches": matches, "unreadable": unreadable, "denied": denied}
+    if IS_MAC:
+        for proc in _mac_processes():
+            if proc["state"] != "alive" or proc["started_ms"] < since_ms:
+                continue
+            if proc["cmdline"] is None:
+                unreadable += 1
+            elif needle in proc["cmdline"]:
+                matches.append(proc)
+        return {"complete": unreadable == 0, "matches": matches, "unreadable": unreadable}
     return {"complete": False, "matches": [], "unreadable": -1, "why": "process scan unsupported on this platform"}
 
 
@@ -545,7 +594,7 @@ def run_state(run_id, supervisor, recorded):
 
 
 # ================================================================ termination
-def terminate(run_id, supervisor=None, wait_ms=15000):
+def terminate(run_id, supervisor=None, wait_ms=15000, run_dir=None):
     """Force stop every process of a run through its ownership container. {"supported", "verified", ...}"""
     if IS_WINDOWS:
         job, why = _job_open(run_id, JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE)
@@ -565,6 +614,15 @@ def terminate(run_id, supervisor=None, wait_ms=15000):
             return {"supported": True, "verified": active == 0, "boundary": "open", "remaining": active}
         finally:
             CloseHandle(job)
+    if IS_MAC and run_dir and supervisor:
+        files = run_files(run_dir, run_id)
+        receipt = _read_json(files["receipt"]) or {}
+        if receipt.get("supervisor") != supervisor or receipt.get("run_id") != run_id:
+            return {"supported": True, "verified": False, "error": "Run receipt changed"}
+        # The supervisor reads only its own request file. A stale PID can never signal an unrelated process.
+        with open(files["stop"], "a", encoding="utf-8"):
+            pass
+        return {"supported": True, "verified": False, "requested": True}
     if IS_LINUX and hasattr(os, "pidfd_open") and hasattr(_signal, "pidfd_send_signal") and supervisor:
         # pragma: no cover - not executed on the Windows test host. Ask the run's supervisor (identity-checked
         # through a pidfd) to kill its subtree; exit is proved only by its later exit receipt.
@@ -585,6 +643,84 @@ def terminate(run_id, supervisor=None, wait_ms=15000):
     return {"supported": False, "verified": False,
             "error": f"force stop with a verified process boundary is not supported on {sys.platform}; the stop "
                      "request stays pending and the run keeps its GPUs until its processes are proven gone"}
+
+
+def legacy_launch_matches(proc, job_id, job_name):
+    import psutil
+
+    try:
+        env = proc.environ()
+    except (psutil.AccessDenied, NotImplementedError):
+        if not IS_MAC:
+            raise
+        env = {}
+    if env or not IS_MAC:
+        return env.get("AITK_JOB_ID") == job_id and not env.get("AITK_RUN_ID")
+
+    # Big Sur and later may hide a different process's environment, including
+    # a trainer owned by this user. The legacy launcher invoked exactly these
+    # two absolute paths. Modern launches use a run-specific config filename.
+    argv = proc.cmdline()
+    script = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "run.py")
+    if len(argv) != 3 or os.path.realpath(argv[1]) != script or not os.path.isabs(argv[2]):
+        return False
+    return os.path.basename(argv[2]) == ".job_config.json" and os.path.basename(os.path.dirname(argv[2])) == job_name
+
+
+def terminate_legacy(job_id, job_name, identity):
+    """Older UI launchers put the job ID in the environment inherited by their workers."""
+    import psutil  # Part of the toolkit runtime. Only this command loads site-packages.
+
+    pid, _ = _split_identity(identity)
+    stopped = set()
+    try:
+        root = psutil.Process(pid)
+        if not legacy_launch_matches(root, job_id, job_name) or check(identity) != "alive":
+            return {"supported": True, "verified": False, "error": "The process no longer matches this pre-update job."}
+
+        # Immobilize each parent before listing its children. This closes the fork race
+        # without signalling a different installation that happens to use a copied database.
+        todo, targets = [root], set()
+        deadline = time.monotonic() + 5
+        while todo:
+            proc = todo.pop()
+            if proc in targets:
+                continue
+            try:
+                if proc.status() != psutil.STATUS_STOPPED:
+                    proc.suspend()
+                    stopped.add(proc)
+                if not IS_WINDOWS:  # SIGSTOP can be pending until the process is scheduled.
+                    while proc.status() not in (psutil.STATUS_STOPPED, psutil.STATUS_ZOMBIE):
+                        if time.monotonic() >= deadline:
+                            raise OSError("Could not suspend the training process tree")
+                        time.sleep(0.01)
+                targets.add(proc)
+                todo.extend(proc.children())
+            except psutil.NoSuchProcess:
+                continue
+        for proc in targets:
+            try:
+                proc.kill()  # psutil checks process creation time before signalling
+                stopped.discard(proc)
+            except psutil.NoSuchProcess:
+                pass
+        _, remaining = psutil.wait_procs(targets, timeout=1)
+        live = 0
+        for proc in remaining:
+            try:
+                live += proc.status() != psutil.STATUS_ZOMBIE
+            except psutil.NoSuchProcess:
+                pass
+        return {"supported": True, "verified": live == 0, "remaining": live}
+    except (psutil.Error, OSError) as exc:
+        return {"supported": True, "verified": False, "error": str(exc)}
+    finally:
+        for proc in stopped:
+            try:
+                proc.resume()
+            except psutil.Error:
+                pass
 
 
 # ================================================================ launch (relay) and supervisor
@@ -648,7 +784,7 @@ def supervise(run_id, run_dir, cwd, program):
     files = run_files(run_dir, run_id)
     me = _own_identity()
     base = {"run_id": run_id, "supervisor": me, "platform": platform_name(), "boot_id": boot_id()}
-    if not (IS_WINDOWS or IS_LINUX):
+    if not (IS_WINDOWS or IS_LINUX or IS_MAC):
         return _fail(files, base, f"no process ownership boundary is implemented for {sys.platform}; nothing was started")
     if not me or not base["boot_id"]:
         return _fail(files, base, "the supervisor could not read its own identity or the boot identity")
@@ -663,6 +799,8 @@ def supervise(run_id, run_dir, cwd, program):
         return _fail(files, base, f"this run was already claimed ({what}); nothing was started")
     if IS_WINDOWS:
         return _supervise_windows(run_id, files, cwd, program, base)
+    if IS_MAC:
+        return _supervise_process_group(files, cwd, program, base)
     return _supervise_linux(run_id, files, cwd, program, base)
 
 
@@ -743,7 +881,6 @@ def _supervise_windows(run_id, files, cwd, program, base):
         CloseHandle(root)
         CloseHandle(job)
         return EXIT_RECEIPT_FAILED if gone else EXIT_UNCERTAIN
-    CloseHandle(root)
     _write_members(files, base, members)
     # monitor until the kernel reports no active process in the job
     while True:
@@ -772,6 +909,12 @@ def _supervise_windows(run_id, files, cwd, program, base):
             sys.stderr.write(f"Run supervisor: job query failed ({e}); retrying\n")
             time.sleep(1)
     _write_members(files, base, members)
+    code = wintypes.DWORD()
+    if GetExitCodeProcess(root, ctypes.byref(code)):
+        base["exit_code"] = code.value
+    else:
+        sys.stderr.write(f"Could not read the trainer exit code ({ctypes.get_last_error()})\n")
+    CloseHandle(root)
     write_receipt(files["exit"], {**base, "state": "exited", "members": sorted(members), "evidence":
                                   "job object ActiveProcesses == 0"})
     CloseHandle(job)
@@ -824,6 +967,52 @@ def _create_in_job(job, program, cwd):
         nul.close()
 
 
+def _live_group_members(pgid):
+    # The leader stays unreaped here. Count only non-zombies, including workers that outlived their parent.
+    rows = subprocess.check_output(["/bin/ps", "-ax", "-o", "pgid=,stat="], text=True).splitlines()
+    return any(group == str(pgid) and "Z" not in state for group, state in (row.split() for row in rows))
+
+
+def _supervise_process_group(files, cwd, program, base):
+    import select
+    import signal
+    base = {**base, "boundary": "darwin-process-group"}
+    # EOF wakes the supervisor when the trainer closes its descriptors, without reaping its PID.
+    read_fd, write_fd = os.pipe()
+    try:
+        with os.fdopen(write_fd, "wb"):
+            proc = subprocess.Popen(program, cwd=cwd, pass_fds=(write_fd,), **_hidden_popen_kwargs())
+    except OSError as e:
+        os.close(read_fd)
+        return _fail(files, base, str(e))
+    with os.fdopen(read_fd, "rb") as finished:
+        try:
+            ident = describe(proc.pid).get("identity")
+            if not ident:
+                raise OSError("could not read trainer identity")
+            write_receipt(files["receipt"], {**base, "state": "spawned", "pid": proc.pid, "identity": ident})
+            recorded = True
+        except (OSError, ValueError) as e:
+            sys.stderr.write(f"Could not record the job process ({e}); terminating the run\n")
+            recorded = False
+        while True:
+            if not recorded or os.path.exists(files["stop"]):
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if select.select([finished], [], [], 0.25)[0]:
+                if not _live_group_members(proc.pid):
+                    break
+                time.sleep(0.25)
+    exit_code = proc.wait()
+    if not recorded:
+        return EXIT_RECEIPT_FAILED
+    write_receipt(files["exit"], {**base, "state": "exited", "exit_code": exit_code,
+                                  "evidence": "trainer process group exited"})
+    return EXIT_SPAWNED
+
+
 def _supervise_linux(run_id, files, cwd, program, base):  # pragma: no cover - not executed on the Windows test host
     import ctypes
     libc = ctypes.CDLL(None, use_errno=True)
@@ -851,14 +1040,17 @@ def _supervise_linux(run_id, files, cwd, program, base):  # pragma: no cover - n
         if kill_requested:
             _kill_children_linux(os.getpid())
         try:
-            pid, _status = os.waitpid(-1, os.WNOHANG)
+            pid, status = os.waitpid(-1, os.WNOHANG)
         except ChildProcessError:
             break  # no children at all: as subreaper, the whole subtree is gone
-        if pid == 0:
+        if pid == proc.pid:
+            proc.returncode = os.waitstatus_to_exitcode(status)
+        elif pid == 0:
             time.sleep(0.1)
     if not os.path.exists(files["receipt"]):
         return EXIT_RECEIPT_FAILED
-    write_receipt(files["exit"], {**base, "state": "exited", "evidence": "subreaper waitpid ECHILD"})
+    write_receipt(files["exit"], {**base, "state": "exited", "exit_code": proc.returncode,
+                                  "evidence": "subreaper waitpid ECHILD"})
     return 0
 
 
@@ -914,7 +1106,10 @@ def main(argv):
     if cmd == "probe":
         res = {"platform": platform_name(), "boot_id": boot_id(), "describe": {}, "runs": {}, "scans": {}}
         for p in req.get("describe", []):
-            res["describe"][str(p)] = describe(p)
+            try:
+                res["describe"][str(p)] = describe(p)
+            except OSError as e:
+                res["describe"][str(p)] = {"state": "unknown", "why": str(e)}
         for key, r in (req.get("runs") or {}).items():
             try:
                 res["runs"][key] = run_state(r["run_id"], r.get("supervisor"), r.get("members") or [])
@@ -923,13 +1118,15 @@ def main(argv):
                                     "error": str(e)}
         for key, s in (req.get("scans") or {}).items():
             try:
-                res["scans"][key] = scan(s["needle"], s["since_ms"])
+                res["scans"][key] = scan(s["needle"], s["since_ms"], s.get("legacy_launchers_only", False))
             except Exception as e:  # noqa: BLE001
                 res["scans"][key] = {"complete": False, "matches": [], "error": str(e)}
     elif cmd == "fence":
         res = fence(req["run_id"], req["run_dir"], req.get("by"))
     elif cmd == "terminate":
-        res = terminate(req["run_id"], req.get("supervisor"), int(req.get("wait_ms", 15000)))
+        res = terminate(req["run_id"], req.get("supervisor"), int(req.get("wait_ms", 15000)), req.get("run_dir"))
+    elif cmd == "terminate-legacy":
+        res = terminate_legacy(req["job_id"], req["job_name"], req["identity"])
     elif cmd == "self":
         res = {"platform": platform_name(), "identity": describe(int(req["pid"])), "boot_id": boot_id()}
     else:

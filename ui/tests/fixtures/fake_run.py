@@ -1,10 +1,11 @@
 """Stand-in for run.py in ui/tests/launch.test.cjs: a harmless CPU-only program launched through the real relay and
-supervisor. Usage: fake_run.py <config.json>. The config's process[0].test_steps is a list of steps:
+supervisor. Usage: fake_run.py <config.json>. Each config process runs its test_steps in order:
   "status:<s>"         fenced UPDATE Job SET status (WHERE id AND run_id, like toolkit/ui_run_fence.py)
   "wait:<file>"        block until <file> exists
   "orphan:<file>"      start an intermediate that starts a grandchild waiting for <file>, then exits at once
   "child:<file>"       start a direct child waiting for <file>; its pid is written to <file>.started
   "sleep:<seconds>"
+  "exit:<code>"        exit the root program with the given status
 Every process it starts is hidden (CREATE_NO_WINDOW) and waits on a gate file, so the test owns its lifetime.
 """
 import json
@@ -26,9 +27,7 @@ def spawn(code):
     return subprocess.Popen([sys.executable, "-c", code], creationflags=NO_WINDOW, stdin=subprocess.DEVNULL)
 
 
-def main():
-    cfg = json.load(open(sys.argv[1], encoding="utf-8"))
-    proc = cfg["config"]["process"][0]
+def run_process(proc):
     db = proc["sqlite_db_path"]
     job_id, run_id = os.environ["AITK_JOB_ID"], os.environ["AITK_RUN_ID"]
     print(f"fake_run start pid={os.getpid()} run={run_id} cuda={os.environ.get('CUDA_VISIBLE_DEVICES')}", flush=True)
@@ -54,8 +53,12 @@ def main():
                 f.write(str(c.pid))
         elif kind == "sleep":
             time.sleep(float(arg))
+        elif kind == "exit":
+            sys.exit(int(arg))
     print("fake_run done", flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    with open(sys.argv[1], encoding="utf-8") as config_file:
+        for process in json.load(config_file)["config"]["process"]:
+            run_process(process)

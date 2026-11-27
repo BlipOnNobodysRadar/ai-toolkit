@@ -1,5 +1,5 @@
 // Worker reconciliation, one pass per tick before admission (docs/STATE_MACHINES.md M10, "Reconciler").
-// It is the only place claims are released after spawn_requested, and only on evidence; every release re-checks,
+// Automatic releases after spawn_requested use process evidence. Each release re-checks,
 // inside its transaction, the launch phase (and identity) the evidence was gathered for.
 //   any phase        the run was recorded under another boot id than the current one (a restart ended it)
 //   attached         the supervisor's exit receipt (its job object reported 0 active processes), or the job object
@@ -8,15 +8,15 @@
 //                    the run's boundary claim (no supervisor claimed it, and none can any more), or the claiming
 //                    supervisor proved gone with its job object still open and empty
 //   claimed          the admitting worker is gone, or is this worker with no launch registered (nothing spawned)
-//   legacy (no run)  a boot id change since the row was first observed by this code
+//   legacy (no run)  the previous trainer is gone, its PID has been reused, or its boot ended
 // A job object that can no longer be opened is NOT evidence: its name disappears when the last handle closes, before
-// its members have finished terminating (measured, docs Q4). Supervisor death without an exit receipt therefore keeps
-// the claims until a restart proves the exit; the UI says so. "unknown" (helper failure, wait failure, unsupported
-// platform) always keeps the claims and says why. Command-line scans are never used as proof.
+// its members have finished terminating (measured, docs Q4). Supervisor death without an exit receipt keeps
+// the claims until the user confirms the job ended or the worker verifies exit. "unknown" (helper failure, wait failure, unsupported
+// platform) always keeps the claims and says why. A scan of the old launch command is used only for pre-update jobs without a PID.
 import fs from 'fs';
-import path from 'path';
 import type { Job } from '@prisma/client';
-import { readExitReceipt, readMembers, readReceipt, runFiles, validIdentity } from './launch';
+import { knownMembers, readExitReceipt, readReceipt, runFiles, savedMembers, validIdentity } from './launch';
+import { legacyProbe, legacyProcess } from './legacy';
 import { ProbeRequest, ProbeResult, ProcCtl, pidExists } from './procctl';
 import { Db, ReleaseOutcome, attachRun, clearLegacy, isLegacyOccupant, keepLegacyTime, noteOwnership, releaseRun, updateMembers, withRetry } from './store';
 
@@ -41,19 +41,7 @@ export type ReconcileReport = Record<string, string>;
 const BACKSTOP_RETRY_MS = 30_000;
 
 export const SUPERVISOR_LOST_NOTE =
-  "The run's supervisor ended without confirming that the run's processes ended, so its GPUs and folder stay reserved; a restart of this computer clears this.";
-export const LEGACY_NOTE =
-  'Started before the run-ownership update: its processes cannot be verified, so its GPUs and folder stay reserved until this computer restarts (stop such jobs before upgrading).';
-
-const members = (job: Job): string[] => {
-  try {
-    const m: unknown = JSON.parse(job.run_members || '[]');
-    return Array.isArray(m) ? m.filter(validIdentity) : [];
-  } catch {
-    return [];
-  }
-};
-
+  "The supervisor exited before reporting the final process state. If the job has finished, choose Mark as Stopped.";
 const readJson = (file: string): any => {
   try {
     return JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -82,9 +70,7 @@ const readLogTail = (logPath: string): string | null => {
   }
 };
 
-export const legacyConfigPath = (trainingRoot: string, name: string) => path.join(trainingRoot, name, '.job_config.json');
-
-type Plan = { job: Job; kind: string };
+type Plan = { job: Job; kind: string; exitCode?: number; evidence?: string };
 
 export const reconcile = async (ctx: ReconcileContext): Promise<ReconcileReport> => {
   const { db, procctl } = ctx;
@@ -103,7 +89,7 @@ export const reconcile = async (ctx: ReconcileContext): Promise<ReconcileReport>
     await db.job.findMany({ where: { run_id: null, OR: [{ status: { in: ['starting', 'running', 'stopping'] } }, { pid: { not: null } }] } })
   ).filter(isLegacyOccupant);
 
-  const req: ProbeRequest = { describe: [], runs: {} };
+  const req: ProbeRequest = { ...legacyProbe(legacy.filter(j => !bootChanged(j.boot_id))), runs: {} };
   const plan: Plan[] = [];
   for (const job of byRun.values()) {
     const runId = job.run_id!;
@@ -111,24 +97,24 @@ export const reconcile = async (ctx: ReconcileContext): Promise<ReconcileReport>
       report[runId] = 'launch in flight';
       continue;
     }
+    const files = job.run_dir ? runFiles(job.run_dir, runId) : null;
+    const receipt = job.launch_phase === 'attached' && files ? readExitReceipt(files.exit, runId, job.supervisor_identity) : null;
+    if (receipt) {
+      plan.push({ job, kind: 'exit-receipt', exitCode: receipt.exit_code, evidence: receipt.evidence });
+      continue;
+    }
     if (bootChanged(job.boot_id) && job.launch_phase && ['claimed', 'spawn_requested', 'attached'].includes(job.launch_phase)) {
       plan.push({ job, kind: 'rebooted' });
       continue;
     }
-    const files = job.run_dir ? runFiles(job.run_dir, runId) : null;
     if (job.launch_phase === 'attached' && job.pid_identity) {
-      if (files && readExitReceipt(files.exit, runId, job.supervisor_identity)) {
-        plan.push({ job, kind: 'exit-receipt' });
-        continue;
-      }
       const cheap =
         ['starting', 'running'].includes(job.status) && !job.stop && ctx.tick % (ctx.identityEveryTicks ?? 15) !== 0 && job.pid != null && pidExists(job.pid);
       if (cheap) {
         report[runId] = 'alive (pid check)';
         continue;
       }
-      const recorded = [...new Set([...members(job), ...(files ? readMembers(files.members, runId) : [])])];
-      req.runs![runId] = { run_id: runId, supervisor: job.supervisor_identity, members: recorded };
+      req.runs![runId] = { run_id: runId, supervisor: job.supervisor_identity, members: knownMembers(job) };
       plan.push({ job, kind: 'attached' });
     } else if (job.launch_phase === 'claimed') {
       if (job.launcher_identity === ctx.self.identity || !job.launcher_identity || job.launcher_pid == null) {
@@ -163,17 +149,17 @@ export const reconcile = async (ctx: ReconcileContext): Promise<ReconcileReport>
   for (const job of legacy) plan.push({ job, kind: 'legacy' });
 
   const helperKinds = ['attached', 'claimed-other', 'unclaimed', 'claimed-boundary'];
-  const needsHelper = plan.some(p => helperKinds.includes(p.kind));
+  const needsHelper = !!req.describe?.length || !!Object.keys(req.scans ?? {}).length || plan.some(p => helperKinds.includes(p.kind));
   const res: ProbeResult = needsHelper ? await procctl.probe(req) : { ok: true, describe: {}, runs: {}, scans: {} };
   const helperDown = needsHelper && !res.ok ? `Cannot check process state (${res.error}); ownership kept.` : null;
 
   const release = async (job: Job, phase: 'claimed' | 'spawn_requested' | 'attached', outcome: ReleaseOutcome, label: string) => {
     const r = await releaseRun(db, job.id, job.run_id!, phase === 'attached' ? { phase, identity: job.pid_identity } : { phase }, outcome);
-    if (r.released && r.unexpected) appendUnexpected(job);
+    if (r.released && r.unexpected && outcome.kind === 'exited') appendUnexpected(job, outcome.unexpectedInfo);
     report[job.run_id!] = r.released ? `released: ${label}${r.status ? ` -> ${r.status}` : ''}` : `kept: ${r.reason}`;
   };
 
-  for (const { job, kind } of plan) {
+  for (const { job, kind, exitCode, evidence } of plan) {
     const runId = job.run_id ?? `legacy:${job.id}`;
     try {
       if (kind === 'rebooted') {
@@ -191,9 +177,8 @@ export const reconcile = async (ctx: ReconcileContext): Promise<ReconcileReport>
         continue;
       }
       if (kind === 'exit-receipt') {
-        const files = runFiles(job.run_dir!, job.run_id!);
-        const evidence = readExitReceipt(files.exit, job.run_id!, job.supervisor_identity)!.evidence ?? 'supervisor exit receipt';
-        await release(job, 'attached', { kind: 'exited', evidence, unexpectedInfo: unexpected(job) }, 'exit receipt');
+        await release(job, 'attached', { kind: 'exited', evidence: evidence ?? 'supervisor exit receipt',
+          exitCode, unexpectedInfo: unexpected(job, exitCode) }, 'exit receipt');
         continue;
       }
       if (kind === 'receipt-spawned') {
@@ -212,22 +197,22 @@ export const reconcile = async (ctx: ReconcileContext): Promise<ReconcileReport>
         continue;
       }
       if (kind === 'legacy') {
-        if (!job.boot_id) {
-          // first observation by this code: from now on a boot change proves the old process gone
-          if (ctx.self.boot_id) {
-            await withRetry(() =>
-              db.job.updateMany({ where: { id: job.id, run_id: null, boot_id: null }, data: { boot_id: ctx.self.boot_id, ownership_note: LEGACY_NOTE, ...keepLegacyTime(job) } }),
-            );
-          } else {
-            await noteOwnership(db, job, `${LEGACY_NOTE} (The boot identity cannot be read here, so it cannot be cleared automatically.)`);
-          }
-          report[runId] = 'legacy kept: first observation recorded';
-        } else if (bootChanged(job.boot_id)) {
-          await clearLegacy(db, job, 'the computer restarted since this job was first seen by the run-ownership code');
-          report[runId] = 'legacy cleared: boot changed';
+        const state = legacyProcess(job, res);
+        if (bootChanged(job.boot_id) || state === 'gone') {
+          const evidence = bootChanged(job.boot_id) ? 'the computer restarted' : 'the previous trainer is no longer running';
+          await clearLegacy(db, job, evidence);
+          report[runId] = 'legacy cleared';
         } else {
-          await noteOwnership(db, job, LEGACY_NOTE);
-          report[runId] = 'legacy kept: same boot';
+          const note = state === 'live' ? null : 'Cannot identify the old training process. If the job has finished, choose Mark as Stopped.';
+          if (ctx.self.boot_id && !job.boot_id) {
+            await withRetry(() => db.job.updateMany({
+              where: { id: job.id, run_id: null, boot_id: null, status: job.status, pid: job.pid, updated_at: job.updated_at },
+              data: { boot_id: ctx.self.boot_id, ownership_note: note, ...keepLegacyTime(job) },
+            }));
+          } else {
+            await noteOwnership(db, job, note);
+          }
+          report[runId] = `legacy kept: ${state}`;
         }
         continue;
       }
@@ -284,28 +269,31 @@ export const reconcile = async (ctx: ReconcileContext): Promise<ReconcileReport>
       }
       if (kind === 'attached') {
         const st = res.runs[job.run_id!];
-        const recorded = members(job);
+        const recorded = savedMembers(job);
         const live = st?.live ?? [];
         if (live.some(m => !recorded.includes(m))) await updateMembers(db, job.id, job.run_id!, [...new Set([...recorded, ...live])]);
         if (st?.supervisor === 'exited' && st.boundary === 'open' && st.active === 0) {
           await release(job, 'attached', { kind: 'exited', evidence: 'job object open with no active process, supervisor gone', unexpectedInfo: unexpected(job) }, 'empty job object');
           continue;
         }
+        const supervisedPosix = ['linux-subreaper', 'darwin-process-group'].includes(job.run_boundary ?? '') && st?.supervisor === 'alive';
         let note: string | null;
         if (st?.supervisor === 'exited') note = SUPERVISOR_LOST_NOTE;
+        else if (supervisedPosix) note = null;
         else if (!st || st.boundary !== 'open' || st.supervisor !== 'alive') note = `Cannot verify the run's processes (${st?.error ?? `supervisor ${st?.supervisor ?? 'unknown'}, boundary ${st?.boundary ?? 'unknown'}`}); ownership kept.`;
         else note = st.members[job.pid_identity!] === 'alive' ? null : `Waiting for ${st.active} remaining process(es) of this run to exit.`;
         // the former Windows stop backstop: a stop request this old gets a force stop through the run boundary
         const requested = job.stop_requested_at?.getTime();
-        if (requested != null && now() - requested > (ctx.graceMs ?? 60_000) && st?.boundary === 'open' && (st.active ?? 0) > 0) {
+        const canTerminate = supervisedPosix || (st?.boundary === 'open' && (st.active ?? 0) > 0);
+        if (requested != null && now() - requested > (ctx.graceMs ?? 60_000) && canTerminate) {
           const attempts = ctx.backstopAttempts ?? new Map<string, number>();
           if (now() - (attempts.get(job.run_id!) ?? 0) > BACKSTOP_RETRY_MS) {
             attempts.set(job.run_id!, now());
             log(`Job ${job.id} still running ${(ctx.graceMs ?? 60_000) / 1000}s after the stop request; force stopping it`);
-            const t = await procctl.terminate(job.run_id!, job.supervisor_identity);
+            const t = await procctl.terminate(job.run_id!, job.supervisor_identity, job.run_dir);
             note = t.supported
-              ? t.verified
-                ? 'Force stopped after the stop request timed out; confirming exit.'
+              ? t.verified || t.requested
+                ? 'Force stop requested after the graceful stop timed out; confirming exit.'
                 : `Force stop after the stop request timed out did not finish (${t.error ?? `${t.remaining} remaining`}).`
               : `Stop pending: ${t.error}`;
           }
@@ -320,13 +308,14 @@ export const reconcile = async (ctx: ReconcileContext): Promise<ReconcileReport>
   }
   return report;
 
-  function unexpected(job: Job) {
+  function unexpected(job: Job, exitCode?: number) {
     const tail = job.run_dir ? readLogTail(runFiles(job.run_dir, job.run_id!).log) : null;
-    return tail ? `Job process exited unexpectedly. Last log line: ${tail}` : 'Job process exited unexpectedly.';
+    const reason = exitCode === undefined ? 'Job process exited unexpectedly.' : `Job process exited with code ${exitCode}.`;
+    return tail ? `${reason} Last log line: ${tail}` : reason;
   }
-  function appendUnexpected(job: Job) {
+  function appendUnexpected(job: Job, message?: string) {
     try {
-      if (job.run_dir) fs.appendFileSync(runFiles(job.run_dir, job.run_id!).log, `\n${unexpected(job)}\n`);
+      if (job.run_dir) fs.appendFileSync(runFiles(job.run_dir, job.run_id!).log, `\n${message ?? unexpected(job)}\n`);
     } catch {
       // the log is a convenience
     }

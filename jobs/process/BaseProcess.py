@@ -25,6 +25,16 @@ class BaseProcess(object):
 
         print(json.dumps(self.config, indent=4))
         
+    def ui_process_status(self, status, info):
+        processes = getattr(getattr(self, 'job', None), 'config', {}).get('process', [])
+        if len(processes) > 1:
+            number = self.process_id + 1
+            if status == 'completed' and number < len(processes):
+                status = 'running'
+            if info:
+                info = f"Process {number}/{len(processes)} · {info}"
+        return status, info
+
     def on_error(self, e: Exception):
         pass
 

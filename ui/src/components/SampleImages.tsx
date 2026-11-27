@@ -3,7 +3,7 @@ import { Virtuoso, VirtuosoHandle } from 'react-virtuoso';
 import useSampleImages from '@/hooks/useSampleImages';
 import SampleImageCard from './SampleImageCard';
 import { Job } from '@prisma/client';
-import { JobConfig } from '@/types';
+import { getJobConfig } from '@/utils/jobs';
 import { LuImageOff, LuLoader, LuBan } from 'react-icons/lu';
 import { Button, Dialog, DialogBackdrop, DialogPanel, DialogTitle } from '@headlessui/react';
 import { FaDownload } from 'react-icons/fa';
@@ -85,16 +85,8 @@ export default function SampleImages({ job }: SampleImagesProps) {
   const [scrollParent, setScrollParent] = useState<HTMLDivElement | null>(null);
   const scrollParentCallback = useCallback((el: HTMLDivElement | null) => setScrollParent(el), []);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
-  const numSamples = useMemo(() => {
-    if (job?.job_config) {
-      const jobConfig = JSON.parse(job.job_config) as JobConfig;
-      const sampleConfig = jobConfig.config.process[0].sample;
-      const numPrompts = sampleConfig.prompts ? sampleConfig.prompts.length : 0;
-      const numSamples = sampleConfig.samples.length;
-      return Math.max(numPrompts, numSamples, 1);
-    }
-    return 10;
-  }, [job]);
+  const sampleConfig = useMemo(() => getJobConfig(job)?.config?.process?.[0]?.sample ?? null, [job.job_config]);
+  const numSamples = Math.max(sampleConfig?.samples?.length || 0, sampleConfig?.prompts?.length || 0, 1);
 
   // Group samples into rows of `numSamples` for the virtualized list — one row per sample iteration.
   const rows = useMemo(() => {
@@ -260,14 +252,6 @@ export default function SampleImages({ job }: SampleImagesProps) {
   // Inline style instead of Tailwind grid-cols-N classes — Tailwind only ships grid-cols-1..12,
   // so class-based columns silently break for larger sample counts.
   const gridCols = Math.max(numSamples, 3);
-
-  const sampleConfig = useMemo(() => {
-    if (job?.job_config) {
-      const jobConfig = JSON.parse(job.job_config) as JobConfig;
-      return jobConfig.config.process[0].sample;
-    }
-    return null;
-  }, [job]);
 
   return (
     <div ref={scrollParentCallback} className="absolute top-[80px] left-0 right-0 bottom-0 overflow-y-auto">

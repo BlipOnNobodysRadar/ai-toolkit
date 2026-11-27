@@ -1,5 +1,7 @@
 /* eslint-disable */
 import { NextRequest, NextResponse } from 'next/server';
+import { historicalArtifactFolder, regularJobPath } from '../../../../../cron/ownership/jobArtifacts';
+import prisma from '@/server/prisma';
 import fs from 'fs';
 import path from 'path';
 import { Readable } from 'stream';
@@ -52,7 +54,8 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       allowedDir => resolved === allowedDir || resolved.startsWith(allowedDir + path.sep),
     );
 
-    if (!isAllowed) {
+    const historicalFolder = isAllowed ? null : await historicalArtifactFolder(prisma, trainingRoot, resolved);
+    if (!isAllowed && !historicalFolder) {
       console.warn(`Access denied: ${resolved} not in ${allowedDirs.join(', ')}`);
       return new NextResponse('Access denied', { status: 403 });
     }
@@ -65,7 +68,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       const thumbBase = path.join(path.dirname(resolved), '.thumbs', path.basename(resolved));
       for (const thumbPath of [`${thumbBase}.png`, `${thumbBase}.jpg`]) {
         const thumbStat = await fs.promises.stat(thumbPath).catch(() => null);
-        if (thumbStat && thumbStat.isFile()) {
+        if (thumbStat?.isFile() && (!historicalFolder || await regularJobPath(historicalFolder, thumbPath))) {
           resolved = thumbPath;
           break;
         }

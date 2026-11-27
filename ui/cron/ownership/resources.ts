@@ -51,6 +51,7 @@ export const parseGpuIds = (raw: string | null | undefined, legacy = false): Gpu
 // Raised when a folder's physical identity cannot be established (permissions, I/O): a lexical path in its place
 // could give one directory two claim keys, so callers refuse/wait instead of guessing.
 export class FolderIdentityError extends Error {}
+export class ResumeFolderError extends FolderIdentityError {}
 
 // The real directory an absolute path names: its nearest existing ancestor resolved through junctions, symlinks
 // and short names (realpath.native), plus the components that do not exist yet. Two job names (or two spellings of
@@ -92,6 +93,7 @@ export const canonicalFolder = (trainingRoot: string, name: string, platform: st
 // delete act outside it).
 export const jobFolderError = (trainingRoot: string, name: string | null | undefined): string | null => {
   if (typeof name !== 'string' || name.trim() === '') return 'Job name is required';
+  if (path.basename(name) !== name) return `Invalid job name "${name}"`;
   const root = path.resolve(trainingRoot);
   const folder = path.resolve(root, name);
   if (path.dirname(folder) !== root || folder === root) return `Invalid job name "${name}"`;
@@ -99,6 +101,91 @@ export const jobFolderError = (trainingRoot: string, name: string | null | undef
   if (name.trim().replace(/[. ]+$/, '').toLowerCase() === '.aitk_locks') return `"${name}" is reserved`;
   if (process.platform === 'win32' && name.replace(/[. ]+$/, '') === '') return `Invalid job name "${name}"`;
   return null;
+};
+
+type OutputJob = { name: string; run_dir?: string | null; run_id?: string | null; exit_verified_at?: unknown };
+
+const hasRunConfig = (folder: string, runId: string | null | undefined) =>
+  !!runId && /^[\w-]+$/.test(runId) &&
+  fs.lstatSync(path.join(folder, `.job_config.${runId}.json`), { throwIfNoEntry: false })?.isFile();
+
+// A rename changes the display name, not the checkpoint prefix. A move of the complete output
+// tree carries the per-launch config with it. Never identify a moved run by its directory name alone.
+export const jobOutputFolder = (trainingRoot: string, job: OutputJob, purpose: 'read' | 'resume' | 'delete' = 'read'): string => {
+  const nameError = jobFolderError(trainingRoot, job.name);
+  if (nameError) throw new FolderIdentityError(nameError);
+  const configured = path.resolve(trainingRoot, job.name);
+  if (!job.run_dir) return configured;
+  const bound = path.resolve(job.run_dir);
+  const historical = path.relative(configured, bound) !== '';
+  if (!path.isAbsolute(job.run_dir) || path.normalize(job.run_dir) !== bound ||
+      jobFolderError(path.dirname(bound), path.basename(bound)) ||
+      (historical && !job.run_id && !job.exit_verified_at)) {
+    throw new FolderIdentityError('The saved output directory is not the claimed job folder.');
+  }
+  if (!historical) return bound;
+
+  let folder = bound;
+  const moved = path.resolve(trainingRoot, path.basename(bound));
+  if (path.relative(bound, moved) !== '' && hasRunConfig(moved, job.run_id)) {
+    if (purpose === 'delete' && hasRunConfig(bound, job.run_id) && path.relative(physicalPath(bound), physicalPath(moved)) !== '') {
+      throw new FolderIdentityError('Both output directories carry this run. Their files have been kept.');
+    }
+    folder = moved; // Matches the configured root when a move or copy can be positively identified.
+  }
+  if (purpose === 'delete' && job.run_id && !hasRunConfig(folder, job.run_id)) {
+    throw new FolderIdentityError('The historical output directory no longer identifies this run.');
+  }
+  const pinned = path.join(physicalPath(path.dirname(folder)), path.basename(folder));
+  const resolved = physicalPath(pinned);
+  if (path.relative(resolved, folder) !== '') {
+    if (!hasRunConfig(resolved, job.run_id)) {
+      throw new FolderIdentityError('The historical output link no longer identifies this run.');
+    }
+    // Preserve a final directory link so deleting it cannot recursively remove its target.
+    if (purpose !== 'read') return pinned;
+  }
+  return folder;
+};
+
+// Folder identity only. Python chooses the checkpoint and verifies its contents and optimizer state.
+export const checkResumeFolder = (folder: string, job: { name: string; job_type: string; step: number }, previousRunId: string | null | undefined): void => {
+  if (job.job_type !== 'train' || (job.step ?? 0) <= 0) return;
+  const prefix = path.basename(folder);
+  const writer = process.platform === 'win32' ? prefix.toLowerCase() : prefix;
+  const namedWeights = /^(?:_(?:LoRA|decorator|refiner|t2i|cn|clip|ip|adapter))?(?:_\d{9})?(?:_(?:high|low)_noise)?\.(?:safetensors|pt)$/i;
+  const config = previousRunId ? `.job_config.${previousRunId}.json` : '.job_config.json';
+  let dir: fs.Dir | undefined;
+  try {
+    dir = fs.opendirSync(folder);
+    for (let entry = dir.readSync(); entry; entry = dir.readSync()) {
+      if (entry.isFile() && entry.name === config) return;
+      if (entry.name === 'rawr-resume.json' && entry.isFile()) {
+        // A committed pair can survive an outage before its public alias was written.
+        try {
+          if (JSON.parse(fs.readFileSync(path.join(folder, entry.name), 'utf8'))?.name === prefix) return;
+        } catch (err) {
+          if (!(err instanceof SyntaxError)) throw err;
+        }
+      }
+      const filename = process.platform === 'win32' ? entry.name.toLowerCase() : entry.name;
+      if (!filename.startsWith(writer)) continue;
+      const suffix = filename.slice(writer.length);
+      if ((entry.isFile() || entry.isSymbolicLink()) && namedWeights.test(suffix)) return;
+      if (entry.isDirectory() && /^(?:_\d{9})?$/.test(suffix)) return; // Diffusers directory
+    }
+  } catch (err: any) {
+    if (err?.code !== 'ENOENT' && err?.code !== 'ENOTDIR') throw err;
+  } finally {
+    dir?.closeSync();
+  }
+  throw new ResumeFolderError(`Cannot find the output for "${job.name}" at ${folder} (recorded step ${job.step}). Restore the original output folder or mount its disk, then start the job again.`);
+};
+
+export const trainingLaunchFolder = (trainingRoot: string, job: OutputJob & { job_type: string; step: number }): string => {
+  const folder = jobOutputFolder(trainingRoot, job, 'resume');
+  checkResumeFolder(folder, job, job.run_id);
+  return folder;
 };
 
 export const resourceSet = (gpu: { gpus: string[]; exclusive: boolean }, folder: string): ResourceSet => ({

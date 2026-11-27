@@ -2,14 +2,14 @@ import prisma from '../prisma';
 
 import { Job, Queue } from '@prisma/client';
 import startJob, { launchesInFlight } from './startJob';
-import { Db, Launcher, admit, isLegacyOccupant, requestQueueReturn, stopIdleQueue } from '../ownership/store';
+import { AdmittedJob, Db, Launcher, admit, isLegacyOccupant, requestQueueReturn, stopIdleQueue } from '../ownership/store';
 import { getTrainingFolder } from '../paths';
 
 export type QueueContext = {
   db: Db;
   trainingRoot: string;
   launcher: Launcher;
-  launch: (job: Job) => void;
+  launch: (job: AdmittedJob) => void;
 };
 
 // One queue tick. Admission is the atomic claim in ownership/store.ts: a queued job starts only when its whole

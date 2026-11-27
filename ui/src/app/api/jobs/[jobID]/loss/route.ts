@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/server/prisma';
-import path from 'path';
 import fs from 'fs';
+import { jobArtifactPath } from '../../../../../../cron/ownership/jobArtifacts';
 import { getTrainingFolder } from '@/server/settings';
 
 import sqlite3 from 'sqlite3';
@@ -64,23 +64,35 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   if (!job) return NextResponse.json({ error: 'Job not found' }, { status: 404 });
 
   const trainingFolder = await getTrainingFolder();
-  const jobFolder = path.join(trainingFolder, job.name);
-  const logPath = path.join(jobFolder, 'loss_log.db');
+  const logPath = await jobArtifactPath(trainingFolder, job, 'loss_log.db');
 
   try {
     await fs.promises.access(logPath);
   } catch {
-    return NextResponse.json({ keys: [], since_step: 0, run_id: job.run_id ?? null, series: {} });
+    return NextResponse.json({ keys: [], since_step: 0, reset: true, cursor: null, run_id: job.run_id ?? null, series: {} });
   }
 
   const url = new URL(request.url);
   const sinceStepParam = Number(url.searchParams.get('since_step') ?? 0);
-  const sinceStep = Number.isFinite(sinceStepParam) ? sinceStepParam : 0;
+  let sinceStep = Number.isFinite(sinceStepParam) ? sinceStepParam : 0;
+  const sinceTime = url.searchParams.get('since_time');
 
   const db = openDb(logPath);
 
   let body: string;
   try {
+    // Bind the cursor and all series to the same SQLite snapshot. A resumed trainer prunes
+    // future rows on its first metric commit, which may happen well after the new run_id appears.
+    await run(db, 'BEGIN;');
+    let reset = false;
+    if (sinceTime !== null) {
+      const [previous] = await all<{ wall_time: number }>(db, 'SELECT wall_time FROM steps WHERE step = ?', [sinceStep]);
+      if (!previous || previous.wall_time !== Number(sinceTime)) {
+        reset = true;
+        sinceStep = 0;
+      }
+    }
+    const [cursor] = await all<{ step: number; wall_time: number }>(db, 'SELECT step, wall_time FROM steps ORDER BY step DESC LIMIT 1');
     const keysRows = await all<{ key: string }>(db, `SELECT key FROM metric_keys ORDER BY key ASC`);
     const keys = keysRows.map((r) => r.key);
 
@@ -93,7 +105,8 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     }
     // run_id: the client's since_step cursor belongs to one run; a new run may rewrite steps it already has, so the
     // client reloads everything (history is kept, it lives in this file) when the run changes
-    body = `{"keys":${JSON.stringify(keys)},"since_step":${sinceStep},"run_id":${JSON.stringify(job.run_id ?? null)},"series":{${parts.join(',')}}}`;
+    body = `{"keys":${JSON.stringify(keys)},"since_step":${sinceStep},"reset":${reset},"cursor":${JSON.stringify(cursor ?? null)},"run_id":${JSON.stringify(job.run_id ?? null)},"series":{${parts.join(',')}}}`;
+    await run(db, 'COMMIT;');
   } finally {
     await closeDb(db);
   }
@@ -141,8 +154,7 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
   }
 
   const trainingFolder = await getTrainingFolder();
-  const jobFolder = path.join(trainingFolder, job.name);
-  const logPath = path.join(jobFolder, 'loss_log.db');
+  const logPath = await jobArtifactPath(trainingFolder, job, 'loss_log.db');
 
   try {
     await fs.promises.access(logPath);

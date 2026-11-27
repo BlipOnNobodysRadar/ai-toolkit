@@ -28,7 +28,7 @@ export default function JobOverview({ job }: JobOverviewProps) {
   const { gpuList, isGPUInfoLoaded } = useGPUInfo(gpuIds, 5000);
   const { cpuInfo, isCPUInfoLoaded } = useCPUInfo(5000);
   const totalSteps = getTotalSteps(job);
-  const progress = (job.step / totalSteps) * 100;
+  const progress = totalSteps > 0 ? Math.min(100, (job.step / totalSteps) * 100) : 0;
 
   const logLines: string[] = useMemo(() => {
     // Log is already terminal-rendered by useJobLog — one entry per line.
@@ -105,14 +105,17 @@ export default function JobOverview({ job }: JobOverviewProps) {
           {totalSteps > 0 && (
             <div className="space-y-2">
               <div className="flex items-center justify-between text-sm">
-                <span className="text-gray-400">Progress</span>
+                <span className="text-gray-400">Completed steps</span>
                 <span className="text-gray-200">
-                  Step {job.step} of {totalSteps}
+                  {job.step} of {totalSteps}
                 </span>
               </div>
               <div className="w-full bg-gray-800 rounded-full h-2">
                 <div className="h-2 rounded-full bg-blue-500 transition-all" style={{ width: `${progress}%` }} />
               </div>
+              {jobType === 'train' && job.step > 0 && ['stopped', 'error'].includes(job.status) && (
+                <p className="text-xs text-gray-400">Resuming uses the last saved checkpoint. Steps completed after that save run again.</p>
+              )}
             </div>
           )}
 

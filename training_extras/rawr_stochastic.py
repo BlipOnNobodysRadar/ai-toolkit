@@ -205,7 +205,11 @@ def unsupported_reason(trainer):
         return RESEEDED
     if str(trainer.accelerator.device) != 'cpu' or trainer.accelerator.num_processes != 1:
         return 'only single-process CPU execution is supported'
-    if (type(trainer).__module__ != 'extensions_built_in.sd_trainer.SDTrainer'
+    trainer_module = type(trainer).__module__
+    # A GUI launch wraps the standard trainer with DB callbacks. Its saved config keeps the original type.
+    standard_ui = (trainer_module == 'extensions_built_in.sd_trainer.DiffusionTrainer'
+                   and trainer.config.get('type') in ('sd_trainer', 'textual_inversion_trainer'))
+    if ((trainer_module != 'extensions_built_in.sd_trainer.SDTrainer' and not standard_ui)
             or type(trainer.sd).__module__ != 'toolkit.stable_diffusion_model'):
         return 'requires the standard SDTrainer/StableDiffusion path; custom model and hook state is unavailable'
     if not trainer.train_config.disable_sampling or trainer.train_config.validation_config is not None:

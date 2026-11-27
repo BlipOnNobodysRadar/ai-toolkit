@@ -56,9 +56,8 @@ type Props = {
   runId: string | null;
   gpuIDs: string | null;
   setGpuIDs: (value: string | null) => void;
-  gpuList: any;
+  gpuOptions: { value: string; label: string }[];
   datasetOptions: any;
-  isLoading?: boolean;
 };
 
 const isDev = process.env.NODE_ENV === 'development';
@@ -71,9 +70,8 @@ export default function SimpleJob({
   runId,
   gpuIDs,
   setGpuIDs,
-  gpuList,
+  gpuOptions,
   datasetOptions,
-  isLoading,
 }: Props) {
   const { archs: modelArchs, groupedModelOptions } = useModelArchs();
   const modelArch = useMemo(() => {
@@ -274,18 +272,7 @@ export default function SimpleJob({
   }
   return (
     <>
-      <form
-        onSubmit={handleSubmit}
-        className={`space-y-8 relative ${isLoading ? 'pointer-events-none opacity-50' : ''}`}
-      >
-        {isLoading && (
-          <div className="absolute inset-0 z-50 flex items-center justify-center">
-            <div className="flex flex-col items-center gap-3">
-              <div className="h-8 w-8 animate-spin rounded-full border-4 border-gray-400 border-t-blue-500" />
-              <span className="text-sm text-gray-400">Loading...</span>
-            </div>
-          </div>
-        )}
+      <form onSubmit={handleSubmit} className="space-y-8 relative">
         <div className={topBarClass}>
           <Card title="Job">
             <TextInput
@@ -298,12 +285,12 @@ export default function SimpleJob({
               required
             />
             {showGPUSelect && (
-              <SelectInput
+              <CreatableSelectInput
                 label="GPU ID"
-                value={`${gpuIDs}`}
+                value={gpuIDs ?? ''}
                 docKey="gpuids"
                 onChange={value => setGpuIDs(value)}
-                options={gpuList.map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` }))}
+                options={gpuOptions}
               />
             )}
             {disableSections.includes('trigger_word') ? null : (

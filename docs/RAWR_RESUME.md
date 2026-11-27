@@ -16,6 +16,8 @@ gradients and the next accumulation counter. Version 3 also records stochastic
 continuation state (or an explicit unsupported-mode reason). Older code rejects
 new versions instead of silently dropping the pending work. Changed LR/configuration,
 step mismatches, unsupported versions, and inconsistent groups are rejected.
+You can increase `train.steps` to extend a completed run. RAWR continues
+its saved cycle, including when its initial length came from the original step target.
 RAWR optimizer load/save errors propagate instead of silently continuing.
 Resuming model metadata beyond step zero also requires its optimizer.pt, and
 that optimizer state must actually load: a changed network shape (LoRA rank)
@@ -96,7 +98,9 @@ optimizer file readable. Plain LoRA training also uses a committed pair:
   moving a resumable run. A standalone new model export can still initialize a
   new run through `pretrained_lora_path`; it cannot masquerade as a paired resume.
 
-This paired protocol covers one plain LoRA file and its optimizer. EMA, merged
+This paired protocol covers one plain LoRA file and its optimizer. For a split
+Wan LoRA, RAWR saves the configured weight files at the selected export precision
+and resumes from the complete set with matching optimizer state. EMA, merged
 full models, auxiliary optimizers, embeddings, decorators, adapters, and learnable
 SNR files are not part of that transaction. Unsupported save modes cannot replace
 an existing committed pair in place; use a new output folder. Legacy directories

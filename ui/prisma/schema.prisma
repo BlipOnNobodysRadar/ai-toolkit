@@ -53,7 +53,7 @@ model Job {
   relay_pid          Int?
   relay_exited_at    DateTime? // the relay's exit was observed: it can no longer start a child
   supervisor_identity String? // pid@creation of the run's supervisor (owns the run's process boundary)
-  run_boundary       String? // 'win-job' | 'linux-subreaper' (from the spawn receipt)
+  run_boundary       String? // 'win-job' | 'linux-subreaper' | 'darwin-process-group' (from the spawn receipt)
   boot_id            String? // boot identity the run (or, for a legacy row, its first observation) belongs to
   pid_identity       String? // root process pid@creation, from the launch receipt or a token scan
   run_members        String? // JSON list of pid@creation of the run's processes seen so far

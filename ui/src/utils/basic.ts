@@ -76,6 +76,16 @@ export const encodeFilePathForUrl = (filePath: string, query = '') => {
   return withReadKey(query ? `${encoded}?${query}` : encoded);
 };
 
+// Scripted reads can still authenticate immediately after a server restart, before the
+// next read-key refresh updates the native image/audio URLs.
+export const fetchImageFile = (filePath: string, signal: AbortSignal, query = '') => {
+  const token = localStorage.getItem('AI_TOOLKIT_AUTH');
+  return fetch(`/api/img/${encodeFilePathForUrl(filePath, query)}`, {
+    signal,
+    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+  });
+};
+
 export const pathJoin = (...parts: string[]) => {
   const sep = parts.length > 0 && parts[0].includes('\\') ? '\\' : '/';
   const leadingTrailing = sep === '\\' ? /^\\+|\\+$/g : /^\/+|\/+$/g;

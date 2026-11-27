@@ -8,7 +8,8 @@ import classNames from 'classnames';
 import { Menu, MenuButton, MenuItem, MenuItems } from '@headlessui/react';
 import { openConfirm } from './ConfirmModal';
 import { apiClient } from '@/utils/api';
-import { isVideo, isAudio, isText, encodeFilePathForUrl } from '@/utils/basic';
+import { isVideo, isAudio, isText, encodeFilePathForUrl, fetchImageFile } from '@/utils/basic';
+import useReadKey from '@/hooks/useReadKey';
 import { withReadKey } from '@/utils/readKey';
 import AudioPlayer from './AudioPlayer';
 import { TransformWrapper, TransformComponent } from 'react-zoom-pan-pinch';
@@ -31,6 +32,7 @@ export default function SampleImageViewer({
   onChange,
   refreshSampleImages,
 }: Props) {
+  const readKey = useReadKey();
   const [mounted, setMounted] = useState(false);
   const [isOpen, setIsOpen] = useState(Boolean(imgPath));
   const [showingControlIdx, setShowingControlIdx] = useState<number | null>(null);
@@ -154,10 +156,10 @@ export default function SampleImageViewer({
   }, [imgPath, onChange, refreshSampleImages]);
 
   const sampleItem = useMemo<SampleItem | null>(() => {
-    if (!sampleConfig) return null;
-    if (imgInfo.promptIdx < 0) return null;
-    if (imgInfo.promptIdx >= sampleConfig.samples.length) return null;
-    return sampleConfig.samples[imgInfo.promptIdx];
+    const item = sampleConfig?.samples?.[imgInfo.promptIdx];
+    if (item) return item;
+    const prompt = sampleConfig?.prompts?.[imgInfo.promptIdx];
+    return typeof prompt === 'string' ? { prompt } : null;
   }, [sampleConfig, imgInfo.promptIdx]);
 
   const controlImages = useMemo<string[]>(() => {
@@ -208,14 +210,14 @@ export default function SampleImageViewer({
       return;
     }
     const controller = new AbortController();
-    fetch(`/api/img/${encodeFilePathForUrl(displayedImgPath)}`, { signal: controller.signal })
+    fetchImageFile(displayedImgPath, controller.signal)
       .then(r => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then(setSampleText)
       .catch(err => {
         if (err?.name !== 'AbortError') console.error('Sample text fetch failed:', err);
       });
     return () => controller.abort();
-  }, [displayedImgPath]);
+  }, [displayedImgPath, readKey]);
 
   // control thumbnails: audio has no image thumb, it gets its waveform art
   const thumbSrc = (p: string) =>

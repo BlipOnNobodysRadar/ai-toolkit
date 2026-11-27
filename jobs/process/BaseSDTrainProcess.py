@@ -892,8 +892,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 optimizer_state_dict = None
                 try:
                     print_acc(f"Loading optimizer state from {optimizer_state_file_path}")
-                    optimizer_state_dict = torch.load(optimizer_state_file_path, weights_only=True,
-                                                     map_location='cpu' if rawr_resume_enabled else None)
+                    # A UI job may resume on a different GPU or on the CPU. Let the
+                    # optimizer place its state alongside the current parameters.
+                    optimizer_state_dict = torch.load(optimizer_state_file_path, weights_only=True, map_location='cpu')
                 except Exception as e:
                     if rawr_resume_enabled:
                         raise RuntimeError('Could not load RAWR optimizer/scheduler checkpoint; refusing a partial resume') from e
@@ -2770,6 +2771,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if hasattr(self.sd, 'target_lora_modules'):
                     network_kwargs['target_lin_modules'] = self.sd.target_lora_modules
 
+                lora_name = BaseSDTrainProcess._lora_save_name(self)
+                latest_save_path = None
+                model_ignores = getattr(self.sd, 'lora_ignore_if_contains', None)
+                if (model_ignores and NetworkClass is LoRASpecialNetwork
+                        and 'use_model_lora_ignores' not in network_kwargs
+                        and not self.train_config.merge_network_on_save):
+                    # Only this run's own LoRA can determine its historical topology.
+                    from toolkit.network_mixins import resume_lora_kwargs
+                    latest_save_path = self.get_latest_save_path(lora_name, include_pretrained_lora=False)
+                    network_kwargs = resume_lora_kwargs(network_kwargs, model_ignores, latest_save_path)
+
                 self.network = NetworkClass(
                     text_encoder=text_encoder,
                     unet=self.sd.get_model_to_train(),
@@ -2873,10 +2885,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 # the names the writer uses (job name, not process name; the model's split files), so the LoRA it saved
                 # is the one resumed (OPUS-RES-01)
-                lora_name = BaseSDTrainProcess._lora_save_name(self)
-
-                latest_save_path = self.get_latest_save_path(
-                    lora_name, suffixes=BaseSDTrainProcess._lora_save_suffixes(self))
+                if latest_save_path is None:
+                    latest_save_path = self.get_latest_save_path(
+                        lora_name, suffixes=BaseSDTrainProcess._lora_save_suffixes(self))
                 extra_weights = None
                 if latest_save_path is not None and not self.train_config.merge_network_on_save:
                     print_acc(f"#### IMPORTANT RESUMING FROM {latest_save_path} ####")
@@ -3048,9 +3059,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # set up the ema now that the optimizer (and its params) are ready
         self.setup_ema()
         BaseSDTrainProcess._restore_ema_resume_state(self)
-        # every save mode is known now (EMA, embedding, adapter): refuse a RAWR pair the writer cannot produce before
-        # training toward a first save that would abort (OPUS-RAWR-01)
-        rawr_pair.refuse_unsupported_writer(self)
+        if rawr_resume_enabled:
+            rawr_pair.check_existing_pair(self)
 
         lr_scheduler_params = self.train_config.lr_scheduler_params
 

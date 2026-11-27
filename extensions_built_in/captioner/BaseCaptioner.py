@@ -95,7 +95,8 @@ class BaseCaptioner(BaseExtensionProcess):
             # Track all async tasks
             self._async_tasks = []
             # Initialize the status
-            self._run_async_operation(self._update_status("running", "Starting"))
+            if process_id == 0:
+                self._run_async_operation(self._update_status("running", "Starting"))
             self._stop_watcher_started = False
             # self.start_stop_watcher(interval_sec=2.0)
 
@@ -502,6 +503,7 @@ class BaseCaptioner(BaseExtensionProcess):
             self._run_async_operation(self._update_key(key, value))
 
     async def _update_status(self, status: AITK_Status, info: Optional[str] = None):
+        status, info = self.ui_process_status(status, info)
         if not self.is_ui_captioner:
             return
 

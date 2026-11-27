@@ -74,3 +74,50 @@ test('already-invalid prefixes (overlong E0 80, surrogate ED A0, overlong F0 80,
     if (c.held) await get({ offset: String(r.offset), generation });
   }
 });
+
+test('a renamed job under a previous training root reads its own artifacts and downloads', async t => {
+  const previous = fs.mkdtempSync(path.join(path.dirname(F.trainingRoot), 'historical-artifacts-'));
+  t.after(() => fs.rmSync(previous, { recursive: true, force: true }));
+  const folder = path.join(previous, 'original');
+  const samples = path.join(folder, 'samples');
+  fs.mkdirSync(samples, { recursive: true });
+  const old = await makeJob(F.db, { name: 'renamed', run_dir: folder, run_id: 'saved-run', launch_phase: 'exited' });
+  const params = { params: Promise.resolve({ jobID: old.id }) };
+  const file = path.join(folder, 'model_10.safetensors');
+  const sample = path.join(samples, 'step_10.WAV');
+  fs.writeFileSync(file, 'checkpoint');
+  fs.writeFileSync(sample, 'audio');
+  fs.writeFileSync(path.join(samples, 'step_10.txt'), 'caption');
+  fs.writeFileSync(path.join(folder, 'log.txt'), 'previous run');
+  const req = { nextUrl: new URL('http://localhost'), headers: new Headers() };
+
+  assert.equal((await (await route.GET(req, params)).json()).log, 'previous run');
+  const files = require(ts.uiPath('src/app/api/jobs/[jobID]/files/route.ts'));
+  const gallery = require(ts.uiPath('src/app/api/jobs/[jobID]/samples/route.ts'));
+  assert.deepEqual((await (await files.GET(req, params)).json()).files.map(f => f.path), [file]);
+  assert.deepEqual((await (await gallery.GET(req, params)).json()).samples, [sample]);
+
+  const loras = require(ts.uiPath('src/app/api/loras/route.ts'));
+  const loraJobs = (await (await loras.GET()).json()).jobs;
+  assert.deepEqual(loraJobs.find(row => row.id === old.id).files.map(f => f.path), [file]);
+  const engineFolder = path.join(previous, 'inference');
+  fs.mkdirSync(engineFolder);
+  const engine = await makeJob(F.db, { name: 'renamed-engine', job_type: 'inference', status: 'running',
+    run_dir: engineFolder, run_id: 'engine-run', launch_phase: 'attached' });
+  fs.writeFileSync(path.join(engineFolder, 'engine.json'), JSON.stringify({ job_id: engine.id, host: '127.0.0.1', port: 1234, pid: process.pid }));
+  const { listEngines } = require(ts.uiPath('src/server/inferenceEngine.ts'));
+  assert.equal((await listEngines(true)).find(item => item.jobId === engine.id).endpoint.port, 1234);
+
+  const download = require(ts.uiPath('src/app/api/files/[...filePath]/route.ts'));
+  const getFile = p => download.GET(req, { params: Promise.resolve({ filePath: [path.dirname(p), path.basename(p)] }) });
+  assert.equal(await (await getFile(file)).text(), 'checkpoint');
+  assert.equal((await getFile(path.join(folder, 'log.txt'))).status, 403);
+  const neighbor = path.join(previous, 'other.safetensors');
+  fs.writeFileSync(neighbor, 'unrelated');
+  assert.equal((await getFile(neighbor)).status, 403);
+  if (process.platform !== 'win32') {
+    const link = path.join(samples, 'link.WAV');
+    fs.symlinkSync(neighbor, link);
+    assert.equal((await getFile(link)).status, 403);
+  }
+});

@@ -147,7 +147,7 @@ export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
     jobConfig.config.process[0].type = 'diffusion_trainer';
   }
 
-  if ('auto_memory' in jobConfig.config.process[0].model) {
+  if (jobConfig.config.process[0].model && 'auto_memory' in jobConfig.config.process[0].model) {
     jobConfig.config.process[0].model.layer_offloading = (jobConfig.config.process[0].model.auto_memory ||
       false) as boolean;
     delete jobConfig.config.process[0].model.auto_memory;

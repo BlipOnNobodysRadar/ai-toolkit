@@ -19,9 +19,14 @@ export default function useJobByRef(jobRef: string | null, reloadInterval: null 
     const owner = ownerRef.current!;
     // a callback from an earlier render (old jobRef) must not issue a request under the new identity
     if (!owner.isCurrent(jobRef)) return Promise.resolve();
+    if (!jobRef) {
+      setJob(null);
+      setStatus('idle');
+      return Promise.resolve();
+    }
     setStatus('loading');
     return apiClient
-      .get(`/api/jobs?job_ref=${jobRef}`)
+      .get(`/api/jobs?job_ref=${encodeURIComponent(jobRef)}`)
       .then(res => res.data)
       .then(data => {
         if (!owner.accept(ticket)) return;

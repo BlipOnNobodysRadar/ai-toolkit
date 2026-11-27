@@ -1,4 +1,5 @@
 import React from 'react';
+import useReadKey from '@/hooks/useReadKey';
 import useFilesList from '@/hooks/useFilesList';
 import { Loader2, AlertCircle, Download, Box, Brain, Trash2, SlidersHorizontal, Info } from 'lucide-react';
 import { openMergeLoRAsModal } from './MergeLoRAsModal';
@@ -8,6 +9,7 @@ import { openConfirm } from './ConfirmModal';
 import { apiClient } from '@/utils/api';
 
 export default function FilesWidget({ jobID, jobName }: { jobID: string; jobName: string }) {
+  useReadKey();
   const { files, status, refreshFiles } = useFilesList(jobID, 5000);
 
   const isOptimizerFile = (filePath: string) => getFilename(filePath) === 'optimizer.pt';

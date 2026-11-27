@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useState } from 'react';
+import { useMemo } from 'react';
 import YAML from 'yaml';
 import Editor from '@monaco-editor/react';
 
@@ -34,13 +34,13 @@ function toYaml(obj: any): string {
 }
 
 export default function JobConfigViewer({ job }: Props) {
-  const [editorValue, setEditorValue] = useState<string>('');
-  useEffect(() => {
-    if (job?.job_config) {
-      const yamlContent = toYaml(JSON.parse(job.job_config));
-      setEditorValue(yamlContent);
+  const editorValue = useMemo(() => {
+    try {
+      return toYaml(JSON.parse(job.job_config));
+    } catch {
+      return job.job_config;
     }
-  }, [job]);
+  }, [job.job_config]);
   return (
     <>
       <Editor

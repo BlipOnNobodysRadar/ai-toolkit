@@ -1,4 +1,7 @@
 import { NextResponse } from 'next/server';
+import { historicalArtifactFolder } from '../../../../../cron/ownership/jobArtifacts';
+import prisma from '@/server/prisma';
+import path from 'path';
 import fs from 'fs';
 import { getDatasetsRoot, getTrainingFolder } from '@/server/settings';
 import { captionPathFor, resolveAllowedMutationPath } from '@/server/safePath';
@@ -17,6 +20,11 @@ export async function POST(request: Request) {
     const datasetsPath = await getDatasetsRoot();
     const trainingPath = await getTrainingFolder();
     const allowedRoots = [datasetsPath, trainingPath];
+    const resolved = path.resolve(imgPath);
+    if (!allowedRoots.some(root => resolved.startsWith(root + path.sep))) {
+      const historical = await historicalArtifactFolder(prisma, trainingPath, resolved);
+      if (historical) allowedRoots.push(historical);
+    }
 
     // Validate both final destinations before mutating either. The physical check permits an intentionally linked
     // configured root but rejects a nested link that escapes it. (A concurrent link swap after this check is a

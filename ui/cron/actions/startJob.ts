@@ -1,5 +1,5 @@
 import prisma from '../prisma';
-import { Job } from '@prisma/client';
+import type { AdmittedJob } from '../ownership/store';
 import path from 'path';
 import { TOOLKIT_ROOT, getHFToken, getModelsPath } from '../paths';
 import { resolveDetachedPythonPath, resolvePythonPath } from '../pythonPath';
@@ -14,7 +14,7 @@ export const launchesInFlight = new Set<string>();
 // and survives the UI being shut down or tree-killed); the supervisor owns the run's process boundary (Windows job
 // object), starts the job through pythonw.exe so no console window appears, and records the root's pid@creation
 // in an atomic per-run receipt. See ui/cron/ownership/launch.ts.
-export default async function startJob(job: Job): Promise<LaunchResult> {
+export default async function startJob(job: AdmittedJob): Promise<LaunchResult> {
   const env: Record<string, string> = {};
   try {
     const hfToken = await getHFToken();

@@ -1,4 +1,6 @@
 import { NextResponse } from 'next/server';
+import { jobArtifactPath } from '../../../../cron/ownership/jobArtifacts';
+import type { Job } from '@prisma/client';
 import fs from 'fs';
 import path from 'path';
 import prisma from '@/server/prisma';
@@ -13,8 +15,9 @@ interface LoraFile {
   mtime: number;
 }
 
-const listSafetensors = async (dir: string): Promise<LoraFile[]> => {
+const listSafetensors = async (trainingRoot: string, job: Job): Promise<LoraFile[]> => {
   try {
+    const dir = await jobArtifactPath(trainingRoot, job);
     const entries = await fs.promises.readdir(dir, { withFileTypes: true });
     const files = entries.filter(e => e.isFile() && e.name.endsWith('.safetensors'));
     return (
@@ -65,7 +68,7 @@ export async function GET() {
         name: job.name,
         status: job.status,
         updated_at: job.updated_at,
-        files: await listSafetensors(path.join(trainingFolder, job.name)),
+        files: await listSafetensors(trainingFolder, job),
       })),
     )
   ).filter(j => j.files.length > 0);

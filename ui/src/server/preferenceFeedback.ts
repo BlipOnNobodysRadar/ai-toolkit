@@ -4,7 +4,7 @@ import { randomUUID } from 'crypto';
 import { once } from 'events';
 import archiver from 'archiver';
 import sqlite3 from 'sqlite3';
-import { jobFolderError } from '../../cron/ownership/resources';
+import { jobFolderError, jobOutputFolder } from '../../cron/ownership/resources';
 
 // Job-scoped reader/writer for MOSS preference-feedback pairs.
 //
@@ -104,9 +104,6 @@ const isContained = (root: string, candidate: string): boolean => {
   const rel = path.relative(root, candidate);
   return rel === '' || (!path.isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${path.sep}`));
 };
-
-const sameName = (a: string, b: string): boolean =>
-  process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
 
 const lstatOptional = async (file: string): Promise<fs.Stats | null> => {
   try {
@@ -235,7 +232,13 @@ export const resolveBoundJobRoot = async (job: BoundJob, trainingRoot: string): 
   const nameError = jobFolderError(trainingRoot, job.name);
   if (nameError) throw new PreferenceFeedbackError(nameError, 400, 'INVALID_JOB_FOLDER');
 
-  const configuredRoot = path.resolve(trainingRoot);
+  let lexical: string;
+  try {
+    lexical = jobOutputFolder(trainingRoot, job);
+  } catch {
+    throw new PreferenceFeedbackError('The job run folder is not the claimed job folder.', 409, 'INVALID_RUN_BINDING');
+  }
+  const configuredRoot = path.dirname(lexical);
   const configuredStat = await fs.promises.stat(configuredRoot).catch(() => null);
   if (!configuredStat || !configuredStat.isDirectory()) {
     throw new PreferenceFeedbackError('The configured training folder is unavailable.', 500, 'TRAINING_FOLDER_UNAVAILABLE');
@@ -243,19 +246,6 @@ export const resolveBoundJobRoot = async (job: BoundJob, trainingRoot: string): 
   const realConfiguredRoot = await fs.promises.realpath(configuredRoot).catch(() => {
     throw new PreferenceFeedbackError('The configured training folder cannot be resolved safely.', 500, 'TRAINING_FOLDER_UNAVAILABLE');
   });
-
-  const expected = path.resolve(configuredRoot, job.name);
-  let lexical = expected;
-  if (job.run_dir !== undefined && job.run_dir !== null && job.run_dir !== '') {
-    if (typeof job.run_dir !== 'string') {
-      throw new PreferenceFeedbackError('The job has an invalid run folder binding.', 409, 'INVALID_RUN_BINDING');
-    }
-    const bound = path.resolve(job.run_dir);
-    if (!sameName(path.dirname(bound), configuredRoot) || !sameName(path.basename(bound), job.name)) {
-      throw new PreferenceFeedbackError('The job run folder is not the claimed job folder.', 409, 'INVALID_RUN_BINDING');
-    }
-    lexical = bound;
-  }
 
   const folderStat = await lstatOptional(lexical);
   if (!folderStat) {

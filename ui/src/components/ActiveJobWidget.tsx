@@ -31,9 +31,11 @@ export default function ActiveJobWidget() {
               href = `/generate?job=${job.id}`;
             }
             if (job.job_type === 'caption') {
-              const splits = (job.job_ref ?? '').split(/[/\\]/);
-              label = splits[splits.length - 1] || job.name;
-              href = `/datasets/${label}`;
+              const dataset = job.job_ref?.split(/[/\\]/).filter(Boolean).pop();
+              if (dataset) {
+                label = dataset;
+                href = `/datasets/${encodeURIComponent(dataset)}`;
+              }
             }
 
             let statusColor = 'text-gray-400';

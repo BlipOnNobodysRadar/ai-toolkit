@@ -4,6 +4,8 @@ import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
 import archiver from 'archiver';
+import prisma from '@/server/prisma';
+import { jobArtifactPath } from '../../../../cron/ownership/jobArtifacts';
 import { getDatasetsRoot, getTrainingFolder } from '@/server/settings';
 
 export const runtime = 'nodejs'; // ensure Node APIs are available
@@ -105,9 +107,11 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'jobName is required' }, { status: 400 });
     }
 
-    const trainingRoot = await resolveSafe(await getTrainingFolder());
-    const folderPath = await resolveSafe(path.join(trainingRoot, body.jobName, 'samples'));
-    const outputPath = path.resolve(trainingRoot, body.jobName, 'samples.zip');
+    const job = await prisma.job.findUnique({ where: { name: body.jobName } });
+    if (!job) return NextResponse.json({ error: 'Job not found' }, { status: 404 });
+    const trainingRoot = await getTrainingFolder();
+    const folderPath = await jobArtifactPath(trainingRoot, job, 'samples');
+    const outputPath = await jobArtifactPath(trainingRoot, job, 'samples.zip');
 
     // Must be a directory
     let stat: fs.Stats;

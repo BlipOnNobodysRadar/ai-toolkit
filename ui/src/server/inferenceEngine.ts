@@ -1,5 +1,6 @@
 import fs from 'fs';
-import path from 'path';
+import { jobArtifactPath } from '../../cron/ownership/jobArtifacts';
+import type { Job } from '@prisma/client';
 import prisma from '@/server/prisma';
 import { getTrainingFolder } from '@/server/settings';
 
@@ -33,11 +34,12 @@ const isProcessAlive = (pid: number): boolean => {
   }
 };
 
-const readEndpoint = (jobFolder: string): EngineEndpoint | null => {
+const readEndpoint = async (trainingRoot: string, job: Job): Promise<EngineEndpoint | null> => {
   try {
-    const raw = fs.readFileSync(path.join(jobFolder, 'engine.json'), 'utf8');
+    const file = await jobArtifactPath(trainingRoot, job, 'engine.json');
+    const raw = await fs.promises.readFile(file, 'utf8');
     const ep = JSON.parse(raw) as EngineEndpoint;
-    if (!ep.host || !ep.port) return null;
+    if (!ep.host || !ep.port || (ep.job_id && ep.job_id !== job.id)) return null;
     // a stale file from a crashed engine must not be proxied to
     if (ep.pid && !isProcessAlive(ep.pid)) return null;
     return ep;
@@ -61,7 +63,7 @@ export async function listEngines(forceFresh = false): Promise<EngineHandle[]> {
     const active = ['starting', 'running', 'queued', 'stopping'].includes(job.status);
     // a run that reported an ending but whose process exit is not verified yet still owns its GPU
     const exiting = !active && job.run_id != null && job.launch_phase != null && job.launch_phase !== 'exited';
-    const endpoint = readEndpoint(path.join(trainingFolder, job.name));
+    const endpoint = await readEndpoint(trainingFolder, job);
     if (!active && !endpoint && !exiting) continue;
     handles.push({
       jobId: job.id,

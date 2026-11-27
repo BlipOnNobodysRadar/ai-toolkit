@@ -17,6 +17,8 @@ type SeriesMap = Record<string, LossSeries>;
 interface LossResponse {
   keys?: string[];
   since_step?: number;
+  reset?: boolean;
+  cursor?: { step: number; wall_time: number } | null;
   run_id?: string | null;
   series?: Record<string, { steps: number[]; values: (number | null)[] }>;
 }
@@ -42,6 +44,7 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
   // key logged at that step after the previous poll is still picked up; the
   // per-key merge below drops the one re-sent point.
   const lastStepRef = useRef<number | null>(null);
+  const cursorRef = useRef<LossResponse['cursor']>(null);
 
   const lossKeys = useMemo(() => {
     const base = keys ?? [];
@@ -64,8 +67,12 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
 
     // One request returns every key. Incremental after the initial load.
     const params: Record<string, number> = {};
-    const incremental = !!reloadInterval && didInitialLoadRef.current && lastStepRef.current != null;
-    if (incremental) params.since_step = lastStepRef.current!;
+    const since = cursorRef.current?.step ?? lastStepRef.current;
+    const incremental = !!reloadInterval && didInitialLoadRef.current && since != null;
+    if (incremental) {
+      params.since_step = since;
+      if (cursorRef.current) params.since_time = cursorRef.current.wall_time;
+    }
 
     const promise = (async () => {
       try {
@@ -73,10 +80,11 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
         if (!owner.accept(ticket)) return;
         const data = res.data as LossResponse;
         const runId = data.run_id ?? null;
-        if (incremental && runIdRef.current !== undefined && runId !== runIdRef.current) {
+        if (incremental && !data.reset && runIdRef.current !== undefined && runId !== runIdRef.current) {
           // another run wrote this log since our cursor was set: reload everything on the next read
           didInitialLoadRef.current = false;
           lastStepRef.current = null;
+          cursorRef.current = null;
           runIdRef.current = runId;
           if (retryRef.current) clearTimeout(retryRef.current);
           retryRef.current = setTimeout(() => {
@@ -92,7 +100,8 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
         setKeys(newKeys);
         const wantedLossKeys = (newKeys.length ? [...newKeys] : ['loss']).sort();
         const incoming = data.series ?? {};
-        const initial = !didInitialLoadRef.current;
+        const initial = !didInitialLoadRef.current || !!data.reset;
+        cursorRef.current = data.cursor ?? null;
 
         setSeries(prev => {
           const next: SeriesMap = initial ? {} : { ...prev };
@@ -181,6 +190,7 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
       // cursor cleared: the next read is a full load
       didInitialLoadRef.current = false;
       lastStepRef.current = null;
+      cursorRef.current = null;
       inFlightRef.current = null;
       await refreshLoss();
     },
@@ -197,6 +207,7 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
     runIdRef.current = undefined;
     didInitialLoadRef.current = false;
     lastStepRef.current = null;
+    cursorRef.current = null;
     setSeries({});
     setKeys([]);
     setStatus('idle');

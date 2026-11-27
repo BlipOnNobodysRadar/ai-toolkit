@@ -164,7 +164,8 @@ def report_error(job, e):
     if not processes:
         return  # the job (or its first process) was never built
     try:
-        processes[0].on_error(e)
+        process = getattr(job, 'active_process', None) or processes[0]
+        process.on_error(e)
     except Exception as e2:
         print_acc(f"Error running on_error: {e2}")
 

@@ -1,12 +1,13 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
+import usePollLoop from '@/hooks/usePollLoop';
 import { Queue } from '@prisma/client';
 import { apiClient } from '@/utils/api';
 import { RequestOwner } from '@/utils/requestOwner';
 
 // Manual refreshes may overlap (e.g. after queue start/stop clicks); only the latest issued one is applied.
-export default function useQueueList() {
+export default function useQueueList(reloadInterval: number | null = null) {
   const [queues, setQueues] = useState<Queue[]>([]);
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const ownerRef = useRef<RequestOwner | null>(null);
@@ -35,9 +36,7 @@ export default function useQueueList() {
         setStatus('error');
       });
   };
-  useEffect(() => {
-    refreshQueues();
-  }, []);
+  usePollLoop(refreshQueues, reloadInterval);
 
   return { queues, setQueues, status, refreshQueues };
 }

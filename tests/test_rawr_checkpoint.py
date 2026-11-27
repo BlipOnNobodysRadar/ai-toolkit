@@ -307,6 +307,31 @@ def test_declared_schedule_change_rejected(change):
         rawr_checkpoint.restore(new_sched, rawr_checkpoint.capture(state), new_config, 0)
 
 
+@pytest.mark.parametrize('explicit_cycle', [False, True])
+def test_extend_completed_plan_continues_the_saved_cycle(explicit_cycle):
+    params = _new_params()
+    opt = _new_optimizer(params)
+    options = _scheduler_params(.45, 1.5)
+    if not explicit_cycle:
+        del options['first_cycle_max_steps']
+    config = rawr_checkpoint.configuration(opt, TOTAL_STEPS, options)
+    sched = create_scheduler(opt, 'easy:RAWR', TOTAL_STEPS, options)
+    sched.step(0)
+    _advance(params, opt, sched, TOTAL_STEPS)
+    state = rawr_checkpoint.add_state(opt.state_dict(), sched, config, TOTAL_STEPS)
+
+    resumed_params = [torch.nn.Parameter(p.detach().clone()) for p in params]
+    resumed_opt = _new_optimizer(resumed_params)
+    extended_target = TOTAL_STEPS + 7
+    extended_config = rawr_checkpoint.configuration(resumed_opt, extended_target, options)
+    resumed_opt.load_state_dict(copy.deepcopy(state))
+    for group, lr in zip(resumed_opt.param_groups, (LR_A, LR_B)):
+        group['lr'] = group['initial_lr'] = lr
+    resumed_sched = create_scheduler(resumed_opt, 'easy:RAWR', extended_target, options)
+    assert rawr_checkpoint.restore(resumed_sched, rawr_checkpoint.capture(state), extended_config, TOTAL_STEPS)
+    _compare_after(params, opt, sched, resumed_params, resumed_opt, resumed_sched, future=7)
+
+
 def test_arbitrary_wrapper_cannot_silently_drop_rawr_state():
     _, opt, sched, config, _ = _make_state(_new_params(), .45, 1.5)
     class UnknownWrapper:

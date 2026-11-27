@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/server/prisma';
 import path from 'path';
 import fs from 'fs';
+import { jobArtifactPath } from '../../../../../../cron/ownership/jobArtifacts';
 import { getTrainingFolder } from '@/server/settings';
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ jobID: string }> }) {
@@ -18,7 +19,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   // setup the training
   const trainingFolder = await getTrainingFolder();
 
-  const samplesFolder = path.join(trainingFolder, job.name, 'samples');
+  const samplesFolder = await jobArtifactPath(trainingFolder, job, 'samples');
   try {
     await fs.promises.access(samplesFolder);
   } catch {
@@ -31,19 +32,13 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   const names = (await fs.promises.readdir(samplesFolder, { withFileTypes: true }))
     .filter(entry => entry.isFile())
     .map(entry => entry.name);
-  const isMedia = (file: string) =>
-    file.endsWith('.png') ||
-    file.endsWith('.jpg') ||
-    file.endsWith('.jpeg') ||
-    file.endsWith('.webp') ||
-    file.endsWith('.mp4') ||
-    file.endsWith('mp3');
+  const isMedia = (file: string) => /\.(png|jpe?g|gif|webp|bmp|mp4|avi|mov|mkv|wmv|m4v|flv|mp3|wav|flac|ogg)$/i.test(file);
   const mediaStems = new Set(names.filter(isMedia).map(file => file.slice(0, file.lastIndexOf('.'))));
   const samples = names
     .filter(file => {
       if (isMedia(file)) return true;
       // text samples (LLM models); a .txt next to a media sample is its prompt sidecar, not a sample
-      return file.endsWith('.txt') && !mediaStems.has(file.slice(0, -4));
+      return file.toLowerCase().endsWith('.txt') && !mediaStems.has(file.slice(0, -4));
     })
     .map(file => {
       return path.join(samplesFolder, file);

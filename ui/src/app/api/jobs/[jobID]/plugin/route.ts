@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/server/prisma';
-import path from 'path';
 import fs from 'fs';
+import { jobArtifactPath } from '../../../../../../cron/ownership/jobArtifacts';
 import { getTrainingFolder } from '@/server/settings';
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ jobID: string }> }) {
@@ -16,8 +16,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   }
 
   const trainingFolder = await getTrainingFolder();
-  const jobFolder = path.join(trainingFolder, job.name);
-  const pluginPath = path.join(jobFolder, 'plugin.html');
+  const pluginPath = await jobArtifactPath(trainingFolder, job, 'plugin.html');
 
   try {
     await fs.promises.access(pluginPath);

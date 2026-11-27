@@ -557,3 +557,18 @@ def test_stop_is_marked_before_the_blocking_status_write(trainer_module, cls, fl
     with pytest.raises(Exception, match='Job'):
         t.maybe_stop()
     assert seen == [True]
+
+
+def test_ui_sample_does_not_change_the_cpu_training_rng():
+    import random
+    import numpy as np
+    from training_extras.rawr_stochastic import rng_state, restore_rng
+    t = ui_trainer(torch.nn.Parameter(torch.zeros(2)))
+    t.should_sample = lambda: True
+    draws = lambda: (torch.rand(()).item(), random.random(), np.random.random())
+    t.sample = lambda step: draws()
+    saved = rng_state()
+    expected = draws()
+    restore_rng(saved)
+    t.maybe_sample()
+    assert draws() == expected

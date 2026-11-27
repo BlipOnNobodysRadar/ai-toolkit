@@ -340,7 +340,7 @@ test('path defenses: outside run bindings, linked preference roots, and linked p
   }
 });
 
-test('existing bearer middleware protects preference reads and votes', () => {
+test('existing bearer middleware protects preference reads and votes', async () => {
   const middleware = require(ts.uiPath('src/middleware.ts')).middleware;
   const request = (method, jobID, token) => ({
     method,
@@ -351,10 +351,10 @@ test('existing bearer middleware protects preference reads and votes', () => {
   try {
     process.env.AI_TOOLKIT_AUTH = 'fixture-only-token';
     const id = randomUUID().replaceAll('-', '');
-    assert.equal(middleware(request('GET', id)).status, 401);
-    assert.equal(middleware(request('POST', id)).status, 401);
-    assert.equal(middleware(request('GET', id, 'fixture-only-token')).next, true);
-    assert.equal(middleware(request('POST', id, 'fixture-only-token')).next, true);
+    assert.equal((await middleware(request('GET', id))).status, 401);
+    assert.equal((await middleware(request('POST', id))).status, 401);
+    assert.equal((await middleware(request('GET', id, 'fixture-only-token'))).next, true);
+    assert.equal((await middleware(request('POST', id, 'fixture-only-token'))).next, true);
   } finally {
     if (old === undefined) delete process.env.AI_TOOLKIT_AUTH;
     else process.env.AI_TOOLKIT_AUTH = old;

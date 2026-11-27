@@ -317,7 +317,7 @@ test('disconnecting during the first image closes it without opening the remaini
   }
 });
 
-test('existing bearer middleware protects the export route', () => {
+test('existing bearer middleware protects the export route', async () => {
   const middleware = require(ts.uiPath('src/middleware.ts')).middleware;
   const request = (token) => ({
     method: 'GET',
@@ -327,8 +327,8 @@ test('existing bearer middleware protects the export route', () => {
   const old = process.env.AI_TOOLKIT_AUTH;
   try {
     process.env.AI_TOOLKIT_AUTH = 'fixture-only-token';
-    assert.equal(middleware(request()).status, 401);
-    assert.equal(middleware(request('fixture-only-token')).next, true);
+    assert.equal((await middleware(request())).status, 401);
+    assert.equal((await middleware(request('fixture-only-token'))).next, true);
   } finally {
     if (old === undefined) delete process.env.AI_TOOLKIT_AUTH;
     else process.env.AI_TOOLKIT_AUTH = old;

@@ -1,5 +1,6 @@
 import React, { useRef, useEffect, useState, ReactNode } from 'react';
-import { isVideo, isAudio, isText, encodeFilePathForUrl } from '@/utils/basic';
+import { isVideo, isAudio, isText, encodeFilePathForUrl, fetchImageFile } from '@/utils/basic';
+import useReadKey from '@/hooks/useReadKey';
 import { withReadKey } from '@/utils/readKey';
 
 interface SampleImageCardProps {
@@ -30,6 +31,7 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
   observerRoot = null,
   rootMargin = '200px 0px',
 }) => {
+  const readKey = useReadKey();
   const cardRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [isVisible, setIsVisible] = useState(false);
@@ -47,7 +49,7 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
   useEffect(() => {
     if (!isItText || !isVisible) return;
     const controller = new AbortController();
-    fetch(`/api/img/${encodeFilePathForUrl(imageUrl)}`, { signal: controller.signal })
+    fetchImageFile(imageUrl, controller.signal)
       .then(r => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then(t => {
         setText(t);
@@ -61,7 +63,7 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
       setText(null);
       setLoaded(false);
     };
-  }, [isItText, isVisible, imageUrl]);
+  }, [isItText, isVisible, imageUrl, readKey]);
 
   // Observe both enter and exit
   useEffect(() => {
@@ -103,7 +105,7 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
       // ?thumb=1: the server sends the small pre-generated thumbnail when one
       // exists, otherwise the full file. Videos without a thumb come back as
       // video/* — abort the transfer and render the <video> element instead.
-      fetch(`/api/img/${encodeFilePathForUrl(imageUrl, 'thumb=1')}`, { signal: controller.signal })
+      fetchImageFile(imageUrl, controller.signal, 'thumb=1')
         .then(r => {
           if (!r.ok) throw new Error(`HTTP ${r.status}`);
           const contentType = r.headers.get('content-type') || '';
@@ -137,7 +139,7 @@ const SampleImageCard: React.FC<SampleImageCardProps> = ({
       setLoaded(false);
       setVideoFallback(false);
     };
-  }, [isVisible, isItAudio, isItText, isItVideo, imageUrl]);
+  }, [isVisible, isItAudio, isItText, isItVideo, imageUrl, readKey]);
 
   return (
     <div className={`flex flex-col ${className}`}>

@@ -9,7 +9,7 @@ import useJob from '@/hooks/useJob';
 import usePollLoop from '@/hooks/usePollLoop';
 import SampleImages, { SampleImagesMenu } from '@/components/SampleImages';
 import JobOverview from '@/components/JobOverview';
-import { redirect } from 'next/navigation';
+import { useRouter } from 'next/navigation';
 import JobActionBar from '@/components/JobActionBar';
 import JobConfigViewer from '@/components/JobConfigViewer';
 import JobLossGraph from '@/components/JobLossGraph';
@@ -88,6 +88,7 @@ const pages: Page[] = [
 ];
 
 export default function JobPage({ params }: { params: Promise<{ jobID: string }> }) {
+  const router = useRouter();
   const usableParams = use(params);
   const jobID = usableParams.jobID;
   const { job, status, refreshJob } = useJob(jobID, 5000);
@@ -112,18 +113,19 @@ export default function JobPage({ params }: { params: Promise<{ jobID: string }>
 
   let title = `Job: ${job?.name || 'Loading...'}`;
   if (jobType === 'caption') {
-    title = `Captioning: ${job?.job_ref || 'Loading...'}`;
+    title = `Captioning: ${job?.job_ref || job?.name || 'Loading...'}`;
   }
   if (jobType === 'inference') {
     title = `Inference Engine: ${job?.name || 'Loading...'}`;
   }
+  if (status === 'success' && !job) title = 'Job not found';
 
   return (
     <>
       {/* Fixed top bar */}
       <TopBar>
         <div className="flex-shrink-0">
-          <Button className="text-gray-500 dark:text-gray-300 pl-0 pr-1 sm:px-3 mt-1" onClick={() => redirect('/jobs')}>
+          <Button className="text-gray-500 dark:text-gray-300 pl-0 pr-1 sm:px-3 mt-1" onClick={() => router.push('/jobs')}>
             <FaChevronLeft />
           </Button>
         </div>
@@ -137,7 +139,7 @@ export default function JobPage({ params }: { params: Promise<{ jobID: string }>
             onRefresh={refreshJob}
             hideView
             afterDelete={() => {
-              redirect('/jobs');
+              router.push('/jobs');
             }}
             autoStartQueue={true}
           />
@@ -145,7 +147,8 @@ export default function JobPage({ params }: { params: Promise<{ jobID: string }>
       </TopBar>
       <MainContent className={pages.find(page => page.value === pageKey)?.mainCss}>
         {status === 'loading' && job == null && <p>Loading...</p>}
-        {status === 'error' && job == null && <p>Error fetching job</p>}
+        {status === 'error' && job == null && <p>Error fetching job. <button onClick={refreshJob}>Retry</button></p>}
+        {status === 'success' && job == null && <p>This job is no longer in the queue.</p>}
         {job && (
           <>
             {pages.map(page => {

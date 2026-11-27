@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/server/prisma';
-import path from 'path';
 import fs from 'fs';
 import type { FileHandle } from 'fs/promises';
+import { jobArtifactPath } from '../../../../../../cron/ownership/jobArtifacts';
 import { getTrainingFolder } from '@/server/settings';
 
 // Bytes of buf[0..n) up to the end of the last complete character. Only a trailing sequence that is a valid UTF-8
@@ -44,8 +44,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
   }
 
   const trainingFolder = await getTrainingFolder();
-  const jobFolder = path.join(trainingFolder, job.name);
-  const logPath = path.join(jobFolder, 'log.txt');
+  const logPath = await jobArtifactPath(trainingFolder, job, 'log.txt');
 
   try {
     await fs.promises.access(logPath);

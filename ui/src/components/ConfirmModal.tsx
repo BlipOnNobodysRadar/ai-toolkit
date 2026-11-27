@@ -47,13 +47,11 @@ export default function ConfirmModal() {
   }, [confirm]);
 
   useEffect(() => {
-    if (!isOpen) {
-      // use timeout to allow the dialog to close before resetting the state
-      setTimeout(() => {
-        setConfirm(null);
-      }, 500);
-    }
-  }, [isOpen]);
+    if (isOpen || !confirm) return;
+    // Keep the closing dialog's text during its transition. Opening another dialog cancels this cleanup.
+    const timer = setTimeout(() => setConfirm(null), 500);
+    return () => clearTimeout(timer);
+  }, [isOpen, confirm]);
 
   const onCancel = () => {
     if (confirm?.onCancel) {

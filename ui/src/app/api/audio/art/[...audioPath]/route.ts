@@ -1,5 +1,7 @@
 /* eslint-disable */
 import { NextRequest, NextResponse } from 'next/server';
+import { historicalArtifactFolder, regularJobPath } from '../../../../../../cron/ownership/jobArtifacts';
+import prisma from '@/server/prisma';
 import fs from 'fs';
 import path from 'path';
 import { getDatasetsRoot, getTrainingFolder, getDataRoot } from '@/server/settings';
@@ -142,7 +144,8 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     // Substring `.includes('..')` false-positives on filenames containing `..` as text.
     const resolved = path.resolve(filepath);
     const isAllowed = allowedDirs.some(d => resolved === d || resolved.startsWith(d + path.sep));
-    if (!isAllowed) {
+    const historicalFolder = isAllowed ? null : await historicalArtifactFolder(prisma, trainingRoot, resolved);
+    if (!isAllowed && !historicalFolder) {
       return new NextResponse('Access denied', { status: 403 });
     }
 
@@ -154,8 +157,9 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     // pre-generated thumb (written by the sampler, or by a previous call here)
     // so the tags are read at most once per file
     const thumbPath = path.join(path.dirname(resolved), '.thumbs', path.basename(resolved) + '.jpg');
+    const thumbAllowed = !historicalFolder || await regularJobPath(historicalFolder, thumbPath);
     const thumbStat = await fs.promises.stat(thumbPath).catch(() => null);
-    if (thumbStat && thumbStat.isFile()) {
+    if (thumbAllowed && thumbStat?.isFile()) {
       const data = await fs.promises.readFile(thumbPath);
       return new NextResponse(data as any, {
         headers: {
@@ -188,7 +192,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
         return new NextResponse('No album art found', { status: 404 });
       }
 
-      if (art.mime === 'image/jpeg') {
+      if (thumbAllowed && art.mime === 'image/jpeg') {
         // cache as the file's thumb; best effort, the response does not depend on it
         try {
           await fs.promises.mkdir(path.dirname(thumbPath), { recursive: true });

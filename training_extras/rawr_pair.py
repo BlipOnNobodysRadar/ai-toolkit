@@ -60,6 +60,7 @@ def _pair_mode(trainer):
     from training_extras.rawr_stochastic import snr_capturable
     return not (trainer.network is None or trainer.is_fine_tuning
                 or trainer.train_config.merge_network_on_save
+                or _split_lora_layout(trainer)
                 or not snr_capturable(trainer)
                 # training_extras state (EDM2 etc.) travels in the pair as a third, hashed file (commit extras=).
                 or any(getattr(trainer, attr, None) is not None for attr in
@@ -71,28 +72,21 @@ def _split_lora_layout(trainer):
     return declared is not None and tuple(declared()) != ('',)
 
 
-def refuse_unsupported_writer(trainer):
-    """A pair slot is one model file; a model whose save_lora splits a LoRA (Wan 2.2 14B with split_multistage_loras)
-    writes other files, and commit then aborted the run at its first save (docs/STATE_MACHINES.md, OPUS-RAWR-01).
-    Called at startup and again by begin, before anything is written."""
-    if getattr(trainer, '_rawr_checkpoint_config', None) is None or not _pair_mode(trainer):
-        return
-    if _split_lora_layout(trainer):
-        raise ValueError('RAWR resume pairs need the LoRA in one file, but this model saves it split '
-                         '(_high_noise/_low_noise). Set network.split_multistage_loras: false, or use another '
-                         'learning-rate scheduler')
+def check_existing_pair(trainer):
+    """A run using ordinary checkpoint files must not leave a stale slot as its resume point."""
+    previous = _manifest(trainer.save_root)
+    if previous is not None and not _pair_mode(trainer):
+        raise ValueError('Cannot replace a committed RAWR pair with an unsupported save mode; use a new output folder')
+    return previous
 
 
 def begin(trainer):
     if getattr(trainer, '_rawr_checkpoint_config', None) is None:
         refuse_stale_manifest(trainer.save_root)
         return None
-    previous = _manifest(trainer.save_root)
+    previous = check_existing_pair(trainer)
     if not _pair_mode(trainer):
-        if previous is not None:
-            raise ValueError('Cannot replace a committed RAWR pair with an unsupported save mode; use a new output folder')
         return None
-    refuse_unsupported_writer(trainer)
     slot = 'b' if previous is not None and previous['slot'] == 'a' else 'a'
     model, optimizer = _paths(trainer.save_root, slot)
     os.makedirs(os.path.dirname(model), exist_ok=True)

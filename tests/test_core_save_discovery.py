@@ -250,23 +250,20 @@ def rawr_trainer(root, model):
                            embedding=None, adapter=None, decorator=None, ema=None, snr_gos=None)
 
 
-def test_rawr_refuses_a_split_lora_layout_before_writing(tmp_path):
+def test_rawr_uses_split_checkpoints_for_split_loras(tmp_path):
     t = rawr_trainer(tmp_path, wan())
-    with pytest.raises(ValueError, match='split_multistage_loras: false'):
-        rawr_pair.refuse_unsupported_writer(t)
-    with pytest.raises(ValueError, match='split_multistage_loras: false'):
-        rawr_pair.begin(t)
+    rawr_pair.check_existing_pair(t)
+    assert rawr_pair.begin(t) is None
     assert not os.path.exists(tmp_path / rawr_pair.DIRECTORY)
     # one-file layouts keep their pairs
-    rawr_pair.refuse_unsupported_writer(rawr_trainer(tmp_path, wan(split=False)))
-    assert rawr_pair.begin(rawr_trainer(tmp_path, SimpleNamespace()))['slot'] == 'a'
+    assert rawr_pair.begin(rawr_trainer(tmp_path, wan(split=False)))['slot'] == 'a'
 
 
 def test_a_split_layout_without_a_pair_mode_is_not_refused(tmp_path):
     # with EMA (or an embedding/adapter) RAWR takes the plain save path, which writes split files fine
     t = rawr_trainer(tmp_path, wan())
     t.ema = object()
-    rawr_pair.refuse_unsupported_writer(t)
+    rawr_pair.check_existing_pair(t)
     assert rawr_pair.begin(t) is None
 
 

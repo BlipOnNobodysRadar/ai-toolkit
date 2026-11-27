@@ -163,3 +163,134 @@ def test_trainer_without_a_run_id_is_unchanged(tmp_path, cls_path):
     assert row(path)[:2] == ('running', 'legacy') and not t.should_stop()
     set_stop(path)
     assert t.should_stop()
+
+
+@pytest.mark.parametrize('cls_path', WRITERS[:2])
+@pytest.mark.parametrize('completed,expected', [(None, '7'), (12, '12')])
+@pytest.mark.parametrize('error,status,info', [(KeyboardInterrupt(), 'stopped', 'Job stopped'),
+                                              (RuntimeError('interrupted'), 'error', 'interrupted')])
+def test_interruption_reports_completed_work_and_preserves_progress_before_resume(
+        tmp_path, cls_path, completed, expected, error, status, info):
+    path = db(tmp_path)
+    t = trainer(cls_path, path, 'run-b')
+    t.is_stopping = False
+    t.update_step()
+    t.last_save_step = 0
+    t.step_num = 0  # e.g. the model failed to load on a subsequent launch
+    if completed is not None:
+        t._checkpoint_completed_step = completed
+        t.step_num = completed - 1  # interrupted during validation/save, before end_step_hook
+    t.on_error(error)
+    assert row(path)[:3] == (status, info, expected)
+
+
+@pytest.mark.parametrize('cls_path', WRITERS[:2])
+def test_ui_trainers_observe_stop_before_first_training_step(tmp_path, monkeypatch, cls_path):
+    import importlib
+    import os
+    import signal
+    import threading
+
+    path = db(tmp_path, stop=1)
+    monkeypatch.setenv('AITK_JOB_ID', 'job')
+    monkeypatch.setenv('AITK_RUN_ID', 'run-b')
+    module_name, class_name = cls_path.rsplit('.', 1)
+    module = importlib.import_module(module_name)
+    cls = getattr(module, class_name)
+    def setup(self, process_id, job, config):
+        self.config = config
+        self.accelerator = SimpleNamespace(is_main_process=True)
+
+    monkeypatch.setattr(module.SDTrainer, '__init__', setup)
+    interrupt = threading.Event()
+
+    def observe(pid, sig):
+        assert pid == os.getpid() and sig == signal.SIGINT
+        interrupt.set()
+
+    if os.name == 'nt':
+        monkeypatch.setattr(signal, 'raise_signal', lambda sig: observe(os.getpid(), sig))
+    else:
+        monkeypatch.setattr(os, 'kill', observe)
+    monkeypatch.setattr(module.SDTrainer, 'run', lambda self: interrupt.wait(5))
+    instance = cls(0, None, {'sqlite_db_path': path})
+    try:
+        assert not interrupt.is_set()
+        assert instance.run()
+    finally:
+        instance.thread_pool.shutdown(wait=True)
+
+
+@pytest.mark.parametrize('selector', ['sd_trainer', 'textual_inversion_trainer', 'ui_trainer'])
+def test_ui_launch_uses_reporting_trainer_for_historical_selectors(monkeypatch, selector):
+    from extensions_built_in.sd_trainer import AI_TOOLKIT_EXTENSIONS
+    from extensions_built_in.sd_trainer.DiffusionTrainer import DiffusionTrainer
+    from extensions_built_in.sd_trainer.SDTrainer import SDTrainer
+    from extensions_built_in.sd_trainer.UITrainer import UITrainer
+    ext = next(ext for ext in AI_TOOLKIT_EXTENSIONS if ext.uid == selector)
+    monkeypatch.delenv('IS_AI_TOOLKIT_UI', raising=False)
+    monkeypatch.delenv('AITK_JOB_ID', raising=False)
+    assert ext.get_process() is (UITrainer if selector == 'ui_trainer' else SDTrainer)
+    monkeypatch.setenv('IS_AI_TOOLKIT_UI', '1')
+    monkeypatch.setenv('AITK_JOB_ID', 'job')
+    gui = ext.get_process()
+    assert gui is DiffusionTrainer
+    if selector != 'ui_trainer':
+        # A serial CPU checkpoint from the original SDTrainer can carry exact RNG/data state.
+        import torch
+        from test_rawr_review_fixes import snr_trainer
+        from training_extras.rawr_stochastic import StochasticResume
+        source = snr_trainer(False)
+        recorded = StochasticResume(source).state_dict()
+        assert recorded['supported']
+        wrapped = gui.__new__(gui)
+        wrapped.__dict__.update(vars(source))
+        wrapped.config = {'type': selector}
+        restored = StochasticResume(wrapped, recorded)
+        expected = torch.rand(3)
+        restored.restore_rng(recorded)
+        assert torch.equal(torch.rand(3), expected)
+
+
+def test_sequential_ui_job_tracks_each_process_and_reports_errors_to_the_failing_process(monkeypatch, tmp_path):
+    from jobs import BaseJob
+    from jobs.process.BaseProcess import BaseProcess
+    from toolkit.ui_job_status import UIJobStatus
+    import run
+
+    path = db(tmp_path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE Job ADD COLUMN total_steps INTEGER")
+        conn.execute("ALTER TABLE Job ADD COLUMN speed_string TEXT")
+    monkeypatch.setenv('IS_AI_TOOLKIT_UI', '1')
+    monkeypatch.setenv('AITK_JOB_ID', 'job')
+    monkeypatch.setenv('AITK_RUN_ID', 'run-b')
+    seen = []
+    errors = []
+
+    class Stage(BaseProcess):
+        def run(self):
+            with sqlite3.connect(path) as conn:
+                seen.append(conn.execute("SELECT status, step, total_steps, info FROM Job").fetchone())
+            if self.process_id == 0:
+                ui = UIJobStatus(path)
+                ui.update_key('step', 3)
+                ui.update_status(*self.ui_process_status('completed', 'Training completed'))
+                assert row(path)[:2] == ('running', 'Process 1/2 · Training completed')
+            else:
+                raise RuntimeError('second stage failed')
+
+        def on_error(self, error):
+            errors.append((self.process_id, str(error)))
+
+    config = {'name': 'sequence', 'process': [
+        {'type': 'first', 'train': {'steps': 3}, 'sqlite_db_path': path},
+        {'type': 'second', 'train': {'steps': 12}, 'sqlite_db_path': path},
+    ]}
+    job = BaseJob({'job': 'extension', 'config': config})
+    job.process = [Stage(index, job, proc) for index, proc in enumerate(config['process'])]
+    with pytest.raises(RuntimeError, match='second stage failed') as exc:
+        job.run_processes()
+    run.report_error(job, exc.value)
+    assert seen == [('running', '0', 3, 'Process 1/2 · first'), ('running', '0', 12, 'Process 2/2 · second')]
+    assert errors == [(1, 'second stage failed')]
