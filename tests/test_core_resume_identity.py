@@ -501,16 +501,17 @@ def with_free_parameters(t, first, second):
     return base._parameter_manifest(t, t.optimizer)
 
 
-def test_unnamed_parameters_are_refused_before_training(tmp_path):
+def test_unnamed_parameters_warn_by_default_and_refuse_when_strict(tmp_path, monkeypatch):
     t = trainer(tmp_path)
     manifest = with_free_parameters(t, torch.nn.Parameter(torch.zeros(3)), torch.nn.Parameter(torch.ones(3)))
+    with pytest.warns(UserWarning, match='2 trainable parameters .* belong to no module'):
+        checkpoint_identity.require_named(manifest)
+    monkeypatch.setenv('AITK_STRICT_INVARIANTS', '1')
     with pytest.raises(ValueError, match='2 trainable parameters .* belong to no module'):
-        checkpoint_identity.require_named(manifest)  # what _run_training calls right after building the optimizer
+        checkpoint_identity.require_named(manifest)
 
 
-def test_reordered_unnamed_parameters_are_refused_without_loading_moments(tmp_path):
-    # a positional record (a fixture namespace can still write one) passes every shape check after a reorder;
-    # certified restore must refuse it before load_state_dict
+def test_unnamed_parameters_resume_warns_by_default_and_refuses_when_strict(tmp_path, monkeypatch):
     x, y = torch.nn.Parameter(torch.zeros(3)), torch.nn.Parameter(torch.ones(3))
     a = trainer(tmp_path)
     with_free_parameters(a, x, y)
@@ -520,10 +521,15 @@ def test_reordered_unnamed_parameters_are_refused_without_loading_moments(tmp_pa
     record = torch.load(tmp_path / 'optimizer.pt', weights_only=True)[checkpoint_identity.KEY]
     assert [e[0] for e in record['parameters'][1]] == ['?1.0', '?1.1']
     b = trainer(tmp_path)
-    with_free_parameters(b, torch.nn.Parameter(torch.ones(3)), torch.nn.Parameter(torch.zeros(3)))  # swapped
+    with_free_parameters(b, torch.nn.Parameter(torch.ones(3)), torch.nn.Parameter(torch.zeros(3)))
+    monkeypatch.setenv('AITK_STRICT_INVARIANTS', '1')
     with pytest.raises(ValueError, match='records 2 parameters only by position'):
         resume(b)
     assert b.optimizer.state_dict()['state'] == {}
+    monkeypatch.delenv('AITK_STRICT_INVARIANTS')
+    with pytest.warns(UserWarning, match='only by position'):
+        resume(b)
+    assert b.optimizer.state_dict()['state'] != {}
 
 
 def test_named_producers_are_certified(tmp_path):

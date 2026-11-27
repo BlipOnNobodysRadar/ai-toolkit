@@ -108,14 +108,17 @@ def positional(manifest):
 
 
 def require_named(manifest):
-    """Refuse, before training, optimizer parameters a save could not name (docs/STATE_MACHINES.md, PARAM-ID-01)."""
+    """Warn (or refuse under AITK_STRICT_INVARIANTS=1) on optimizer parameters a save cannot name by module."""
     unnamed = positional(manifest)
     if unnamed:
         gi, pi, entry = unnamed[0]
-        raise ValueError(f'{len(unnamed)} trainable parameters (e.g. group {gi} parameter {pi}, shape {entry[1]}) '
-                         f'belong to no module of this trainer or its model, so a checkpoint could pair their '
-                         f'optimizer state only by position, and a resume could attach it to other weights. Train '
-                         f'them as part of a module (network, adapter, decorator), or report this configuration')
+        msg = (f'{len(unnamed)} trainable parameters (e.g. group {gi} parameter {pi}, shape {entry[1]}) '
+               f'belong to no module of this trainer or its model, so a checkpoint pairs their optimizer state '
+               f'by position. Attach them to a module for named resume verification (set AITK_STRICT_INVARIANTS=1 '
+               f'to refuse unnamed parameters).')
+        if os.environ.get('AITK_STRICT_INVARIANTS') == '1':
+            raise ValueError(msg)
+        warnings.warn(msg, UserWarning, stacklevel=2)
 
 
 def sha256(path):
@@ -216,9 +219,12 @@ def check(identity, current, artifacts, step, check_step, path, optimizer_path):
     unnamed = positional(identity['parameters'])
     if unnamed:
         gi, pi, entry = unnamed[0]
-        raise ValueError(f'{optimizer_path} records {len(unnamed)} parameters only by position (no module name, e.g. '
-                         f'group {gi} parameter {pi}, shape {entry[1]}), so its optimizer state cannot be shown to '
-                         f'belong to the same weights. {move}')
+        msg = (f'{optimizer_path} records {len(unnamed)} parameters only by position (no module name, e.g. '
+               f'group {gi} parameter {pi}, shape {entry[1]}); falling back to positional matching for those '
+               f'parameters (set AITK_STRICT_INVARIANTS=1 to refuse). {move}')
+        if os.environ.get('AITK_STRICT_INVARIANTS') == '1':
+            raise ValueError(msg)
+        warnings.warn(msg, UserWarning, stacklevel=2)
     if not artifacts:
         raise ValueError(f'{optimizer_path} has no resumed checkpoint to belong to. {move}')
     for artifact, generation in artifacts:

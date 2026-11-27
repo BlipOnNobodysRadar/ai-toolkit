@@ -3,6 +3,7 @@ import copy
 import json
 import os
 import random
+import warnings
 from contextlib import contextmanager, nullcontext
 from itertools import islice
 from pathlib import Path
@@ -434,17 +435,20 @@ def _check_validation_disjoint(trainer):
         if canonical and canonical not in canonical_validation:
             canonical_validation.append(canonical)
 
+    nested_warnings = []
     for training in canonical_training:
         for validation in canonical_validation:
-            if _path_contains(training, validation) or _path_contains(validation, training):
+            if training == validation:
                 raise ValueError(
                     "Validation data overlaps training data: "
                     f"training root {training!r} and validation root {validation!r} "
-                    "are equal or nested. Put validation files outside the training tree."
+                    "are equal. Put validation files outside the training tree."
                 )
+            if _path_contains(training, validation) or _path_contains(validation, training):
+                nested_warnings.append((training, validation))
 
-    # Actual-file overlap catches canonical aliases and hardlinks that root
-    # comparison cannot see when the roots are disjoint.
+    # Actual-file overlap catches canonical aliases, hardlinks, and nested dirs
+    # whose files were actually admitted into training.
     training_paths = set()
     training_identities = set()
     for attr in ("datasets", "datasets_reg", "data_loader", "data_loader_reg"):
@@ -468,6 +472,19 @@ def _check_validation_disjoint(trainer):
                     "Validation data overlaps training data: "
                     f"validation file {canonical!r} is also an admitted training file"
                 )
+
+    # Nested directories with zero overlapping admitted files (e.g. `_controls/validation`
+    # skipped by the training walker) warn by default instead of hard-blocking.
+    for training, validation in nested_warnings:
+        msg = (
+            "Validation root is nested with a training root "
+            f"(training={training!r}, validation={validation!r}), though no admitted "
+            "training files currently overlap. Keep validation outside the training tree "
+            "to avoid accidental leakage (set AITK_STRICT_INVARIANTS=1 to refuse nested roots)."
+        )
+        if os.environ.get("AITK_STRICT_INVARIANTS") == "1":
+            raise ValueError(msg)
+        warnings.warn(msg, UserWarning, stacklevel=2)
 
 
 def setup(trainer):

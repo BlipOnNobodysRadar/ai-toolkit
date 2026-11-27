@@ -281,14 +281,32 @@ export const sameRun = (job: Job, seen: RunSnapshot) =>
 
 // The ordinary action only changes the status. A confirmed recovery has already checked the observed
 // processes; recheck the run in the transaction so an old tab cannot release a subsequent launch.
-export const markStopped = (db: Db, jobId: string, seen?: RunSnapshot): Promise<Outcome> =>
+// An explicit ?force=1 override can also force-clear stale ownership without rebooting.
+export const markStopped = (db: Db, jobId: string, seen?: RunSnapshot, opts: { force?: boolean } = {}): Promise<Outcome> =>
   routeTx(db, async tx => {
     const job = await tx.job.findUnique({ where: { id: jobId } });
     if (!job) return { status: 404, body: { error: 'Job not found' } };
     if (DELETING.includes(job.status)) return conflict('This job is being deleted.');
     const own = await ownershipOf(tx, job);
     if (seen && !sameRun(job, seen)) return conflict('The job changed. Refresh and try again.');
-    if (own.held && !seen) return conflict(`Not marked as stopped: ${own.message}`, { ownership: own.kind });
+    if (own.held && !seen) {
+      if (!opts.force) {
+        return conflict(`Not marked as stopped: ${own.message}`, { ownership: own.kind });
+      }
+      await tx.runClaim.deleteMany({ where: { job_id: jobId, kind: 'run' } });
+      await tx.job.updateMany({
+        where: { id: jobId },
+        data: {
+          stop: true,
+          status: 'stopped',
+          info: 'Job stopped (force-cleared)',
+          pid: null,
+          launch_phase: job.run_id ? 'exited' : job.launch_phase,
+          ownership_note: 'Ownership force-cleared by user override (?force=1).',
+        },
+      });
+      return { status: 200, body: await tx.job.findUnique({ where: { id: jobId } }) };
+    }
     if (seen) await tx.runClaim.deleteMany({ where: { job_id: jobId, kind: 'run' } });
     const updated = await tx.job.updateMany({
       where: { id: jobId, run_id: job.run_id, status: job.status },

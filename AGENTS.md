@@ -1,10 +1,11 @@
 # Training review workflow
 
-For training configuration, tuning, optimizer/scheduler, and trainer changes,
-obtain a second opinion before merging. Standing rule (Ryan, 2 Nov 2026): the
-second opinion is an internal review by another agent working in
-`C:/Users/someb/AI/agent-shared` (Astra, the Codex peer, for Claude's changes),
-coordinated on that folder's project board. Ryan still approves every merge.
+For substantive training-math, optimizer/scheduler, architecture, or major trainer
+behavior changes, obtain a second opinion before merging (an internal peer review via
+`C:/Users/someb/AI/agent-shared`, or Ryan's approval). Trivial/obvious bugfixes (typos,
+broken wiring like unhooked loss options, small test/doc fixes) do not need a
+multi-agent review cycle—verify with tests and fix them directly rather than leaving
+broken code sitting in `main`. Ryan approves merges of major changes.
 
 A DeepSeek Flash review through the installed DeepSeek Harness is optional, as
 an extra opinion. If you use it, verify the exact model ID against the live

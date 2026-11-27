@@ -9,7 +9,9 @@ import { checkStopped, isRunSnapshot } from '../../../../../../cron/ownership/re
 // The existing GET action applies to unreserved jobs.
 export async function GET(request: NextRequest, { params }: { params: Promise<{ jobID: string }> }) {
   const { jobID } = await params;
-  const out = await markStopped(prisma, jobID);
+  const rawForce = request?.nextUrl?.searchParams?.get('force') ?? null;
+  const force = rawForce === '1' || rawForce === 'true';
+  const out = await markStopped(prisma, jobID, undefined, { force });
   return NextResponse.json(out.body, { status: out.status });
 }
 

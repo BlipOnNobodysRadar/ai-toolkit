@@ -98,7 +98,7 @@ class MossImagePipeline:
         uncond_skip_layers: Sequence[int] = DEFAULT_UNCOND_SKIP_LAYERS,
         ref_latents: Optional[List[List[torch.Tensor]]] = None,
         isolate_refs: bool = False,
-        batched_cfg: bool = False,
+        batched_cfg: bool = True,
         sigmas: Optional[List[float]] = None,
         **kwargs,
     ):

@@ -9,6 +9,8 @@ import { forceStop } from '../../../../../../cron/ownership/forceStop';
 // identity. Old launchers identify the trainer and its workers through the job ID in their process environment.
 export async function GET(request: NextRequest, { params }: { params: Promise<{ jobID: string }> }) {
   const { jobID } = await params;
-  const out = await forceStop(prisma, makeProcCtl(resolvePythonPath(), TOOLKIT_ROOT), jobID);
+  const rawForce = request?.nextUrl?.searchParams?.get('force') ?? null;
+  const force = rawForce === '1' || rawForce === 'true';
+  const out = await forceStop(prisma, makeProcCtl(resolvePythonPath(), TOOLKIT_ROOT), jobID, 5000, { force });
   return NextResponse.json(out.body, { status: out.status });
 }

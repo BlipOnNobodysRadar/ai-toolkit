@@ -298,6 +298,24 @@ test('actual rendered fields cover the fork parity matrix and show existing YAML
   assert.match(html, /data-field="Respect alpha\/rank"[^>]*data-checked="true"/);
   assert.match(html, /data-field="Batched CFG previews"[^>]*data-checked="true"/);
   assert.match(html, /data-field="Validation max batches" data-value="7"/);
+
+  // Speedup flags default ON when omitted from saved YAML, and respect explicit false opt-out
+  const defaultsCfg = makeConfig();
+  delete defaultsCfg.config.process[0].train.allow_tf32;
+  delete defaultsCfg.config.process[0].model.model_kwargs.batched_cfg;
+  delete defaultsCfg.config.process[0].model.model_kwargs.fused_pointwise;
+  const defaultHtml = render(defaultsCfg);
+  assert.match(defaultHtml, /data-field="Allow TF32"[^>]*data-checked="true"/);
+  assert.match(defaultHtml, /data-field="Batched CFG previews"[^>]*data-checked="true"/);
+  assert.match(defaultHtml, /data-field="Fused pointwise"[^>]*data-checked="true"/);
+
+  defaultsCfg.config.process[0].train.allow_tf32 = false;
+  defaultsCfg.config.process[0].model.model_kwargs.batched_cfg = false;
+  defaultsCfg.config.process[0].model.model_kwargs.fused_pointwise = false;
+  const optOutHtml = render(defaultsCfg);
+  assert.match(optOutHtml, /data-field="Allow TF32"[^>]*data-checked="false"/);
+  assert.match(optOutHtml, /data-field="Batched CFG previews"[^>]*data-checked="false"/);
+  assert.match(optOutHtml, /data-field="Fused pointwise"[^>]*data-checked="false"/);
 });
 
 test('model-specific fields are gated by arch and LTX2 isolation is exposed', () => {

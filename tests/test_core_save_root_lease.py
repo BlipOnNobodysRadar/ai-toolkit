@@ -176,7 +176,12 @@ def test_the_lock_lives_outside_the_root_and_survives_its_deletion(tmp_path):
             save_root_lease.acquire(str(root), me, me)
     finally:
         stop(child)
-    assert os.path.exists(lock)  # never unlinked
+    # After a crash/kill the OS drops the lock; a subsequent clean acquire + release unlinks the lock and empty dir
+    me = object()
+    lease = save_root_lease.acquire(str(root), me, me)
+    save_root_lease.release(lease, me)
+    assert not os.path.exists(lock)
+    assert not os.path.exists(os.path.dirname(lock))
 
 
 def test_the_lock_path_matches_the_ui_formula(tmp_path):
@@ -278,13 +283,21 @@ def test_sd_trainer_run_releases_on_failure(tmp_path):
     assert save_root_lease.held_roots() == []
 
 
-def test_distributed_launches_are_refused_before_the_lease(tmp_path, monkeypatch):
+def test_distributed_launches_warn_by_default_and_refuse_when_strict(tmp_path, monkeypatch):
     import toolkit.accelerator
-    monkeypatch.setattr(toolkit.accelerator, 'get_accelerator', lambda: SimpleNamespace(num_processes=2))
+    monkeypatch.setattr(toolkit.accelerator, 'get_accelerator',
+                        lambda: SimpleNamespace(num_processes=2, is_main_process=False))
     job = train_job(tmp_path, [{'type': 'tiny', 'name': 'a'}])
-    with pytest.raises(ValueError, match='2 processes'):
+    with pytest.warns(UserWarning, match='2 processes'):
         job.load_processes({'tiny': process_class()})
-    assert not (tmp_path / 'a').exists() and save_root_lease.held_roots() == []
+    assert save_root_lease.held_roots() == []  # non-main rank does not deadlock on the lease
+    job.cleanup()
+
+    monkeypatch.setenv('AITK_STRICT_INVARIANTS', '1')
+    job2 = train_job(tmp_path, [{'type': 'tiny', 'name': 'b'}])
+    with pytest.raises(ValueError, match='2 processes'):
+        job2.load_processes({'tiny': process_class()})
+    assert not (tmp_path / 'b').exists() and save_root_lease.held_roots() == []
 
 
 def test_run_py_releases_and_reports_safely_across_configs(tmp_path, monkeypatch, capsys):

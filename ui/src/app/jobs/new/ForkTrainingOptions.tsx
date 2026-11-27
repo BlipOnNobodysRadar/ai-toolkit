@@ -311,7 +311,7 @@ export default function ForkTrainingOptions({
         <div className="pt-1">
           <Checkbox
             label="Allow TF32"
-            checked={train.allow_tf32 === true}
+            checked={train.allow_tf32 !== false}
             onChange={value => write(FORK_CONTROL_PATHS.train.allowTf32, value)}
           />
           <Checkbox
@@ -503,7 +503,7 @@ export default function ForkTrainingOptions({
             checked={model.activation_offloading === true}
             onChange={value => write(FORK_CONTROL_PATHS.model.activationOffloading, value)}
           />
-          <p className="mt-1 text-xs text-gray-500">Eager-only, currently MiniMax-H3. Requires compile off.</p>
+          <p className="mt-1 text-xs text-gray-500">Eager-only, currently MiniMax-H3 (unbenchmarked on GPU). Requires compile off.</p>
         </div>
         {(isMossArch(arch) || arch.startsWith('minimax_h3') || isH3ImageArch(arch)) && (
           <NumberInput
@@ -519,7 +519,7 @@ export default function ForkTrainingOptions({
           <div className="pt-1">
             <Checkbox
               label="Batched CFG previews"
-              checked={modelKwargs.batched_cfg === true}
+              checked={modelKwargs.batched_cfg !== false}
               onChange={value => write(FORK_CONTROL_PATHS.model.batchedCfg, value)}
             />
             <Checkbox
@@ -531,7 +531,7 @@ export default function ForkTrainingOptions({
             <Checkbox
               className="pt-2"
               label="Fused pointwise"
-              checked={modelKwargs.fused_pointwise === true}
+              checked={modelKwargs.fused_pointwise !== false}
               onChange={value => write(FORK_CONTROL_PATHS.model.fusedPointwise, value)}
             />
           </div>

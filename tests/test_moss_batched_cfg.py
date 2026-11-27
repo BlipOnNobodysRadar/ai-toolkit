@@ -102,16 +102,20 @@ def test_pipeline_batched_cfg_matches_two_call_path(cond_len, uncond_len, sigmas
     torch.testing.assert_close(one, two, atol=1e-5, rtol=1e-5)
 
 
-def test_batched_cfg_is_off_by_default():
-    # DeepSeek review C3: previews keep the two-call path (and its memory) unless model_kwargs.batched_cfg opts in
+def test_batched_cfg_is_on_by_default_and_can_opt_out():
     import inspect
     from extensions_built_in.diffusion_models.moss_image import moss_image
-    assert inspect.signature(MossImagePipeline.__call__).parameters["batched_cfg"].default is False
-    assert 'kw.get("batched_cfg", False)' in inspect.getsource(moss_image.MossImageModel.__init__)
+    assert inspect.signature(MossImagePipeline.__call__).parameters["batched_cfg"].default is True
+    assert 'kw.get("batched_cfg", True)' in inspect.getsource(moss_image.MossImageModel.__init__)
     m = _model()
     cond = types.SimpleNamespace(text_embeds=[torch.randn(5, 32)])
     uncond = types.SimpleNamespace(text_embeds=[torch.randn(3, 32)])
     model = _StubModel(m)
     MossImagePipeline(model)(cond, uncond, height=96, width=96, num_inference_steps=3,
                              latents=torch.randn(1, 8, 6, 6), uncond_skip_layers=(SKIP,))
-    assert model.calls == 6  # cond + uncond per step
+    assert model.calls == 3  # batched cond+uncond per step by default
+    model_opt_out = _StubModel(m)
+    MossImagePipeline(model_opt_out)(cond, uncond, height=96, width=96, num_inference_steps=3,
+                                     latents=torch.randn(1, 8, 6, 6), uncond_skip_layers=(SKIP,),
+                                     batched_cfg=False)
+    assert model_opt_out.calls == 6  # explicit opt-out restores two-call path

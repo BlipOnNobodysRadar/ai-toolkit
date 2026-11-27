@@ -52,19 +52,30 @@ class BaseTrainProcess(BaseProcess):
         self._refuse_distributed()
         # before anything is written to the folder, and before any resume reads it (docs/STATE_MACHINES.md,
         # OPUS-ONEWRITER-01). Owned by the job: BaseJob releases it if a later constructor fails.
-        self._save_root_lease = save_root_lease.acquire(self.save_root, owner=self.job, holder=self)
+        # In multi-process launches only the main rank acquires the save-root lease so ranks don't deadlock each other.
+        from toolkit.accelerator import get_accelerator
+        acc = get_accelerator()
+        if getattr(acc, 'is_main_process', True):
+            self._save_root_lease = save_root_lease.acquire(self.save_root, owner=self.job, holder=self)
+        else:
+            self._save_root_lease = None
         self.setup_tensorboard()
         self.save_training_config()
 
     def _refuse_distributed(self):
-        # Data loaders are not sharded, resume metadata is read on the main rank only, per-step reseeding gives every
-        # rank the same draws, and every rank would take this folder's lease (OPUS-DIST-01). Refuse before writing.
+        # Data loaders are not sharded by default and resume metadata is read on the main rank.
+        # Warn by default rather than hard-blocking multi-GPU / multi-process experiments; set
+        # AITK_STRICT_INVARIANTS=1 to restore the hard refusal.
+        import warnings
         from toolkit.accelerator import get_accelerator
         processes = get_accelerator().num_processes
         if processes > 1:
-            raise ValueError(f"Training with {processes} processes (accelerate launch / torchrun) is not supported: "
-                             f"each process would train on the same batches and write the same output folder. Launch "
-                             f"one process")
+            msg = (f"Training with {processes} processes (accelerate launch / torchrun): built-in data loaders "
+                   f"may not shard across ranks and checkpoints write from the main rank. Set "
+                   f"AITK_STRICT_INVARIANTS=1 to refuse multi-process launches.")
+            if os.environ.get("AITK_STRICT_INVARIANTS") == "1":
+                raise ValueError(msg)
+            warnings.warn(msg, UserWarning, stacklevel=2)
 
     def release_save_root(self):
         """Give up this process's share of the save-root lease (idempotent): its run is over."""

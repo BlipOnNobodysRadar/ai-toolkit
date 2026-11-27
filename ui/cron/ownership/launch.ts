@@ -179,7 +179,9 @@ export const launchRun = async (ctx: LaunchContext, job: AdmittedJob): Promise<L
     const resuming = job.job_type === 'train' && job.step > 0;
     checkResumeFolder(folder, job, job.previousRunId);
     const jobConfig = bindLaunchConfig(job.job_config, job.name, folder);
-    for (const proc of jobConfig.config.process) proc.sqlite_db_path = ctx.sqliteDbPath;
+    for (const proc of jobConfig.config.process) {
+      if (proc && typeof proc === 'object') proc.sqlite_db_path = ctx.sqliteDbPath;
+    }
     // CLI trainers have no UI claim. Respect their lease during launch preparation too, before rotating their log
     // or replacing a config. Release before spawning: the Python constructor acquires its lifetime lease itself.
     // If another trainer wins that handoff, Python refuses before training/config writes.
@@ -195,10 +197,7 @@ export const launchRun = async (ctx: LaunchContext, job: AdmittedJob): Promise<L
     if (!prepared) return { result: 'cancelled' };
     if (!fs.existsSync(ctx.runPy)) throw new PreSpawnError('run.py not found');
     const platform = ctx.platform ?? process.platform;
-    if (!SUPPORTED_PLATFORMS.includes(platform)) {
-      // no process boundary is implemented there, so a launched run could never be proven finished
-      throw new PreSpawnError(`launching jobs is not supported on ${platform} in this version: no process ownership boundary is implemented for it`);
-    }
+    const useDirectFallback = !SUPPORTED_PLATFORMS.includes(platform);
 
     if (!(await markSpawnRequested(db, job.id, runId))) {
       // a stop arrived before anything was spawned, or the run is no longer this one: nothing was started
@@ -225,6 +224,37 @@ export const launchRun = async (ctx: LaunchContext, job: AdmittedJob): Promise<L
       IS_AI_TOOLKIT_UI: '1',
       PYTHONUNBUFFERED: '1', // write Python output immediately so it is not lost on a crash
     };
+    if (useDirectFallback) {
+      const warnMsg = `[launch] Platform "${platform}" has no job-object/subreaper helper; spawning directly without an OS process-tree boundary.`;
+      console.warn(warnMsg);
+      if (logFd !== null) appendLog(files.log, `${warnMsg}\n`);
+      const child = spawn(ctx.jobPython, [ctx.runPy, files.config], {
+        env,
+        cwd: ctx.toolkitRoot,
+        detached: true,
+        windowsHide: true,
+        stdio: ['ignore', logFd, logFd],
+      });
+      const started = await new Promise<{ pid?: number; error?: Error }>(resolve => {
+        child.once('error', error => resolve({ error }));
+        child.once('spawn', () => resolve({ pid: child.pid }));
+      });
+      if (started.error || started.pid === undefined) {
+        const info = `Error launching job: ${started.error?.message ?? 'direct spawn failed'}`;
+        if (logFd !== null) appendLog(files.log, `${info}\n`);
+        await releaseRun(db, job.id, runId, { phase: 'spawn_requested' }, { kind: 'not_spawned', info });
+        return { result: 'not_spawned', info };
+      }
+      child.unref();
+      const identity = `${started.pid}@${Date.now()}`;
+      await attachRun(db, job.id, runId, { identity, supervisor: undefined, boundary: 'direct', boot_id: undefined });
+      try {
+        fs.writeFileSync(path.join(folder, 'pid.txt'), String(started.pid), { flag: 'w' });
+      } catch (e) {
+        console.error('Error writing pid file:', e);
+      }
+      return { result: 'attached', identity };
+    }
     const args = ['-I', '-S', ctx.helperPath, 'launch', '--run-id', runId, '--run-dir', folder, '--cwd', ctx.toolkitRoot, '--', ctx.jobPython, ctx.runPy, files.config];
     const relay = spawn(ctx.helperPython, args, { env, cwd: ctx.toolkitRoot, windowsHide: true, stdio: ['ignore', logFd, logFd] });
     const ended = new Promise<{ code: number | null; spawnError?: Error }>(resolve => {

@@ -37,20 +37,32 @@ def test_file_identity_is_dev_inode_only_and_matches_hardlinks(tmp_path):
     assert len(identity) == 2 and identity[1] != 0
 
 
-def test_setup_refuses_equal_and_nested_roots(tmp_path):
+def test_setup_refuses_equal_and_warns_on_disjoint_nested_roots(tmp_path, monkeypatch):
     root = tmp_path / "data"
     nested = root / "validation"
     nested.mkdir(parents=True)
     train_file = root / "train.png"
     train_file.write_bytes(b"train")
-    (nested / "val.png").write_bytes(b"val")
+    val_file = nested / "val.png"
+    val_file.write_bytes(b"val")
 
     equal = _trainer(root, root, [train_file])
-    with pytest.raises(ValueError, match="equal or nested"):
+    with pytest.raises(ValueError, match="equal"):
         tv.setup(equal)
 
+    # Disjoint files inside a nested validation folder warn by default instead of hard-blocking
     nested_trainer = _trainer(root, nested, [train_file])
-    with pytest.raises(ValueError, match="equal or nested"):
+    with pytest.warns(UserWarning, match="nested"):
+        tv._check_validation_disjoint(nested_trainer)
+
+    # Actual overlap inside a nested folder is still hard-refused
+    overlapping_nested = _trainer(root, nested, [train_file, val_file])
+    with pytest.raises(ValueError, match="also an admitted training file"):
+        tv._check_validation_disjoint(overlapping_nested)
+
+    # Strict mode still refuses any nested root
+    monkeypatch.setenv("AITK_STRICT_INVARIANTS", "1")
+    with pytest.raises(ValueError, match="nested"):
         tv.setup(nested_trainer)
 
 
@@ -104,18 +116,21 @@ def test_directory_junction_alias_is_detected_as_canonical_overlap(tmp_path):
     )
     if result.returncode != 0:
         pytest.skip(f"directory junction creation unavailable: {result.stdout} {result.stderr}")
-    with pytest.raises(ValueError, match="equal or nested"):
+    with pytest.raises(ValueError, match="equal"):
         tv._check_validation_disjoint(_trainer(train_root, val_alias, [train_file]))
 
 
-def test_nested_controls_or_hidden_validation_root_is_still_refused(tmp_path):
+def test_nested_controls_warns_when_disjoint_and_refuses_when_strict(tmp_path, monkeypatch):
     train_root = tmp_path / "data"
     val_root = train_root / "_controls" / "validation"
     val_root.mkdir(parents=True)
     train_file = train_root / "train.png"
     train_file.write_bytes(b"train")
     (val_root / "val.png").write_bytes(b"val")
-    with pytest.raises(ValueError, match="equal or nested"):
+    with pytest.warns(UserWarning, match="nested"):
+        tv._check_validation_disjoint(_trainer(train_root, val_root, [train_file]))
+    monkeypatch.setenv("AITK_STRICT_INVARIANTS", "1")
+    with pytest.raises(ValueError, match="nested"):
         tv._check_validation_disjoint(_trainer(train_root, val_root, [train_file]))
 
 

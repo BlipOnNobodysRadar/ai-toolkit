@@ -289,7 +289,9 @@ def test_set_fused_pointwise_reaches_every_block_and_norm():
 
 def test_model_kwarg_wiring():
     from extensions_built_in.diffusion_models.moss_image import moss_image
-    assert 'kw.get("fused_pointwise", False)' in inspect.getsource(moss_image.MossImageModel.__init__)
+    src = inspect.getsource(moss_image.MossImageModel.__init__)
+    assert '"fused_pointwise" in kw' in src
+    assert 'find_spec("triton")' in src
     assert "transformer.set_fused_pointwise(self.fused_pointwise)" in inspect.getsource(
         moss_image.MossImageModel.load_model)
 

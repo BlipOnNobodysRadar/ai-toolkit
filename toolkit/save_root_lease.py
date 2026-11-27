@@ -113,6 +113,16 @@ def release(lease, holder):
             lease.connection.execute('ROLLBACK')
         finally:
             lease.connection.close()
+        # Best-effort cleanup of empty lock files/.aitk_locks directory once released.
+        # On Windows, if another process opened the file concurrently, unlink raises OSError and is safely skipped.
+        try:
+            os.unlink(lease.path)
+        except OSError:
+            pass
+        try:
+            os.rmdir(os.path.dirname(lease.path))
+        except OSError:
+            pass
 
 
 def release_owner(owner):
