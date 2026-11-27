@@ -120,22 +120,23 @@ def _write_same_length_restore_mtime(path, data):
 
 # ---------------------------------------------------------------- latent/text source and policy keys
 
-def test_latent_source_rewrite_same_length_and_restored_mtime_changes_new_preparation_key(tmp_path):
+def test_latent_key_does_not_hash_source_files_or_bloat_on_dataset_resolution_change(tmp_path, monkeypatch):
     source = tmp_path / "source.bin"
     source.write_bytes(b"AAAA")
-    first = LatentItem(source, _cfg())
-    first_key = first.get_latent_path(recalculate=True)
-    first_sha = first.get_latent_info_dict()["source_content_sha256"]
-    st = source.stat()
 
-    _write_same_length_restore_mtime(source, b"BBBB")
-    assert source.stat().st_size == st.st_size
-    assert source.stat().st_mtime_ns == st.st_mtime_ns
+    def forbid_hash(path, *args, **kwargs):
+        raise AssertionError(f"sha256_file should not be called for {path}")
 
-    second = LatentItem(source, _cfg())
-    second_key = second.get_latent_path(recalculate=True)
-    assert first_key != second_key
-    assert first_sha != second.get_latent_info_dict()["source_content_sha256"]
+    monkeypatch.setattr(ci, "sha256_file", forbid_hash)
+
+    first = LatentItem(source, _cfg(resolution=[768, 1024], random_crop_percent=0))
+    second = LatentItem(source, _cfg(resolution=[1024], random_crop_percent=10))
+    info = first.get_latent_info_dict()
+    assert "source_content_sha256" not in info
+    assert "cache_key_schema_version" not in info
+    assert "preprocessing_identity" not in info
+    # Same crop/scale geometry must reuse the exact same cache path (zero disk bloat).
+    assert first.get_latent_path(recalculate=True) == second.get_latent_path(recalculate=True)
 
 
 def test_latent_key_keeps_model_space_override_and_encoder_digest(tmp_path):
@@ -151,104 +152,122 @@ def test_latent_key_keeps_model_space_override_and_encoder_digest(tmp_path):
     assert base.get_latent_path() != encoder.get_latent_path()
 
 
-def test_latent_source_hash_is_memoized_and_force_refreshes(tmp_path, monkeypatch):
-    source = tmp_path / "source.bin"
-    source.write_bytes(b"AAAA")
-    item = LatentItem(source, _cfg())
-    calls = []
-    real = dm.sha256_file
+def test_text_and_control_keys_never_hash_source_files(tmp_path, monkeypatch):
+    source = tmp_path / "source.png"
+    control = tmp_path / "ctrl.png"
+    Image.new("RGB", (4, 4), (1, 2, 3)).save(source)
+    Image.new("RGB", (4, 4), (4, 5, 6)).save(control)
 
-    def counted(path):
-        calls.append(str(path))
-        return real(path)
-    monkeypatch.setattr(dm, "sha256_file", counted)
-    item.get_latent_info_dict()
-    item.get_latent_info_dict()
-    assert len(calls) == 1
-    item.get_latent_info_dict(force_source_identity=True)
-    assert len(calls) == 2
+    def forbid_hash(path, *args, **kwargs):
+        raise AssertionError(f"sha256_file should not be called for {path}")
+
+    monkeypatch.setattr(ci, "sha256_file", forbid_hash)
+    cfg = _cfg(do_i2v=True, num_frames=5)
+    item = TextItem(source, cfg, encode_control_in_text_embeddings=True, control_path=[str(control)])
+    info = item.get_text_embedding_info_dict(force_source_identity=True)
+    assert "self_reference_content_sha256" not in info
+    assert "cache_key_schema_version" not in info
+    dopsd = item.get_text_embedding_info_dict(dopsd_self_ref=True, force_source_identity=True)
+    assert "self_reference_content_sha256" not in dopsd
 
 
-def test_vae_config_and_local_source_changes_change_latent_encoder_identity(tmp_path):
-    vae = tmp_path / "vae.safetensors"
-    vae.write_bytes(b"A" * 32)
+def test_latent_encoder_identity_tracks_vae_not_dit_checkpoint_or_quant(tmp_path):
+    vae_a = tmp_path / "vae_a.safetensors"
+    vae_b = tmp_path / "vae_b.safetensors"
+    vae_a.write_bytes(b"A" * 32)
+    vae_b.write_bytes(b"B" * 32)
     sd = SimpleNamespace(
-        model_config=SimpleNamespace(vae_path=str(vae), name_or_path=None, qtype=None,
-                                     vae_dtype="fp16", quantize=False),
+        model_config=SimpleNamespace(vae_path=str(vae_a), name_or_path="dit-v1", qtype="qfloat8",
+                                     vae_dtype="bf16", quantize=True),
         vae=SimpleNamespace(config={"latent_channels": 4}),
         cache_latents_as_uint8=False, load_rgba=False, is_audio_model=False, sample_rate=None,
     )
-    first = ci.cache_key_digest(ci.build_latent_encoder_identity(sd))
-    _write_same_length_restore_mtime(vae, b"B" * 32)
-    second = ci.cache_key_digest(ci.build_latent_encoder_identity(sd))
+    base = ci.cache_key_digest(ci.build_latent_encoder_identity(sd))
+    # Switching merged DiT checkpoint or DiT quantizer must NOT invalidate VAE latent cache.
+    sd.model_config.name_or_path = "dit-v2-merged"
+    sd.model_config.quantize = False
+    sd.model_config.qtype = None
+    assert ci.cache_key_digest(ci.build_latent_encoder_identity(sd)) == base
+
+    # Changing actual VAE path or VAE config DOES change latent encoder identity.
+    sd.model_config.vae_path = str(vae_b)
+    diff_path = ci.cache_key_digest(ci.build_latent_encoder_identity(sd))
     sd.vae = SimpleNamespace(config={"latent_channels": 8})
-    third = ci.cache_key_digest(ci.build_latent_encoder_identity(sd))
-    assert len({first, second, third}) == 3
+    diff_cfg = ci.cache_key_digest(ci.build_latent_encoder_identity(sd))
+    assert len({base, diff_path, diff_cfg}) == 3
 
 
-def test_te_config_and_local_source_changes_change_text_encoder_identity(tmp_path):
-    te = tmp_path / "text_encoder.safetensors"
-    te.write_bytes(b"A" * 32)
+def test_text_encoder_identity_tracks_te_config_and_precision_not_dit(tmp_path):
+    te_a = tmp_path / "te_a.safetensors"
+    te_b = tmp_path / "te_b.safetensors"
+    te_a.write_bytes(b"A" * 32)
+    te_b.write_bytes(b"B" * 32)
     sd = SimpleNamespace(
-        model_config=SimpleNamespace(te_name_or_path=str(te), name_or_path=None, qtype_te=None,
-                                     quantize_te=False, text_encoder_bits=16),
+        model_config=SimpleNamespace(te_name_or_path=str(te_a), name_or_path="dit-v1", qtype_te="qfloat8",
+                                     quantize_te=True, text_encoder_bits=8),
         text_encoder=[SimpleNamespace(config={"hidden_size": 1024})],
-        te_padding_side="right", te_torch_dtype=None,
+        te_padding_side="right", te_torch_dtype="bf16",
     )
-    first = ci.cache_key_digest(ci.build_text_encoder_identity(sd))
-    _write_same_length_restore_mtime(te, b"B" * 32)
-    second = ci.cache_key_digest(ci.build_text_encoder_identity(sd))
+    base = ci.cache_key_digest(ci.build_text_encoder_identity(sd))
+    # Switching DiT checkpoint reuses identical TE embeddings.
+    sd.model_config.name_or_path = "dit-v2-merged"
+    assert ci.cache_key_digest(ci.build_text_encoder_identity(sd)) == base
+
+    # Changing TE path, TE config, or TE quantizer isolates caches safely.
+    sd.model_config.te_name_or_path = str(te_b)
+    diff_path = ci.cache_key_digest(ci.build_text_encoder_identity(sd))
     sd.text_encoder[0].config = {"hidden_size": 2048}
-    third = ci.cache_key_digest(ci.build_text_encoder_identity(sd))
-    assert len({first, second, third}) == 3
+    diff_cfg = ci.cache_key_digest(ci.build_text_encoder_identity(sd))
+    sd.model_config.qtype_te = "int4"
+    diff_quant = ci.cache_key_digest(ci.build_text_encoder_identity(sd))
+    assert len({base, diff_path, diff_cfg, diff_quant}) == 4
 
 
-def test_large_model_manifest_is_complete_but_weights_are_metadata_only(tmp_path):
+def test_local_path_identity_is_lightweight_stat_metadata_without_walking_or_hashing(tmp_path, monkeypatch):
     root = tmp_path / "model"
     root.mkdir()
-    for i in range(260):
+    for i in range(10):
         (root / f"small_{i:03}.json").write_text("x", encoding="utf-8")
-    large = root / "weights.bin"
-    with large.open("wb") as f:
-        f.seek(2 * 1024 * 1024)
-        f.write(b"x")
+
+    def forbid_hash(path, *args, **kwargs):
+        raise AssertionError(f"sha256_file should not be called for {path}")
+
+    monkeypatch.setattr(ci, "sha256_file", forbid_hash)
     identity = ci.local_path_identity(root)
-    assert identity["file_count"] == 261
-    assert len(identity["files"]) == 261
-    assert identity["small_files_hashed"] == ci._MODEL_HASH_MAX_FILES
-    by_name = {entry["path"]: entry for entry in identity["files"]}
-    assert "sha256" not in by_name["weights.bin"]
-    assert by_name["weights.bin"]["size"] > ci._MODEL_HASH_MAX_BYTES
-    assert any("sha256" in entry for name, entry in by_name.items() if name.startswith("small_"))
+    assert identity["exists"] is True
+    assert identity["kind"] == "directory"
+    assert identity["name"] == "model"
+    assert "files" not in identity
+    assert "small_files_hashed" not in identity
+
+    single = root / "weights.safetensors"
+    single.write_bytes(b"first")
+    first_id = ci.local_path_identity(single)
+    assert first_id["kind"] == "file" and first_id["size"] == 5
+    single.write_bytes(b"second-bytes")
+    second_id = ci.local_path_identity(single)
+    assert second_id["size"] == 12 and second_id != first_id
 
 
-def test_control_reference_order_and_bytes_change_text_key_without_per_step_rehash(tmp_path, monkeypatch):
+def test_control_reference_order_changes_text_key_without_hashing(tmp_path, monkeypatch):
     a, b = tmp_path / "a.png", tmp_path / "b.png"
     Image.new("RGB", (4, 4), (1, 2, 3)).save(a)
     Image.new("RGB", (4, 4), (4, 5, 6)).save(b)
+
+    def forbid_hash(path, *args, **kwargs):
+        raise AssertionError(f"sha256_file should not be called for {path}")
+
+    monkeypatch.setattr(ci, "sha256_file", forbid_hash)
     cfg = _cfg()
     one = TextItem(tmp_path / "item.png", cfg, encode_control_in_text_embeddings=True,
                    control_path=[str(a), str(b)])
-    calls = []
-    real = ci.sha256_file
-
-    def counted(path):
-        calls.append(str(path))
-        return real(path)
-    monkeypatch.setattr(ci, "sha256_file", counted)
     first = ci.cache_key_digest(one.get_text_embedding_info_dict())
     second = ci.cache_key_digest(one.get_text_embedding_info_dict())
-    assert first == second and len(calls) == 2
+    assert first == second
 
     two = TextItem(tmp_path / "item.png", cfg, encode_control_in_text_embeddings=True,
                    control_path=[str(b), str(a)])
     assert ci.cache_key_digest(two.get_text_embedding_info_dict()) != first
-
-    st = b.stat()
-    b.write_bytes(a.read_bytes())
-    os.utime(b, ns=(st.st_atime_ns, st.st_mtime_ns))
-    refreshed = one.get_text_embedding_info_dict(force_source_identity=True)
-    assert ci.cache_key_digest(refreshed) != first
 
 
 def test_explicit_control_key_does_not_invent_dto_flip_or_crop(tmp_path):
@@ -326,16 +345,23 @@ def test_text_key_keeps_model_space_override_and_encoder_digest(tmp_path):
 
 # ---------------------------------------------------------------- old schema lazy miss / no deletion
 
-def test_old_unkeyed_latent_cache_is_a_lazy_miss_and_unrelated_legacy_files_survive(tmp_path):
+def test_legacy_unkeyed_latent_cache_is_reused_and_mismatched_key_misses(tmp_path):
     source = tmp_path / "image.png"
     Image.new("RGB", (16, 16), (10, 20, 30)).save(source)
     item = LatentItem(source, _cfg())
     expected_path = Path(item.get_latent_path(recalculate=True))
     expected_path.parent.mkdir(parents=True, exist_ok=True)
-    save_file({"latent": torch.zeros(1)}, str(expected_path))  # old schema: no metadata
+    save_file({"latent": torch.zeros(1)}, str(expected_path))  # legacy file without aitk_cache_key
     legacy_sibling = expected_path.parent / "old_unrelated.safetensors"
     legacy_sibling.write_bytes(b"legacy-do-not-delete")
     expected_digest = ci.cache_key_digest(item.get_latent_info_dict())
+
+    # Legacy cache files missing aitk_cache_key metadata are accepted instead of forcing rebuild.
+    ok, state = dm._read_latent_cache(str(expected_path), load=True, expected_cache_digest=expected_digest)
+    assert ok is True and state is not None and "latent" in state
+
+    # An explicit mismatched aitk_cache_key is still rejected and rebuilt cleanly.
+    save_file({"latent": torch.zeros(1)}, str(expected_path), metadata={"aitk_cache_key": "stale-digest"})
     assert dm._read_latent_cache(str(expected_path), load=True, expected_cache_digest=expected_digest) == (False, None)
     assert legacy_sibling.read_bytes() == b"legacy-do-not-delete"
 

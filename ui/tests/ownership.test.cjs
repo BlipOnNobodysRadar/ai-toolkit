@@ -514,7 +514,13 @@ test('U-R8 delete: claim-free -> deleting reserves the canonical folder; case al
   // Make these alternate spellings real aliases on filesystems that distinguish them.
   for (const spelling of ['myjob', 'MYJOB. ']) {
     const aliasPath = path.join(F.trainingRoot, spelling);
-    if (!fs.existsSync(aliasPath)) fs.symlinkSync(folder, aliasPath, 'dir');
+    if (!fs.existsSync(aliasPath)) {
+      try {
+        fs.symlinkSync(folder, aliasPath, process.platform === 'win32' ? 'junction' : 'dir');
+      } catch (err) {
+        if (err?.code !== 'EPERM' && err?.code !== 'EEXIST') throw err;
+      }
+    }
   }
   for (const name of ['MyJob', 'myjob', 'MYJOB. ']) {
     assert.equal((await jobsRoute.POST({ json: async () => ({ name, gpu_ids: '0', job_config: {} }) })).status, 409, name);

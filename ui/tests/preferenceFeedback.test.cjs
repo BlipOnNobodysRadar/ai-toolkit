@@ -345,7 +345,7 @@ test('existing bearer middleware protects preference reads and votes', async () 
   const request = (method, jobID, token) => ({
     method,
     headers: new Headers(token ? { Authorization: `Bearer ${token}` } : {}),
-    nextUrl: { pathname: `/api/jobs/${jobID}/preferences` },
+    nextUrl: { pathname: `/api/jobs/${jobID}/preferences`, searchParams: new URLSearchParams() },
   });
   const old = process.env.AI_TOOLKIT_AUTH;
   try {

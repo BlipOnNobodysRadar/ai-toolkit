@@ -322,7 +322,7 @@ test('existing bearer middleware protects the export route', async () => {
   const request = (token) => ({
     method: 'GET',
     headers: new Headers(token ? { Authorization: `Bearer ${token}` } : {}),
-    nextUrl: { pathname: `/api/jobs/${randomUUID()}/preferences/export` },
+    nextUrl: { pathname: `/api/jobs/${randomUUID()}/preferences/export`, searchParams: new URLSearchParams() },
   });
   const old = process.env.AI_TOOLKIT_AUTH;
   try {

@@ -2201,6 +2201,7 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
       "config.process[0].train.noise_scheduler": ["flowmatch", "flowmatch"],
       "config.process[0].sample.width": [1024, 1024],
       "config.process[0].sample.height": [1024, 1024],
+      "config.process[0].datasets[x].resolution": [[1024], [512, 768, 1024]],
       // vendor defaults: CFG 3 with block 22 skipped on the negative branch
       "config.process[0].sample.guidance_scale": [3, 4],
       "config.process[0].sample.sample_steps": [30, 25],
@@ -2245,6 +2246,7 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
       "config.process[0].train.noise_scheduler": ["flowmatch", "flowmatch"],
       "config.process[0].sample.width": [1024, 1024],
       "config.process[0].sample.height": [1024, 1024],
+      "config.process[0].datasets[x].resolution": [[1024], [512, 768, 1024]],
       // vendor defaults: CFG 3 with block 22 skipped on the negative branch
       "config.process[0].sample.guidance_scale": [3, 4],
       "config.process[0].sample.sample_steps": [30, 25],
@@ -2290,6 +2292,7 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
       "config.process[0].train.noise_scheduler": ["flowmatch", "flowmatch"],
       "config.process[0].sample.width": [1024, 1024],
       "config.process[0].sample.height": [1024, 1024],
+      "config.process[0].datasets[x].resolution": [[1024], [512, 768, 1024]],
       "config.process[0].sample.guidance_scale": [3, 4],
       "config.process[0].sample.sample_steps": [30, 25],
       "config.process[0].train.timestep_type": ["shift", "sigmoid"],
@@ -2344,6 +2347,7 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
       "config.process[0].train.noise_scheduler": ["flowmatch", "flowmatch"],
       "config.process[0].sample.width": [1024, 1024],
       "config.process[0].sample.height": [1024, 1024],
+      "config.process[0].datasets[x].resolution": [[1024], [512, 768, 1024]],
       "config.process[0].sample.guidance_scale": [3, 4],
       "config.process[0].sample.sample_steps": [30, 25],
       "config.process[0].train.timestep_type": ["shift", "sigmoid"],

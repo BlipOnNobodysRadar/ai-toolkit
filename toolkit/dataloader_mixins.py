@@ -23,10 +23,8 @@ from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection, Sigl
 from toolkit.audio.preserve_pitch import time_stretch_preserve_pitch
 from toolkit.basic import UnusableFileError, flush, value_map
 from toolkit.cache_identity import (
-    CACHE_KEY_SCHEMA_VERSION,
     cache_key_digest,
     ordered_reference_identity,
-    sha256_file,
 )
 from toolkit.buckets import get_bucket_for_image_size, get_resolution
 from toolkit.config_modules import ControlTypes
@@ -1966,7 +1964,8 @@ def _read_latent_cache(path, load, expected_cache_digest=None):
             keys = f.keys()
             metadata = f.metadata() or {}
             if expected_cache_digest is not None:
-                if metadata.get('aitk_cache_key') != expected_cache_digest:
+                recorded = metadata.get('aitk_cache_key')
+                if recorded is not None and recorded != expected_cache_digest:
                     return False, None
             complete = 'latent' in keys
         if load and complete:
@@ -2033,15 +2032,6 @@ class LatentCachingFileItemDTOMixin:
         # Built once per dataset from the effective VAE/encoding stack. The
         # model-specific latent_space_version above remains authoritative.
         self.latent_cache_encoder_identity = kwargs.get('latent_cache_encoder_identity', None)
-        self._latent_source_sha256 = None
-
-    def _get_latent_source_sha256(self: 'FileItemDTO', force=False):
-        # At cache admission recalculate=True refreshes this from the source
-        # bytes. Normal training-item reads use the memoized value and do not
-        # rehash media per step.
-        if force or self._latent_source_sha256 is None:
-            self._latent_source_sha256 = sha256_file(self.path)
-        return self._latent_source_sha256
 
     def get_latent_info_dict(self: 'FileItemDTO', force_source_identity=False):
         item = OrderedDict([
@@ -2054,30 +2044,12 @@ class LatentCachingFileItemDTOMixin:
             ("crop_height", self.crop_height),
             ("latent_space_version", self.latent_space_version),
             ("latent_version", self.latent_version),
-            ("cache_key_schema_version", CACHE_KEY_SCHEMA_VERSION),
-            ("source_content_sha256", self._get_latent_source_sha256(force=force_source_identity)),
         ])
         if self.latent_cache_encoder_identity is not None:
             item["latent_encoder_identity"] = self.latent_cache_encoder_identity
         dataset_config = getattr(self, "dataset_config", None)
-        if dataset_config is not None:
-            item["preprocessing_identity"] = {
-                "standardize_images": bool(getattr(dataset_config, "standardize_images", False)),
-                "buckets": bool(getattr(dataset_config, "buckets", False)),
-                "resolution": getattr(dataset_config, "resolution", None),
-                "scale": getattr(dataset_config, "scale", None),
-                "random_crop": bool(getattr(dataset_config, "random_crop", False)),
-                "random_crop_percent": getattr(dataset_config, "random_crop_percent", 0),
-                "square_crop": bool(getattr(dataset_config, "square_crop", False)),
-                "auto_frame_count": bool(getattr(dataset_config, "auto_frame_count", False)),
-                "trim_auto_frame_count_tail": bool(getattr(dataset_config, "trim_auto_frame_count_tail", False)),
-                "num_frames": getattr(dataset_config, "num_frames", None),
-                "fps": getattr(dataset_config, "fps", None),
-                "do_i2v": bool(getattr(dataset_config, "do_i2v", False)),
-                "do_audio": bool(getattr(dataset_config, "do_audio", False)),
-                "audio_normalize": bool(getattr(dataset_config, "audio_normalize", False)),
-                "audio_preserve_pitch": bool(getattr(dataset_config, "audio_preserve_pitch", False)),
-            }
+        if dataset_config is not None and getattr(dataset_config, "standardize_images", False):
+            item["standardize_images"] = True
         is_video = False
         # when adding items, do it after so we dont change old latents
         if self.flip_x:
@@ -2505,25 +2477,10 @@ class TextEmbeddingFileItemDTOMixin:
         # Built once per dataset from the effective TE/prompt stack. Model
         # overrides of text_embedding_space_version remain authoritative.
         self.text_encoder_cache_identity = kwargs.get('text_encoder_cache_identity', None)
-        self._text_source_sha256 = None
         self._reference_identity_cache = {}
 
-    def _get_text_source_sha256(self: 'FileItemDTO', force=False):
-        # Only embeddings that actually consume the item's own media carry this
-        # value. It is refreshed at cache admission (recalculate=True), not on
-        # every training step.
-        if force or self._text_source_sha256 is None:
-            self._text_source_sha256 = sha256_file(self.path)
-        return self._text_source_sha256
-
     def _get_ordered_reference_identity(self: 'FileItemDTO', kind, paths, force=False):
-        """Memoized, ordered content identity for control/reference files.
-
-        The identity hashes reference bytes at cache admission.  Building one
-        embedding path asks for it several times (normal/blank/DOP targets), so
-        the result is kept on the prepared item; a recalculate/admission call
-        with force=True refreshes it from disk.
-        """
+        """Memoized, ordered path identity for control/reference files (no hashing)."""
         if paths is None:
             return []
         if isinstance(paths, (str, os.PathLike)):
@@ -2549,31 +2506,23 @@ class TextEmbeddingFileItemDTOMixin:
         }
 
     def _get_self_reference_identity(self: 'FileItemDTO', purpose, force=False):
-        """Identity of the item media a conditioned text embedding consumes.
-
-        A D-OPSD image and an i2v first-frame embed are built from the prepared
-        bucketed pixels, so the key carries the actual scale/crop/flip policy.
-        A D-OPSD video is passed to the model by raw path and the model applies
-        its own video-reference presentation; no latent-loader pixel crop is
-        claimed in that case.
-        """
-        source_sha256 = self._get_text_source_sha256(force=force)
+        """Lightweight identity of the item media a conditioned text embedding consumes (no file hashing)."""
+        source_path = os.path.realpath(os.fspath(self.path))
         dataset_config = self.dataset_config
         if purpose == "dopsd" and self.is_video:
             return {
                 "mode": "raw_video_reference_path",
-                "source_content_sha256": source_sha256,
+                "source_path": source_path,
                 "reference_presentation": "model_video_ref_2fps",
                 "dataset_temporal_policy": self._temporal_policy_identity(dataset_config),
             }
         mode = "own_video_first_frame_pixels" if purpose == "first_frame" else "own_image_pixels"
         policy = {
             "mode": mode,
-            "source_content_sha256": source_sha256,
+            "source_path": source_path,
             "resize": {
                 "scale_to_width": getattr(self, "scale_to_width", None),
                 "scale_to_height": getattr(self, "scale_to_height", None),
-                "filter": "bicubic",
             },
             "crop": {
                 "crop_x": getattr(self, "crop_x", None),
@@ -2583,17 +2532,6 @@ class TextEmbeddingFileItemDTOMixin:
             },
             "flip_x": bool(getattr(self, "flip_x", False)),
             "flip_y": bool(getattr(self, "flip_y", False)),
-            "dataset_preprocessing": {
-                "buckets": bool(getattr(dataset_config, "buckets", False)),
-                "scale": getattr(dataset_config, "scale", None),
-                "resolution": getattr(dataset_config, "resolution", None),
-                "random_crop": bool(getattr(dataset_config, "random_crop", False)),
-                "random_crop_percent": getattr(dataset_config, "random_crop_percent", 0),
-                "square_crop": bool(getattr(dataset_config, "square_crop", False)),
-                "standardize_images": bool(getattr(dataset_config, "standardize_images", False)),
-            },
-            "augments": list(getattr(dataset_config, "augments", None) or []),
-            "dataloader_transform_class": type(getattr(self, "dataloader_transforms", None)).__name__,
         }
         if mode == "own_video_first_frame_pixels":
             policy["video_frame_policy"] = self._temporal_policy_identity(dataset_config)
@@ -2609,7 +2547,6 @@ class TextEmbeddingFileItemDTOMixin:
             ("caption", self.caption if caption_override is None else caption_override),
             ("text_embedding_space_version", self.text_embedding_space_version),
             ("text_embedding_version", self.text_embedding_version),
-            ("cache_key_schema_version", CACHE_KEY_SCHEMA_VERSION),
             ("te_padding_side", getattr(self, 'te_padding_side', 'right')),
             ("text_only", bool(text_only)),
             ("dopsd_self_ref", bool(dopsd_self_ref)),
@@ -2622,8 +2559,6 @@ class TextEmbeddingFileItemDTOMixin:
         if dopsd_self_ref:
             # teacher embeds carry the item's own media as the vision reference
             item["dopsd_self_ref"] = True
-            item["self_reference_content_sha256"] = self._get_text_source_sha256(
-                force=force_source_identity)
             item["self_reference_identity"] = self._get_self_reference_identity(
                 "dopsd", force=force_source_identity)
             return item
@@ -2631,11 +2566,7 @@ class TextEmbeddingFileItemDTOMixin:
         # out of their cache key
         if text_only:
             return item
-        # Ordered reference identities: reordering references or replacing the
-        # bytes at one path must produce a new key. Identity is content-based,
-        # not just a path label.  Explicit control images are opened raw
-        # (Image.open/exif_transpose), so this case does not invent DTO crop or
-        # flip flags the model does not consume.
+        # Ordered reference paths (no per-file content hashing).
         control_paths = getattr(self, 'control_path', None)
         if self.encode_control_in_text_embeddings and control_paths is not None:
             item["control_paths"] = self._get_ordered_reference_identity(
@@ -2656,8 +2587,6 @@ class TextEmbeddingFileItemDTOMixin:
             and self.is_video
         ):
             item["first_frame_in_te"] = True
-            item["self_reference_content_sha256"] = self._get_text_source_sha256(
-                force=force_source_identity)
             item["self_reference_identity"] = self._get_self_reference_identity(
                 "first_frame", force=force_source_identity)
         return item

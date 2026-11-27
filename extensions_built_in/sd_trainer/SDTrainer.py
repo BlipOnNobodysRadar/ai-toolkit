@@ -1089,7 +1089,17 @@ class SDTrainer(BaseSDTrainProcess):
                 # video B,C,T,H,W
                 mask_multiplier = mask_multiplier.unsqueeze(2)  # add time dimension back for video
                 mask_multiplier = mask_multiplier.repeat(1, 1, noise_pred.shape[2], 1, 1)
-            loss = loss * mask_multiplier
+            mm = mask_multiplier
+            if isinstance(mm, torch.Tensor) and loss.ndim == 4 and mm.ndim == 4:
+                # Spatial losses like Haar DWT wavelet_loss halve (H, W) and expand C -> 4*C;
+                # downsample mask with area averaging and collapse channels so it broadcasts cleanly.
+                if mm.shape[1] != 1 and mm.shape[1] != loss.shape[1]:
+                    mm = mm.mean(dim=1, keepdim=True)
+                if mm.shape[-2:] != loss.shape[-2:]:
+                    mm = torch.nn.functional.interpolate(
+                        mm.float(), size=loss.shape[-2:], mode='area'
+                    ).to(dtype=loss.dtype, device=loss.device)
+            loss = loss * mm
         except Exception as e:
             # todo handle mask with video models
             print("Could not apply mask multiplier to loss")
