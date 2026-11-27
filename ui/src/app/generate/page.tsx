@@ -240,7 +240,7 @@ function GeneratePageInner() {
     setStoppingJobId(id);
     setStoppingSince(Date.now());
     try {
-      await stopJob(id).catch(e => console.warn('graceful stop failed, will kill', e?.message || e));
+      await stopJob(id).catch(() => console.warn('Graceful stop failed, requesting force stop'));
       const deadline = Date.now() + 4000;
       let alive = true;
       while (Date.now() < deadline) {
@@ -540,8 +540,8 @@ function GeneratePageInner() {
                   setShowPreview(true);
                 }
               }
-            } catch (e) {
-              console.warn('latent preview failed', e);
+            } catch {
+              console.warn('Latent preview failed');
             }
             break;
           }

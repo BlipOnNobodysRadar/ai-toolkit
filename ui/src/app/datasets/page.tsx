@@ -60,11 +60,10 @@ export default function Datasets() {
         apiClient
           .post('/api/datasets/delete', { name: datasetName })
           .then(() => {
-            console.log('Dataset deleted:', datasetName);
             refreshDatasets();
           })
           .catch(error => {
-            console.error('Error deleting dataset:', error);
+            console.error('Error deleting dataset');
           });
       },
     });
@@ -73,13 +72,12 @@ export default function Datasets() {
   const handleCreateDataset = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      const data = await apiClient.post('/api/datasets/create', { name: newDatasetName }).then(res => res.data);
-      console.log('New dataset created:', data);
+      await apiClient.post('/api/datasets/create', { name: newDatasetName });
       refreshDatasets();
       setNewDatasetName('');
       setIsNewDatasetModalOpen(false);
     } catch (error) {
-      console.error('Error creating new dataset:', error);
+      console.error('Error creating new dataset');
     }
   };
 
@@ -97,14 +95,13 @@ export default function Datasets() {
         }
         try {
           const data = await apiClient.post('/api/datasets/create', { name }).then(res => res.data);
-          console.log('New dataset created:', data);
           if (data.name) {
             router.push(`/datasets/${data.name}`);
           } else {
             refreshDatasets();
           }
         } catch (error) {
-          console.error('Error creating new dataset:', error);
+          console.error('Error creating new dataset');
         }
       },
     });

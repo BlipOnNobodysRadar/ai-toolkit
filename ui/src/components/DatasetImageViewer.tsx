@@ -115,7 +115,7 @@ export default function DatasetImageViewer({
           onCaptionSaved?.(path, trimmed);
         })
         .catch(error => {
-          console.error('Error saving caption:', error);
+          console.error('Error saving caption');
         });
     },
     [onCaptionSaved, captionExt],
@@ -175,7 +175,7 @@ export default function DatasetImageViewer({
       })
       .catch(error => {
         if (controller.signal.aborted) return;
-        console.error('Error fetching caption:', error);
+        console.error('Error fetching caption');
         setIsCaptionLoaded(true);
       });
 
@@ -228,12 +228,11 @@ export default function DatasetImageViewer({
         apiClient
           .post('/api/img/delete', { imgPath })
           .then(() => {
-            console.log('Image deleted:', imgPath);
             onChange(null);
             if (refreshImages) refreshImages();
           })
           .catch(error => {
-            console.error('Error deleting image:', error);
+            console.error('Error deleting image');
           });
       },
     });

@@ -40,7 +40,7 @@ export default function useFilesList(jobID: string, reloadInterval: null | numbe
       })
       .catch(error => {
         if (!owner.accept(ticket)) return;
-        console.error('Error fetching files:', error);
+        console.error('Error fetching files');
         setStatus('error');
       });
   };

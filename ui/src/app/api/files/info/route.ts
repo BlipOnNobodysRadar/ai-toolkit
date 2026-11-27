@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { historicalArtifactFolder } from '../../../../../cron/ownership/jobArtifacts';
 import prisma from '@/server/prisma';
 import fs from 'fs';
+import { mediaPathWithinRoots } from '@/server/safePath';
 import path from 'path';
 import { getDatasetsRoot, getTrainingFolder } from '@/server/settings';
 
@@ -32,12 +33,9 @@ export async function POST(request: NextRequest) {
     const allowedDirs = [datasetRoot, trainingRoot];
 
     const resolvedFilePath = path.resolve(decodedFilePath);
-    const isAllowed = allowedDirs.some(
-      allowedDir => resolvedFilePath === allowedDir || resolvedFilePath.startsWith(allowedDir + path.sep),
-    );
+    const isAllowed = await mediaPathWithinRoots(allowedDirs, resolvedFilePath);
     const historicalFolder = isAllowed ? null : await historicalArtifactFolder(prisma, trainingRoot, resolvedFilePath);
     if (!isAllowed && !historicalFolder) {
-      console.warn(`Access denied: ${resolvedFilePath} not in ${allowedDirs.join(', ')}`);
       return new NextResponse('Access denied', { status: 403 });
     }
 

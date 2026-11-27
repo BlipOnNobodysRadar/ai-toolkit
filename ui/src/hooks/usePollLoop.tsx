@@ -36,7 +36,7 @@ export default function usePollLoop(
       try {
         await fnRef.current(isCurrent);
       } catch (error) {
-        console.error('Poll error:', error);
+        console.error('Poll error');
       }
       if (stopped || !intervalMs) return;
       timeout = setTimeout(tick, intervalMs);

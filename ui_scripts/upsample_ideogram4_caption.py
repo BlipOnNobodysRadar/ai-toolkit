@@ -183,8 +183,7 @@ def upsample_one(
 
     data = extract_json(output_text)
     if data is None:
-        log("Failed to parse JSON from model output. Raw output follows:")
-        log(output_text)
+        log("Caption generation returned invalid JSON.")
         return None
     return sanitize_caption(data)
 

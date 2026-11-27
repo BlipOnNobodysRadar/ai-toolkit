@@ -230,7 +230,8 @@ def ensure_ui_deps(env=None, dry_run=False):
     if dry_run:
         info("[dry-run] would run: npm install --no-save (in %s)" % UI_DIR)
         return False
-    env = env or npm_env()
+    env = (env or npm_env()).copy()
+    env.setdefault("CHECKPOINT_DISABLE", "1")
     npm = find_npm(env)
     if npm is None:
         warn("npm not found — skipping UI dependency install.")

@@ -116,6 +116,9 @@ test('launch binds a stale/mismatched training process to the exact claimed fold
 
   const files = launch.runFiles(runDir, job.run_id);
   assert.equal(fs.existsSync(files.config), true);
+  if (process.platform !== 'win32') {
+    for (const file of [files.config, files.log]) assert.equal(fs.statSync(file).mode & 0o077, 0);
+  }
   const launched = JSON.parse(fs.readFileSync(files.config, 'utf8'));
   assert.equal(launched.config.name, 'UI Job Name');
   assert.equal(launched.config.process[0].name, 'UI Job Name');

@@ -2,36 +2,12 @@ import { JobConfig } from '@/types';
 import { Job } from '@prisma/client';
 import { apiClient } from '@/utils/api';
 
-export const startJob = (jobID: string) => {
-  return new Promise<void>((resolve, reject) => {
-    apiClient
-      .get(`/api/jobs/${jobID}/start`)
-      .then(res => res.data)
-      .then(data => {
-        console.log('Job started:', data);
-        resolve();
-      })
-      .catch(error => {
-        console.error('Error starting job:', error);
-        reject(error);
-      });
-  });
+export const startJob = async (jobID: string): Promise<void> => {
+  await apiClient.get(`/api/jobs/${jobID}/start`);
 };
 
-export const stopJob = (jobID: string) => {
-  return new Promise<void>((resolve, reject) => {
-    apiClient
-      .get(`/api/jobs/${jobID}/stop`)
-      .then(res => res.data)
-      .then(data => {
-        console.log('Job stopped:', data);
-        resolve();
-      })
-      .catch(error => {
-        console.error('Error stopping job:', error);
-        reject(error);
-      });
-  });
+export const stopJob = async (jobID: string): Promise<void> => {
+  await apiClient.get(`/api/jobs/${jobID}/stop`);
 };
 
 const snapshot = ({ status, pid, run_id, launch_phase, name, run_dir }: Job) => ({ status, pid, run_id, launch_phase, name, run_dir });
@@ -42,52 +18,16 @@ export const deleteJob = async (jobID: string, job?: Job): Promise<{ keptOutput?
   return response.data;
 };
 
-export const saveJobNow = (jobID: string) => {
-  return new Promise<void>((resolve, reject) => {
-    apiClient
-      .get(`/api/jobs/${jobID}/save_now`)
-      .then(res => res.data)
-      .then(data => {
-        console.log('Job set to save on next step:', data);
-        resolve();
-      })
-      .catch(error => {
-        console.error('Error setting job to save on next step:', error);
-        reject(error);
-      });
-  });
+export const saveJobNow = async (jobID: string): Promise<void> => {
+  await apiClient.get(`/api/jobs/${jobID}/save_now`);
 };
 
-export const sampleJobNow = (jobID: string) => {
-  return new Promise<void>((resolve, reject) => {
-    apiClient
-      .get(`/api/jobs/${jobID}/sample_now`)
-      .then(res => res.data)
-      .then(data => {
-        console.log('Job set to sample on next step:', data);
-        resolve();
-      })
-      .catch(error => {
-        console.error('Error setting job to sample on next step:', error);
-        reject(error);
-      });
-  });
+export const sampleJobNow = async (jobID: string): Promise<void> => {
+  await apiClient.get(`/api/jobs/${jobID}/sample_now`);
 };
 
-export const markJobAsStopped = (jobID: string) => {
-  return new Promise<void>((resolve, reject) => {
-    apiClient
-      .get(`/api/jobs/${jobID}/mark_stopped`)
-      .then(res => res.data)
-      .then(data => {
-        console.log('Job marked as stopped:', data);
-        resolve();
-      })
-      .catch(error => {
-        console.error('Error marking job as stopped:', error);
-        reject(error);
-      });
-  });
+export const markJobAsStopped = async (jobID: string): Promise<void> => {
+  await apiClient.get(`/api/jobs/${jobID}/mark_stopped`);
 };
 
 export const confirmJobStopped = (job: Job) =>

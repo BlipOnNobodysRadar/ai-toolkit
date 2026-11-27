@@ -13,14 +13,13 @@ export default function useDatasetList() {
       .get('/api/datasets/list')
       .then(res => res.data)
       .then(data => {
-        console.log('Datasets:', data);
         // sort
         data.sort((a: string, b: string) => a.localeCompare(b));
         setDatasets(data);
         setStatus('success');
       })
       .catch(error => {
-        console.error('Error fetching datasets:', error);
+        console.error('Error fetching datasets');
         setStatus('error');
       });
   };

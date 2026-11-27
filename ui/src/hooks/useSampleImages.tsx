@@ -29,7 +29,7 @@ export default function useSampleImages(jobID: string, reloadInterval: null | nu
       })
       .catch(error => {
         if (!owner.accept(ticket)) return;
-        console.error('Error fetching sample images:', error);
+        console.error('Error fetching sample images');
         setStatus('error');
       });
   };

@@ -85,7 +85,7 @@ export const CaptionDatasetModal: React.FC = () => {
           newJobConfig.config.name = `${newJobConfig.config.name}_copy`;
           setJobConfig(newJobConfig);
         })
-        .catch(error => console.error('Error fetching caption job:', error))
+        .catch(error => console.error('Error fetching caption job'))
         .finally(() => setHasLoadedExistingJob(true));
     }
   }, [modalInfo?.cloneId]);
@@ -101,7 +101,7 @@ export const CaptionDatasetModal: React.FC = () => {
           setExistingJobName(data.name);
           setJobConfig(JSON.parse(data.job_config));
         })
-        .catch(error => console.error('Error fetching caption job:', error))
+        .catch(error => console.error('Error fetching caption job'))
         .finally(() => setHasLoadedExistingJob(true));
     }
   }, [modalInfo?.jobId]);
@@ -157,7 +157,6 @@ export const CaptionDatasetModal: React.FC = () => {
         } else {
           alert('Failed to save job. Please try again.');
         }
-        console.log('Error saving training:', error);
         isSavingRef.current = false;
         setIsSaving(false);
       });

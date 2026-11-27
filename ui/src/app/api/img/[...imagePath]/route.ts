@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { historicalArtifactFolder, regularJobPath } from '../../../../../cron/ownership/jobArtifacts';
 import prisma from '@/server/prisma';
 import fs from 'fs';
+import { mediaPathWithinRoots } from '@/server/safePath';
 import path from 'path';
 import { Readable } from 'stream';
 import { getDatasetsRoot, getTrainingFolder, getDataRoot } from '@/server/settings';
@@ -50,13 +51,10 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     // then ensure it's still under an allowed root. (Plain `.includes('..')`
     // false-positives on filenames that contain `..` as text, e.g. an ellipsis.)
     let resolved = path.resolve(filepath);
-    const isAllowed = allowedDirs.some(
-      allowedDir => resolved === allowedDir || resolved.startsWith(allowedDir + path.sep),
-    );
+    const isAllowed = await mediaPathWithinRoots(allowedDirs, resolved);
 
     const historicalFolder = isAllowed ? null : await historicalArtifactFolder(prisma, trainingRoot, resolved);
     if (!isAllowed && !historicalFolder) {
-      console.warn(`Access denied: ${resolved} not in ${allowedDirs.join(', ')}`);
       return new NextResponse('Access denied', { status: 403 });
     }
 
@@ -68,7 +66,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       const thumbBase = path.join(path.dirname(resolved), '.thumbs', path.basename(resolved));
       for (const thumbPath of [`${thumbBase}.png`, `${thumbBase}.jpg`]) {
         const thumbStat = await fs.promises.stat(thumbPath).catch(() => null);
-        if (thumbStat?.isFile() && (!historicalFolder || await regularJobPath(historicalFolder, thumbPath))) {
+        if (thumbStat?.isFile() && (historicalFolder ? await regularJobPath(historicalFolder, thumbPath) : await mediaPathWithinRoots(allowedDirs, thumbPath))) {
           resolved = thumbPath;
           break;
         }
@@ -91,7 +89,11 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
 
     // Weak ETag from inode/size/mtime — cheap and stable enough for revalidation
     const etag = `W/"${stat.ino.toString(36)}-${stat.size.toString(36)}-${stat.mtimeMs.toString(36)}"`;
-    const cacheControl = 'public, max-age=86400, immutable';
+    const cacheControl = 'private, max-age=86400, immutable';
+    const mediaHeaders: Record<string, string> = {
+      'X-Content-Type-Options': 'nosniff',
+    };
+    if (contentType === 'image/svg+xml') mediaHeaders['Content-Security-Policy'] = "sandbox; default-src 'none'; style-src 'unsafe-inline'";
 
     const ifNoneMatch = request.headers.get('if-none-match');
     if (ifNoneMatch && ifNoneMatch === etag) {
@@ -138,6 +140,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
           'Accept-Ranges': 'bytes',
           'Content-Length': String(chunkSize),
           'Content-Type': contentType,
+          ...mediaHeaders,
           'Cache-Control': cacheControl,
           ETag: etag,
         },
@@ -147,6 +150,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     return new NextResponse(buildBody() as any, {
       headers: {
         'Content-Type': contentType,
+        ...mediaHeaders,
         'Content-Length': String(stat.size),
         'Cache-Control': cacheControl,
         'Accept-Ranges': 'bytes',

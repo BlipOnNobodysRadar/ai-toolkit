@@ -4,6 +4,7 @@ import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
 import archiver from 'archiver';
+import { resolveMutationPath, UnsafePathError } from '@/server/safePath';
 import prisma from '@/server/prisma';
 import { jobArtifactPath } from '../../../../cron/ownership/jobArtifacts';
 import { getDatasetsRoot, getTrainingFolder } from '@/server/settings';
@@ -47,12 +48,16 @@ async function collectFiles(dir: string, captionsOnly: boolean): Promise<string[
 
 async function zipDataset(datasetName: string, captionsOnly: boolean) {
   const datasetsRoot = await resolveSafe(await getDatasetsRoot());
-  // basename strips any path segments so the name can't escape the datasets root
-  const safeName = path.basename(datasetName);
+  if (typeof datasetName !== 'string' || !datasetName || datasetName.startsWith('.') || path.basename(datasetName) !== datasetName) {
+    return NextResponse.json({ error: 'Invalid dataset name' }, { status: 400 });
+  }
+  const safeName = datasetName;
   let folderPath: string;
   try {
-    folderPath = await resolveSafe(path.join(datasetsRoot, safeName));
-  } catch {
+    folderPath = (await resolveMutationPath(datasetsRoot, path.join(datasetsRoot, safeName))).realPath;
+    if (!(await fsp.stat(folderPath)).isDirectory()) throw new Error();
+  } catch (error) {
+    if (error instanceof UnsafePathError) return new NextResponse('Access denied', { status: 403 });
     return NextResponse.json({ error: `Dataset '${datasetName}' not found` }, { status: 404 });
   }
 
@@ -63,7 +68,7 @@ async function zipDataset(datasetName: string, captionsOnly: boolean) {
 
   // Hidden dir at the datasets root: skipped by the dataset list/image walkers,
   // but still under datasetsRoot so /api/files/[...filePath] is allowed to serve it.
-  const zipDir = path.join(datasetsRoot, '.zips');
+  const zipDir = (await resolveMutationPath(datasetsRoot, path.join(datasetsRoot, '.zips'))).realPath;
   await fsp.mkdir(zipDir, { recursive: true });
   const outputPath = path.join(zipDir, `${safeName}_${captionsOnly ? 'captions' : 'dataset'}.zip`);
   await fsp.rm(outputPath, { force: true });

@@ -23,7 +23,6 @@ export default function useQueueList(reloadInterval: number | null = null) {
       .then(data => {
         if (!owner.accept(ticket)) return;
         if (data.error) {
-          console.log('Error fetching queues:', data.error);
           setStatus('error');
         } else {
           setQueues(data.queues);
@@ -32,7 +31,7 @@ export default function useQueueList(reloadInterval: number | null = null) {
       })
       .catch(error => {
         if (!owner.accept(ticket)) return;
-        console.error('Error fetching queues:', error);
+        console.error('Error fetching queues');
         setStatus('error');
       });
   };

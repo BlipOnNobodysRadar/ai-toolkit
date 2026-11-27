@@ -40,7 +40,6 @@ export async function POST(request: NextRequest) {
       }
       target = await resolveAllowedMutationPath(roots, decodedFilePath);
     } catch {
-      console.warn(`Access denied: ${decodedFilePath} not in ${[datasetRoot, trainingRoot].join(', ')}`);
       return new NextResponse('Access denied', { status: 403 });
     }
 
@@ -49,7 +48,6 @@ export async function POST(request: NextRequest) {
     try {
       stat = await fs.promises.stat(target.lexicalPath);
     } catch {
-      console.warn(`File not found: ${target.lexicalPath}`);
       return new NextResponse('File not found', { status: 404 });
     }
     if (!stat.isFile()) {
@@ -60,7 +58,7 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ success: true });
   } catch (error) {
-    console.error('Error deleting file:', error);
+    console.error('Error deleting file');
     return new NextResponse('Internal Server Error', { status: 500 });
   }
 }

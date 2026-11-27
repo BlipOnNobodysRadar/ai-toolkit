@@ -51,7 +51,12 @@ test('inference proxy forwards POST /api/inference/unload with the selected job 
   const incoming = {
     method: 'POST',
     nextUrl: { searchParams: new URLSearchParams('job=J1') },
-    headers: new Headers(),
+    headers: new Headers({
+      'content-type': 'application/json',
+      'authorization': 'Bearer browser-credential',
+      'cookie': 'session=fixture',
+      'x-forwarded-for': '192.0.2.42',
+    }),
     arrayBuffer: async () => new ArrayBuffer(0),
   };
   const response = await route.POST(incoming, { params: { path: ['unload'] } });
@@ -59,4 +64,6 @@ test('inference proxy forwards POST /api/inference/unload with the selected job 
   assert.equal(request.url, 'http://127.0.0.1:9876/unload');
   assert.equal(request.init.method, 'POST');
   assert.equal(request.init.headers.get('x-engine-token'), 'fixture-token');
+  assert.equal(request.init.headers.get('content-type'), 'application/json');
+  for (const name of ['authorization', 'cookie', 'x-forwarded-for']) assert.equal(request.init.headers.has(name), false);
 });

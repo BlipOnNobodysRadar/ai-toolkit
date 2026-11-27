@@ -148,9 +148,9 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
 
         setStatus('success');
         didInitialLoadRef.current = true;
-      } catch (err) {
+      } catch {
         if (!owner.accept(ticket)) return;
-        console.error('Error fetching loss logs:', err);
+        console.error('Error fetching loss logs');
         setStatus('error');
       } finally {
         if (inFlightRef.current?.ticket === ticket) inFlightRef.current = null;

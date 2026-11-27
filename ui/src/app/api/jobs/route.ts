@@ -70,7 +70,7 @@ export async function POST(request: Request) {
       // Handle unique constraint violation, 409=Conflict
       return NextResponse.json({ error: 'Job name already exists' }, { status: 409 });
     }
-    console.error(error);
+    console.error('Failed to save training data', error?.code || error?.name);
     // Handle other errors
     return NextResponse.json({ error: 'Failed to save training data' }, { status: 500 });
   }

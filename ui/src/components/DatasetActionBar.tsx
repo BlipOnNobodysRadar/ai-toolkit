@@ -34,8 +34,8 @@ export default function DatasetActionBar({ datasetName, className }: DatasetActi
       document.body.appendChild(a);
       a.click();
       a.remove();
-    } catch (err) {
-      console.error('Error downloading zip:', err);
+    } catch {
+      console.error('Error downloading zip');
     } finally {
       setZipping(null);
     }

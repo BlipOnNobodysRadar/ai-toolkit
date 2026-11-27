@@ -10,7 +10,6 @@ import { checkStopped, isRunSnapshot } from '../../../../../../cron/ownership/re
 export async function GET(request: NextRequest, { params }: { params: Promise<{ jobID: string }> }) {
   const { jobID } = await params;
   const out = await markStopped(prisma, jobID);
-  if (out.status === 200) console.log(`Job ${jobID} marked as stopped`);
   return NextResponse.json(out.body, { status: out.status });
 }
 

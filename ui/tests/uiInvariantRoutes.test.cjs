@@ -276,3 +276,30 @@ test('dataset upload refuses sanitization collisions and concurrent publication 
   assert.deepEqual(raceFiles, ['same_name.png']);
   assert.ok(['AAAA', 'BBBB'].includes(fs.readFileSync(path.join(root, 'race', 'same_name.png'), 'utf8')));
 });
+
+test('media keys cover dataset files and thumbnails within configured storage and keep service credentials private', async () => {
+  const { mediaPathWithinRoots } = require(ts.uiPath('cron/safePath.ts'));
+  const dataset = makeRoot('media');
+  const elsewhere = makeRoot('other-storage');
+  const photo = path.join(dataset, 'sample.png');
+  fs.writeFileSync(photo, 'sample');
+  assert.equal(await mediaPathWithinRoots([dataset], photo), true);
+  assert.equal(await mediaPathWithinRoots([dataset], path.join(dataset, '.thumbs', 'sample.png.jpg')), true);
+  assert.equal(await mediaPathWithinRoots([dataset], path.join(dataset, 'engine.json')), false);
+  assert.equal(await mediaPathWithinRoots([dataset], path.join(dataset, '.job_config.example.json')), false);
+  const linked = path.join(dataset, 'other-library');
+  fs.symlinkSync(elsewhere, linked, 'junction');
+  assert.equal(await mediaPathWithinRoots([dataset], path.join(linked, 'sample.png')), false);
+  assert.equal(await mediaPathWithinRoots([linked], path.join(linked, 'sample.png')), true);
+});
+
+test('caption reads preserve custom sidecar extensions and leave missing captions blank', async () => {
+  const { readCaption, readCaptionExtension } = require(ts.uiPath('src/server/readCaption.ts'));
+  const dataset = makeRoot('captions');
+  const file = path.join(dataset, 'example.png');
+  fs.writeFileSync(path.join(dataset, 'example.tags'), 'fixture');
+  assert.equal(readCaptionExtension('.tags'), 'tags');
+  assert.equal(readCaptionExtension('folder/tags'), null);
+  assert.equal(await readCaption(dataset, file, 'tags'), 'fixture');
+  assert.equal(await readCaption(dataset, file, 'txt'), '');
+});

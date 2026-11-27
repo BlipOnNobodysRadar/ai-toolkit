@@ -49,7 +49,7 @@ export default function JobNotes({ job }: Props) {
       await apiClient.post(`/api/jobs/${job.id}/notes`, { content: toSave });
       savedRef.current = toSave;
     } catch (error) {
-      console.error('Error saving notes:', error);
+      console.error('Error saving notes');
     } finally {
       isSavingRef.current = false;
     }

@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { historicalArtifactFolder } from '../../../../../cron/ownership/jobArtifacts';
 import prisma from '@/server/prisma';
 import fs from 'fs';
+import { mediaPathWithinRoots } from '@/server/safePath';
 import path from 'path';
 import { Readable } from 'stream';
 import { getDatasetsRoot, getTrainingFolder } from '@/server/settings';
@@ -24,13 +25,10 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     // an allowed root. Substring `.includes('..')` false-positives on filenames
     // containing `..` as text (e.g. an ellipsis in a filename).
     const resolvedFilePath = path.resolve(decodedFilePath);
-    const isAllowed = allowedDirs.some(
-      allowedDir => resolvedFilePath === allowedDir || resolvedFilePath.startsWith(allowedDir + path.sep),
-    );
+    const isAllowed = await mediaPathWithinRoots(allowedDirs, resolvedFilePath);
 
     const historicalFolder = isAllowed ? null : await historicalArtifactFolder(prisma, trainingRoot, resolvedFilePath);
     if (!isAllowed && !historicalFolder) {
-      console.warn(`Access denied: ${resolvedFilePath} not in ${allowedDirs.join(', ')}`);
       return new NextResponse('Access denied', { status: 403 });
     }
 
@@ -39,7 +37,6 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     try {
       stat = await fs.promises.stat(resolvedFilePath);
     } catch {
-      console.warn(`File not found: ${resolvedFilePath}`);
       return new NextResponse('File not found', { status: 404 });
     }
     if (!stat.isFile()) {
@@ -85,7 +82,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     const commonHeaders = {
       'Content-Type': contentType,
       'Accept-Ranges': 'bytes',
-      'Cache-Control': 'public, max-age=86400',
+      'Cache-Control': 'private, max-age=86400',
       'Content-Disposition': `attachment; filename="${encodeURIComponent(filename)}"`,
       'X-Content-Type-Options': 'nosniff',
     };
