@@ -1,11 +1,13 @@
-version: "3.8"
-
 services:
   ai-toolkit:
-    image: ostris/aitoolkit:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        GIT_COMMIT: ${AI_TOOLKIT_REVISION:-main}
     restart: unless-stopped
     ports:
-      - "8675:8675"
+      - "127.0.0.1:8675:8675"
     volumes:
       - ~/.cache/huggingface/hub:/root/.cache/huggingface/hub
       - ./aitk_db.db:/app/ai-toolkit/aitk_db.db
@@ -13,7 +15,9 @@ services:
       - ./output:/app/ai-toolkit/output
       - ./config:/app/ai-toolkit/config
     environment:
-      - AI_TOOLKIT_AUTH=${AI_TOOLKIT_AUTH:-password}
+      # Forward the loopback-published port into the container.
+      - AI_TOOLKIT_HOST=0.0.0.0
+      - AI_TOOLKIT_AUTH=${AI_TOOLKIT_AUTH:-}
       - NODE_ENV=production
       - TZ=UTC
     deploy:

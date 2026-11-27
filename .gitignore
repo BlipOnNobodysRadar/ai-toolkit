@@ -121,6 +121,9 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
+!.env.template
 .venv
 .python
 .node
@@ -187,6 +190,7 @@ cython_debug/
 aitk_db.db
 aitk_db.db-wal
 aitk_db.db-shm
+aitk_db.db-journal
 /notes.md
 /data
 .claude
