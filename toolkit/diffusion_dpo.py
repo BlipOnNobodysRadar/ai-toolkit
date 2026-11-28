@@ -81,6 +81,46 @@ def preference_logits(policy_errors, reference_errors, beta):
     return (0.5 * beta) * (rejected_delta - chosen_delta)
 
 
+def pair_weights(logits, multipliers):
+    weights = logits.new_tensor(multipliers)
+    if logits.ndim != 1 or weights.shape != logits.shape:
+        raise ValueError('DPO loss_multiplier requires one scalar per pair')
+    if not (torch.isfinite(weights) & (weights >= 0)).all():
+        raise ValueError('DPO loss_multiplier must be finite and nonnegative')
+    return weights
+
+
+def composite_loss(config, preference_loss, positive_drift, chosen_error):
+    anchor = getattr(config, 'dpo_anchor_weight', 0.0)
+    sft = getattr(config, 'dpo_sft_weight', 0.0)
+    if anchor > 0:
+        preference_loss = preference_loss + anchor * positive_drift
+    if sft > 0:
+        preference_loss = preference_loss + sft * chosen_error
+    return preference_loss
+
+
+@torch.no_grad()
+def accumulate_dpo_metrics(trainer, weights, logits, chosen_delta, rejected_delta):
+    # Normalize telemetry by total pair weight. A zero-weight window contributes zero.
+    values = torch.stack((logits, logits > 0, chosen_delta, rejected_delta, chosen_delta.relu()))
+    if weights.device.type != 'mps':
+        weights = weights.double()
+    totals = torch.cat(((values * weights).sum(dim=1), weights.sum().reshape(1)))
+    previous = getattr(trainer, '_dpo_metric_totals', None)
+    trainer._dpo_metric_totals = totals if previous is None else previous + totals
+
+
+def publish_dpo_metrics(trainer):
+    totals = trainer._dpo_metric_totals
+    denominator = torch.where(totals[-1] > 0, totals[-1], 1.0)
+    means = (totals[:-1] / denominator).tolist()
+    names = ('margin', 'accuracy', 'chosen_delta', 'rejected_delta', 'chosen_pos_drift')
+    trainer.additional_logs.update((f'dpo/{name}', mean) for name, mean in zip(names, means))
+    trainer.additional_logs['dpo/gain_gap'] = means[0] * (2 / trainer.train_config.dpo_beta)
+    trainer._dpo_metric_totals = None
+
+
 def paired_batch(batch):
     # The loader batch stays reusable. General preprocessing writes its encoded
     # latents onto this shallow view; captions and item weights remain B-wide.
@@ -144,16 +184,9 @@ def train_dpo_accumulation(trainer, batch, accum_scale):
                 chosen_err, _rejected_err = policy_errors.chunk(2)
                 chosen_delta, rejected_delta = (policy_errors - frozen_errors.detach()).chunk(2)
                 logits = (0.5 * trainer.train_config.dpo_beta) * (rejected_delta - chosen_delta)
-                weights = logits.new_tensor(batch.loss_multiplier_list)
+                weights = pair_weights(logits, batch.loss_multiplier_list)
                 dpo_loss = -F.logsigmoid(logits)
-                anchor_w = float(getattr(trainer.train_config, 'dpo_anchor_weight', 0.0) or 0.0)
-                sft_w = float(getattr(trainer.train_config, 'dpo_sft_weight', 0.0) or 0.0)
-                pos_drift = F.relu(chosen_delta)
-                total_loss = dpo_loss
-                if anchor_w > 0.0:
-                    total_loss = total_loss + anchor_w * pos_drift
-                if sft_w > 0.0:
-                    total_loss = total_loss + sft_w * chosen_err
+                total_loss = composite_loss(trainer.train_config, dpo_loss, chosen_delta.relu(), chosen_err)
                 loss = (total_loss * weights).mean()
                 if not torch.isfinite(loss):
                     raise FloatingPointError('Non-finite DPO loss')
@@ -163,10 +196,5 @@ def train_dpo_accumulation(trainer, batch, accum_scale):
         network.is_active = previous_active
         network.multiplier = previous_multiplier
 
-    trainer.additional_logs['dpo/margin'] = logits.detach().mean().item()
-    trainer.additional_logs['dpo/gain_gap'] = trainer.additional_logs['dpo/margin'] * (2 / trainer.train_config.dpo_beta)
-    trainer.additional_logs['dpo/accuracy'] = (logits.detach() > 0).float().mean().item()
-    trainer.additional_logs['dpo/chosen_delta'] = chosen_delta.detach().mean().item()
-    trainer.additional_logs['dpo/rejected_delta'] = rejected_delta.detach().mean().item()
-    trainer.additional_logs['dpo/chosen_pos_drift'] = pos_drift.detach().mean().item()
+    accumulate_dpo_metrics(trainer, weights, logits, chosen_delta, rejected_delta)
     return loss.detach()

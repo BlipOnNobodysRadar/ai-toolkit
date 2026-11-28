@@ -2480,19 +2480,40 @@ class SDTrainer(BaseSDTrainProcess):
             # grads of memory-managed (offloaded) params are async D2H copies into
             # pinned tensors; join them before anything on the CPU reads .grad
             sync_grad_transfers()
-            # fix this for multi params
+            dpo_window = getattr(self, '_dpo_metric_totals', None) is not None
+            guard = False
+            if dpo_window and (self.train_config.dpo_anchor_weight or self.train_config.dpo_sft_weight):
+                scaler = getattr(self.optimizer, 'scaler', None)
+                guard = scaler is None or not scaler.is_enabled()
+            check_grads = guard
             if self.train_config.optimizer != 'adafactor' and self.train_config.max_grad_norm > 0:
-                # low-precision optimizers hold the accumulated grads in a hidden buffer; clipping must see them
+                check_grads = False
                 pending_grads.materialize(self.optimizer)
-                if isinstance(self.params[0], dict):
-                    for i in range(len(self.params)):
-                        self.accelerator.clip_grad_norm_(self.params[i]['params'], self.train_config.max_grad_norm)
-                else:
-                    self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
+                groups = self.params if isinstance(self.params[0], dict) else [{'params': self.params}]
+                for group in groups:
+                    norm = self.accelerator.clip_grad_norm_(group['params'], self.train_config.max_grad_norm)
+                    if guard:
+                        if norm is None:  # Backend owns clipping and returned no norm.
+                            check_grads = True
+                        elif not torch.isfinite(norm):
+                            raise FloatingPointError('Non-finite DPO gradient norm')
+            if check_grads:
+                # Without clipping or AMP there is no existing overflow check to reuse.
+                finite_by_device = {}
+                for group in self.optimizer.param_groups:
+                    for param in group['params']:
+                        grad, _ = pending_grads.capture(param)
+                        if grad is not None:
+                            finite_by_device.setdefault(grad.device, []).append(torch.isfinite(grad).all())
+                if any(not torch.stack(flags).all() for flags in finite_by_device.values()):
+                    raise FloatingPointError('Non-finite DPO gradient')
             # only step if we are not accumulating
             with self.timer('optimizer_step'):
                 mark_update_commit(self, 'optimizer.step()')
                 self.optimizer.step()
+                if dpo_window:
+                    from toolkit.diffusion_dpo import publish_dpo_metrics
+                    publish_dpo_metrics(self)
                 if getattr(self, 'training_extras', None) is not None and not getattr(batch, '_feedback_pair_id', None):
                     self.training_extras.step()
 

@@ -2,6 +2,7 @@ import os
 import time
 from typing import List, Optional, Literal, Tuple, Union, TYPE_CHECKING, Dict
 import random
+import sys
 import math
 
 import torch
@@ -1192,7 +1193,11 @@ class DatasetConfig:
         self.clip_image_augmentations: List[dict] = kwargs.get('clip_image_augmentations', None)
         self.clip_image_shuffle_augmentations: bool = kwargs.get('clip_image_shuffle_augmentations', False)
         self.replacements: List[str] = kwargs.get('replacements', [])
-        self.loss_multiplier: float = kwargs.get('loss_multiplier', 1.0)
+        multiplier = kwargs.get('loss_multiplier', 1.0)
+        if (isinstance(multiplier, bool) or not isinstance(multiplier, (int, float))
+                or not 0 <= multiplier <= sys.float_info.max):
+            raise ValueError('dataset loss_multiplier must be a finite nonnegative scalar')
+        self.loss_multiplier = float(multiplier)
 
         self.num_workers: int = kwargs.get('num_workers', 2)
         self.prefetch_factor: int = kwargs.get('prefetch_factor', 2)

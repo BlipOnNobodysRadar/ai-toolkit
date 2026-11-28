@@ -554,6 +554,7 @@ def setup(trainer):
                         'latents': paired.latents.detach().to('cpu', dtype=torch.float32),
                         'noise': noise[:pair_count].detach().to('cpu', dtype=torch.float32),
                         'embeds': embeds,
+                        'loss_multipliers': list(batch.loss_multiplier_list),
                         'chosen_image_ids': [
                             _relative_chosen_image_id(item) for item in batch.file_items
                         ],
@@ -580,6 +581,8 @@ def _validate_paired(trainer, cfg, phase, device, dtype):
     from toolkit.diffusion_dpo import (
         prediction_errors,
         preference_logits,
+        composite_loss,
+        pair_weights,
         reference_errors,
     )
     from toolkit.prompt_utils import concat_prompt_embeds
@@ -650,6 +653,16 @@ def _validate_paired(trainer, cfg, phase, device, dtype):
                         )
                         losses = -F.logsigmoid(margins)
 
+                        chosen_delta, rejected_delta = (policy - reference).chunk(2)
+                        positive_drift = chosen_delta.relu()
+                        composite = None
+                        if (getattr(trainer.train_config, 'dpo_anchor_weight', 0.0) > 0
+                                or getattr(trainer.train_config, 'dpo_sft_weight', 0.0) > 0):
+                            # As in training, multiply by dataset weight and average over pairs.
+                            weights = pair_weights(margins, cached.get('loss_multipliers', [1.0] * pair_count))
+                            composite = weights * composite_loss(
+                                trainer.train_config, losses, positive_drift, policy[:pair_count])
+
                         for pair_index in range(pair_count):
                             rejected_index = pair_count + pair_index
                             chosen_gain = reference[pair_index] - policy[pair_index]
@@ -672,10 +685,17 @@ def _validate_paired(trainer, cfg, phase, device, dtype):
                                 'policy_rejected_error': float(policy[rejected_index].item()),
                                 'reference_chosen_error': float(reference[pair_index].item()),
                                 'reference_rejected_error': float(reference[rejected_index].item()),
+                                'chosen_delta': chosen_delta[pair_index].item(),
+                                'rejected_delta': rejected_delta[pair_index].item(),
+                                'chosen_drift_pos': positive_drift[pair_index].item(),
+                                **({'composite_loss': composite[pair_index].item()} if composite is not None else {}),
                                 'chosen_gain': float(chosen_gain.item()),
                                 'rejected_gain': float(rejected_gain.item()),
                             })
 
+        for name in ('chosen_delta', 'rejected_delta', 'chosen_drift_pos', 'composite_loss'):
+            if name in results[0]:
+                trainer.additional_logs[f'val/dpo/{name}'] = float(np.mean([r[name] for r in results]))
         trainer.additional_logs['val/loss'] = float(np.mean([r['dpo_loss'] for r in results]))
         trainer.additional_logs['val/dpo/loss'] = float(np.mean([r['dpo_loss'] for r in results]))
         trainer.additional_logs['val/dpo/margin'] = float(np.mean([r['margin'] for r in results]))

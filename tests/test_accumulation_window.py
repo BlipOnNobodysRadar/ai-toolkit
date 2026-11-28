@@ -572,3 +572,79 @@ def test_ui_sample_does_not_change_the_cpu_training_rng():
     restore_rng(saved)
     t.maybe_sample()
     assert draws() == expected
+
+
+@pytest.mark.parametrize('max_norm,scaling', [(0., False), (1., False), (0., True)])
+def test_dpo_finite_loss_overflow_preserves_adam_state(tmp_path, max_norm, scaling):
+    f, p, raw = trainer(tmp_path, rawr=False, max_grad_norm=max_norm)
+    iterate(f, 0, raw)  # initialize Adam moments
+    old_state = copy.deepcopy(raw.state_dict())
+    old_param = p.detach().clone()
+    if scaling:
+        from accelerate.optimizer import AcceleratedOptimizer
+        f.accelerator.scaler = torch.amp.GradScaler('cpu')
+        f.optimizer = AcceleratedOptimizer(raw, scaler=f.accelerator.scaler)
+    f.train_config.dpo_beta = 2.
+    f.additional_logs = {}
+    f.train_config.dpo_anchor_weight = 1e7
+    f.train_config.dpo_sft_weight = 0.0
+
+    def train_one(batch, accum_scale):
+        drift = p.half().float().square().mean()
+        loss = drift.relu() * f.train_config.dpo_anchor_weight
+        assert loss.isfinite()
+        f.accelerator.backward(loss * accum_scale)
+        assert p.grad.isinf().any()
+        f._dpo_metric_totals = torch.ones(6)
+        return loss.detach()
+
+    f.train_single_accumulation = train_one
+    if scaling:
+        iterate(f, 1, raw)
+        assert f.optimizer.step_was_skipped
+    else:
+        with pytest.raises(FloatingPointError, match='Non-finite DPO gradient'):
+            iterate(f, 1, raw)
+    assert torch.equal(p, old_param)
+    assert equal(raw.state_dict(), old_state)
+
+
+def test_pair_weighted_dpo_window_resets_after_update(tmp_path):
+    from toolkit.diffusion_dpo import accumulate_dpo_metrics
+    f, _, raw = trainer(tmp_path, gas=2, rawr=False)
+    f.train_config.dpo_beta = 2.
+    f.train_config.dpo_anchor_weight = f.train_config.dpo_sft_weight = 0.
+    f.additional_logs = {}
+    train_one = f.train_single_accumulation
+
+    def record(batch, accum_scale):
+        weights, chosen, rejected = (
+            ([2., 0.], [3., 100.], [5., 0.]) if f.step_num == 0 else ([1.], [-3.], [-4.]))
+        weights, chosen, rejected = map(torch.tensor, (weights, chosen, rejected))
+        accumulate_dpo_metrics(f, weights, rejected - chosen, chosen, rejected)
+        return train_one(batch, accum_scale)
+
+    f.train_single_accumulation = record
+    iterate(f, 0, raw)
+    assert not f.additional_logs
+    iterate(f, 1, raw)
+    assert f.additional_logs == pytest.approx({
+        'dpo/chosen_delta': 1., 'dpo/rejected_delta': 2., 'dpo/margin': 1.,
+        'dpo/accuracy': 2 / 3, 'dpo/chosen_pos_drift': 2., 'dpo/gain_gap': 1.})
+    iterate(f, 2, raw)
+    iterate(f, 3, raw)
+    assert f.additional_logs['dpo/chosen_delta'] == -3.
+
+
+def test_fused_backward_warns_by_default_and_refuses_in_strict_mode_for_active_dpo_penalty(tmp_path, monkeypatch):
+    f, _, _ = trainer(tmp_path, rawr=False)
+    optimizer = SimpleNamespace(steps_in_backward=True)
+    f.train_config.loss_type = 'dpo'
+    f.train_config.dpo_anchor_weight = f.train_config.dpo_sft_weight = 0.
+    f._check_accumulation_support(optimizer)
+    f.train_config.dpo_anchor_weight = 25.
+    monkeypatch.delenv('AITK_STRICT_INVARIANTS', raising=False)
+    f._check_accumulation_support(optimizer)
+    monkeypatch.setenv('AITK_STRICT_INVARIANTS', '1')
+    with pytest.raises(ValueError, match='fused backward-stepping optimizer'):
+        f._check_accumulation_support(optimizer)

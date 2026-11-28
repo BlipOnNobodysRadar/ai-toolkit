@@ -25,7 +25,7 @@ from extensions_built_in.sd_trainer.SDTrainer import SDTrainer
 from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 from toolkit.config_modules import DatasetConfig, NetworkConfig, TrainConfig
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
-from toolkit.diffusion_dpo import validate_dpo_config
+from toolkit.diffusion_dpo import pair_weights, publish_dpo_metrics, validate_dpo_config
 from toolkit.lora_special import LoRASpecialNetwork
 from toolkit.prompt_utils import concat_prompt_embeds
 from toolkit.samplers.custom_flowmatch_sampler import CustomFlowMatchEulerDiscreteScheduler
@@ -606,6 +606,7 @@ def test_dpo_anchor_and_sft_penalties_and_drift_logs():
     torch.manual_seed(111)
     loss0 = SDTrainer.train_single_accumulation(trainer, batch, accum_scale=1.0)
     assert loss0.item() == pytest.approx(math.log(2.0), abs=1e-6)
+    publish_dpo_metrics(trainer)
     assert "dpo/chosen_delta" in trainer.additional_logs
     assert "dpo/rejected_delta" in trainer.additional_logs
     assert "dpo/chosen_pos_drift" in trainer.additional_logs
@@ -620,6 +621,7 @@ def test_dpo_anchor_and_sft_penalties_and_drift_logs():
     trainer.train_config.dpo_sft_weight = 0.0
     torch.manual_seed(222)
     loss_plain = SDTrainer.train_single_accumulation(trainer, batch, accum_scale=1.0)
+    publish_dpo_metrics(trainer)
     pos_drift = trainer.additional_logs["dpo/chosen_pos_drift"]
 
     network.zero_grad()
@@ -634,3 +636,51 @@ def test_dpo_anchor_and_sft_penalties_and_drift_logs():
     torch.manual_seed(222)
     loss_sft = SDTrainer.train_single_accumulation(trainer, batch, accum_scale=1.0)
     assert loss_sft.item() > loss_plain.item()
+
+
+@pytest.mark.parametrize("value", [-1, math.nan, math.inf, 10**400, [1], [[0]], True, None])
+def test_invalid_dataset_loss_multiplier(value):
+    with pytest.raises(ValueError, match="loss_multiplier"):
+        DatasetConfig(folder_path="chosen", loss_multiplier=value)
+
+
+@pytest.mark.parametrize("weights", [[[1], [2]], [1], [1, -1], [0, math.nan]])
+def test_invalid_pair_weights(weights):
+    with pytest.raises(ValueError, match="loss_multiplier"):
+        pair_weights(torch.zeros(2), weights)
+
+
+@pytest.mark.parametrize("weights", [[2., 0.5], [0., 2.], [0., 0.]])
+def test_default_off_matches_plain_dpo_gradients(weights):
+    model, transformer = _make_model()
+    network, network_config = _make_network(model, transformer)
+    trainer = _make_trainer(model, transformer, network, network_config)
+    batch = _make_latent_batch()
+    batch.loss_multiplier_list = weights
+    predictions = torch.nn.Parameter(torch.tensor([0.25, -0.75, 0.5, 1.0]))
+    targets = []
+
+    def predict(noisy, timesteps, conditioning):
+        if network.is_active:
+            return predictions.view(4, 1, 1, 1).expand_as(noisy)
+        return torch.zeros_like(noisy)
+
+    original_target = trainer.sd.get_loss_target
+
+    def capture_target(**kwargs):
+        target = original_target(**kwargs)
+        targets.append(target)
+        return target
+
+    trainer.sd.get_loss_target = capture_target
+    trainer.predict_noise = predict
+    loss = SDTrainer.train_single_accumulation(trainer, batch, accum_scale=0.5)
+    independent = predictions.detach().clone().requires_grad_()
+    target = targets[0]
+    policy = _per_image_errors(independent.view(4, 1, 1, 1).expand_as(target), target)
+    chosen, rejected = (policy - _per_image_errors(torch.zeros_like(target), target)).chunk(2)
+    logits = (0.5 * trainer.train_config.dpo_beta) * (rejected - chosen)
+    plain = (-F.logsigmoid(logits) * torch.tensor(weights)).mean()
+    (plain * 0.5).backward()
+    assert torch.equal(loss, plain)
+    assert torch.equal(predictions.grad, independent.grad)

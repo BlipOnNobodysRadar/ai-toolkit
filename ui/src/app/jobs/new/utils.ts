@@ -135,6 +135,12 @@ export const applyDpoFeedbackMode = (
   return true;
 };
 
+const clearDpoObjective = (setJobConfig: (value: any, key: string) => void) => {
+  for (const field of ['dpo_beta', 'dpo_anchor_weight', 'dpo_sft_weight']) {
+    setJobConfig(undefined, `config.process[0].train.${field}`);
+  }
+};
+
 /** Turn off only interleaved feedback. Offline DPO keeps its beta; a standard
  * loss job no longer has any consumer for dpo_beta, so remove the stale field. */
 export const clearDpoFeedbackConfig = (
@@ -144,7 +150,7 @@ export const clearDpoFeedbackConfig = (
   const process = jobConfig.config.process[0];
   setJobConfig(undefined, 'config.process[0].train.dpo_feedback');
   if (process.train.loss_type !== 'dpo') {
-    setJobConfig(undefined, 'config.process[0].train.dpo_beta');
+    clearDpoObjective(setJobConfig);
   }
 };
 
@@ -175,7 +181,7 @@ export const clearDpoConfig = (
 ) => {
   const process = jobConfig.config.process[0];
   if (!isDpoFeedbackEnabled(process.train.dpo_feedback)) {
-    setJobConfig(undefined, 'config.process[0].train.dpo_beta');
+    clearDpoObjective(setJobConfig);
   }
   jobConfig.config.process[0].datasets.forEach((_, i) => {
     setJobConfig(undefined, `config.process[0].datasets[${i}].rejected_path`);
@@ -224,7 +230,7 @@ export const handleModelArchChange = (
     if (jobConfig.config.process[0].train.loss_type === 'dpo') {
       setJobConfig('mse', 'config.process[0].train.loss_type');
     }
-    setJobConfig(undefined, 'config.process[0].train.dpo_beta');
+    clearDpoObjective(setJobConfig);
     setJobConfig(undefined, 'config.process[0].train.dpo_feedback');
   }
 

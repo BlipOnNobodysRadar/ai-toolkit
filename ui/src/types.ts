@@ -200,6 +200,10 @@ export interface TrainConfig {
   switch_boundary_every: number;
   loss_type: 'mse' | 'mae' | 'wavelet' | 'stepped' | 'dpo';
   dpo_beta?: number;
+  /** Positive chosen drift penalty. Defaults to zero. */
+  dpo_anchor_weight?: number;
+  /** Chosen denoising loss coefficient. Defaults to zero. */
+  dpo_sft_weight?: number;
   /** Inline MOSS preference feedback from ranked gallery samples. This is
    * independent of offline DPO, which uses loss_type='dpo' and rejected
    * dataset folders. */

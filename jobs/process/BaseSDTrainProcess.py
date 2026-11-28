@@ -793,6 +793,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         fresh one, so no update averages a partial window."""
         optimizer.zero_grad(set_to_none=True)
         pending_grads.discard(optimizer)
+        self._dpo_metric_totals = None
         if getattr(self, 'training_extras', None) is not None:
             self.training_extras.edm.zero_grad()
         if self.train_config.gradient_accumulation_steps == -1:
@@ -1038,6 +1039,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 f"do_paramiter_swapping reselects the trained parameters (clearing their gradients) every step, so it "
                 f"cannot accumulate over gradient_accumulation_steps={gas}; use 1 (gradient_accumulation batches "
                 f"within a step are fine)")
+        if (pending_grads.steps_in_backward(optimizer)
+                and (getattr(self.train_config, 'loss_type', None) == 'dpo'
+                     or getattr(self.train_config, 'dpo_feedback', None) is not None)
+                and (self.train_config.dpo_anchor_weight or self.train_config.dpo_sft_weight)):
+            msg = ('Anchored or SFT DPO with a fused backward-stepping optimizer cannot check '
+                   'accumulated gradients before stepping; use an unfused optimizer (e.g. fused: false) '
+                   'if you need atomic pre-step overflow rejection')
+            if os.environ.get('AITK_STRICT_INVARIANTS', '').strip().lower() in ('1', 'true', 'yes'):
+                raise ValueError(msg)
+            print_acc(f"Warning: {msg}")
         if pending_grads.steps_in_backward(optimizer) and (gas != 1 or self.train_config.gradient_accumulation > 1):
             # each backward would apply its own update at 1/(window) scale instead of accumulating one
             raise ValueError(

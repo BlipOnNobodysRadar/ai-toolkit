@@ -180,6 +180,8 @@ test('changing to an ineligible model clears stale online and offline preference
   process.model.arch = 'moss_image';
   process.train.loss_type = 'mse';
   process.train.dpo_feedback = { every: 15, start_after: 2 };
+  process.train.dpo_anchor_weight = 2.5;
+  process.train.dpo_sft_weight = 1.25;
   process.train.dpo_beta = 100;
   process.datasets[0].rejected_path = 'C:/rejected';
 
@@ -190,6 +192,8 @@ test('changing to an ineligible model clears stale online and offline preference
   assert.equal(out.model.arch, 'flex1');
   assert.equal('dpo_feedback' in out.train, false);
   assert.equal('dpo_beta' in out.train, false);
+  assert.equal('dpo_anchor_weight' in out.train, false);
+  assert.equal('dpo_sft_weight' in out.train, false);
   assert.equal('rejected_path' in out.datasets[0], false);
 });
 
@@ -327,3 +331,32 @@ test('only the Krea Raw T2I preset adds eligibility alongside the existing MOSS 
     assert.equal(isImageDpoEligible(arch), false);
   }
 });
+
+
+for (const mode of ['offline', 'feedback']) {
+  test(`SimpleJob edits imported weights and clears them on leaving ${mode} DPO`, () => {
+    const job = freshJob();
+    const process = job.config.process[0];
+    process.model.arch = 'moss_image';
+    process.train.dpo_anchor_weight = 1e7;
+    process.train.dpo_sft_weight = 0.5;
+    const h = stateHarness(job);
+    if (mode === 'offline') applyDpoMode(h.state, h.setJobConfig);
+    else applyDpoFeedbackMode(h.state, h.setJobConfig);
+    const r = renderHook(props => SimpleJob(props), uiProps(h.state, h.setJobConfig));
+    for (const [label, initial] of [['Chosen drift penalty weight', 1e7], ['Chosen SFT weight', 0.5]]) {
+      const input = findNode(r.result.current, node => node.props?.label === label);
+      assert.equal(input.props.value, initial);
+      input.props.onChange(initial * 2);
+    }
+    r.unmount();
+    const saved = stateHarness(clone(h.state));
+    assert.equal(saved.state.config.process[0].train.dpo_anchor_weight, 2e7);
+    assert.equal(saved.state.config.process[0].train.dpo_sft_weight, 1);
+    if (mode === 'offline') clearDpoConfig(saved.state, saved.setJobConfig);
+    else clearDpoFeedbackConfig(saved.state, saved.setJobConfig);
+    for (const key of ['dpo_anchor_weight', 'dpo_sft_weight']) {
+      assert.equal(key in saved.state.config.process[0].train, false);
+    }
+  });
+}

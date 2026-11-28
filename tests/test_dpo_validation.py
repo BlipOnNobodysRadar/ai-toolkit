@@ -145,6 +145,35 @@ def test_paired_validation_reports_vectorized_per_pair_metrics(tmp_path):
     assert trainer.sd.unet.training is True
 
 
+def test_better_margin_can_hide_worse_chosen_error(tmp_path):
+    trainer = _PolicyTrainer(tmp_path)
+    cached = _paired_cache(tmp_path)
+    cached["loss_multipliers"] = [0.0, 3.0]
+    trainer._validation_cache = {"paired": True, "native_batches": [cached]}
+    tv.validate(trainer)
+    initial = trainer.additional_logs["val/loss"]
+    assert "val/dpo/composite_loss" not in trainer.additional_logs
+    trainer.train_config.dpo_anchor_weight = 2.0
+    trainer.train_config.dpo_sft_weight = 0.25
+
+    def predict(noisy, timesteps, conditioning):
+        result = torch.zeros_like(noisy)
+        if trainer.network.is_active:
+            result[:2] = 3  # chosen error 4
+            result[2:] = 4  # rejected error 9
+        return result
+
+    trainer.predict_noise = predict
+    tv.validate(trainer)
+    logs = trainer.additional_logs
+    historical = torch.nn.functional.softplus(torch.tensor(-5.)).item()
+    assert logs["val/loss"] == logs["val/dpo/loss"] == pytest.approx(historical)
+    assert logs["val/loss"] < initial
+    assert logs["val/dpo/chosen_delta"] == logs["val/dpo/chosen_drift_pos"] == 3
+    assert logs["val/dpo/rejected_delta"] == 8
+    assert logs["val/dpo/composite_loss"] == pytest.approx(1.5 * (historical + 2 * 3 + 0.25 * 4))
+
+
 def _make_dpo_tree(root):
     chosen = root / "chosen"
     rejected = root / "rejected"
@@ -269,6 +298,7 @@ def test_setup_caches_paired_validation_without_touching_plain_path(tmp_path, mo
         ],
         latents=torch.zeros(pair_count, 1, 2, 2),
         rejected_latents=torch.ones(pair_count, 1, 2, 2),
+        loss_multiplier_list=[2.0, 0.0],
         tensor=None,
         rejected_tensor=None,
     )
@@ -287,6 +317,7 @@ def test_setup_caches_paired_validation_without_touching_plain_path(tmp_path, mo
     assert cache["paired"] is True
     item = cache["native_batches"][0]
     assert item["latents"].shape[0] == pair_count * 2
+    assert item["loss_multipliers"] == [2.0, 0.0]
     assert item["noise"].shape[0] == pair_count
     assert item["chosen_image_ids"] == ["a.png", "sub/b.png"]
     assert len(item["embeds"].text_embeds) == pair_count

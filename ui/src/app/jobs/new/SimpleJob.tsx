@@ -927,6 +927,21 @@ export default function SimpleJob({
                         min={Number.MIN_VALUE}
                         required
                       />
+                      {(['dpo_anchor_weight', 'dpo_sft_weight'] as const).map(field => (
+                        <NumberInput
+                          key={field}
+                          label={field === 'dpo_anchor_weight' ? 'Chosen drift penalty weight' : 'Chosen SFT weight'}
+                          className="pt-2"
+                          allowEmpty
+                          value={jobConfig.config.process[0].train[field] ?? 0}
+                          onChange={value => {
+                            if (value === null || (Number.isFinite(value) && value >= 0)) {
+                              setJobConfig(value ?? undefined, `config.process[0].train.${field}`);
+                            }
+                          }}
+                          min={0}
+                        />
+                      ))}
                       <p className="pt-2 text-xs text-gray-400">
                         {isDpoActive && isDpoFeedbackActive
                           ? `Offline DPO and periodic sample feedback share this positive beta; both compare against the frozen reference ${dpoReferenceName} checkpoint.`
